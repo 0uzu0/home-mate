@@ -1,0 +1,9 @@
+Spike A live (rig-core 0.46.0 -> bigmodel glm-4-flash, 2026-11-07)
+[tool] +1.354600166s Start kind=ToolCall name=Some(ToolName("music_search"))
+[tool] +1.354657916s End content=ToolCall
+[tool] first_event=Some(1.354599916s) total=1.373463416s text_frags=0 arg_frags=1 finalized_tool_calls=1 terminal=stream-ended
+[tool] assembled arguments JSON: {"query": "周杰伦 晴天", "limit": 1}
+[tool] arguments parse: OK
+[text] first text delta at 818.599583ms
+[drop] dropped after 1 text pieces; next call 1.184468208s later answered: 蓝
+[live] spike A complete

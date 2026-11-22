@@ -1,0 +1,32 @@
+data: {"id":"20261107194745ad0d91a86e0e4d77","created":1794052065,"object":"chat.completion.chunk","model":"glm-4-flash","choices":[{"index":0,"delta":{"role":"assistant","content":"我是一个"}}]}
+
+data: {"id":"20261107194745ad0d91a86e0e4d77","created":1794052065,"object":"chat.completion.chunk","model":"glm-4-flash","choices":[{"index":0,"delta":{"role":"assistant","content":"专注于"}}]}
+
+data: {"id":"20261107194745ad0d91a86e0e4d77","created":1794052065,"object":"chat.completion.chunk","model":"glm-4-flash","choices":[{"index":0,"delta":{"role":"assistant","content":"提供"}}]}
+
+data: {"id":"20261107194745ad0d91a86e0e4d77","created":1794052065,"object":"chat.completion.chunk","model":"glm-4-flash","choices":[{"index":0,"delta":{"role":"assistant","content":"准确"}}]}
+
+data: {"id":"20261107194745ad0d91a86e0e4d77","created":1794052065,"object":"chat.completion.chunk","model":"glm-4-flash","choices":[{"index":0,"delta":{"role":"assistant","content":"信息"}}]}
+
+data: {"id":"20261107194745ad0d91a86e0e4d77","created":1794052065,"object":"chat.completion.chunk","model":"glm-4-flash","choices":[{"index":0,"delta":{"role":"assistant","content":"、"}}]}
+
+data: {"id":"20261107194745ad0d91a86e0e4d77","created":1794052065,"object":"chat.completion.chunk","model":"glm-4-flash","choices":[{"index":0,"delta":{"role":"assistant","content":"丰富"}}]}
+
+data: {"id":"20261107194745ad0d91a86e0e4d77","created":1794052065,"object":"chat.completion.chunk","model":"glm-4-flash","choices":[{"index":0,"delta":{"role":"assistant","content":"知识和"}}]}
+
+data: {"id":"20261107194745ad0d91a86e0e4d77","created":1794052065,"object":"chat.completion.chunk","model":"glm-4-flash","choices":[{"index":0,"delta":{"role":"assistant","content":"有效"}}]}
+
+data: {"id":"20261107194745ad0d91a86e0e4d77","created":1794052065,"object":"chat.completion.chunk","model":"glm-4-flash","choices":[{"index":0,"delta":{"role":"assistant","content":"沟通"}}]}
+
+data: {"id":"20261107194745ad0d91a86e0e4d77","created":1794052065,"object":"chat.completion.chunk","model":"glm-4-flash","choices":[{"index":0,"delta":{"role":"assistant","content":"的人工"}}]}
+
+data: {"id":"20261107194745ad0d91a86e0e4d77","created":1794052065,"object":"chat.completion.chunk","model":"glm-4-flash","choices":[{"index":0,"delta":{"role":"assistant","content":"智能"}}]}
+
+data: {"id":"20261107194745ad0d91a86e0e4d77","created":1794052065,"object":"chat.completion.chunk","model":"glm-4-flash","choices":[{"index":0,"delta":{"role":"assistant","content":"助手"}}]}
+
+data: {"id":"20261107194745ad0d91a86e0e4d77","created":1794052065,"object":"chat.completion.chunk","model":"glm-4-flash","choices":[{"index":0,"delta":{"role":"assistant","content":"。"}}]}
+
+data: {"id":"20261107194745ad0d91a86e0e4d77","created":1794052065,"object":"chat.completion.chunk","model":"glm-4-flash","choices":[{"index":0,"finish_reason":"stop","delta":{"role":"assistant","content":""}}],"usage":{"prompt_tokens":9,"completion_tokens":16,"total_tokens":25}}
+
+data: [DONE]
+

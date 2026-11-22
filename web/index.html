@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-Hans">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#f6f7f3" />
+    <link rel="icon" type="image/svg+xml" href="/home-mate-icon-v2.svg" sizes="any" />
+    <title>Home Mate · 家庭助手控制台</title>
+    <script>
+      // Theme + language before first paint. This is the same choice theme.ts
+      // and i18n.ts read afterwards, so the console never flashes the wrong
+      // theme and a deep link renders in the saved language immediately.
+      (function () {
+        try {
+          var pref = localStorage.getItem('hm.theme') || 'auto'
+          if (pref === 'brand') {
+            pref = 'auto'
+            try { localStorage.setItem('hm.theme', 'auto') } catch (e) {}
+          }
+          if (pref !== 'light' && pref !== 'dark') pref = 'auto'
+          var theme =
+            pref === 'auto'
+              ? window.matchMedia &&
+                window.matchMedia('(prefers-color-scheme: dark)').matches
+                ? 'dark'
+                : 'light'
+              : pref
+          document.documentElement.dataset.theme = theme
+          var locale = localStorage.getItem('hm.locale') === 'en' ? 'en' : 'zh'
+          document.documentElement.lang = locale === 'en' ? 'en' : 'zh-Hans'
+        } catch (e) {
+          /* private mode: defaults are fine */
+        }
+      })()
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

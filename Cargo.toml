@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/hm-core", "crates/hm-release"]
+
+# The on-device core ships through a 16 MB update body limit. tract-onnx
+# registers every ONNX operator in a static table, so its code cannot be
+# dead-code-eliminated: LTO + one codegen unit is the only lever that shrinks
+# it (M1b measured 24.7 MB -> see docs/d/m1b-m5-20261113.md).
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = "s"
+
+[workspace.package]
+edition = "2021"
+version = "0.0.1"
+license-file = "NOT-LICENSED"

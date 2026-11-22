@@ -1,0 +1,6 @@
+data: {"id":"202611071947422c566e7eeeab4426","created":1794052062,"object":"chat.completion.chunk","model":"glm-4-flash","choices":[{"index":0,"finish_reason":"tool_calls","delta":{"role":"assistant","tool_calls":[{"id":"call_202611071947422c566e7eeeab4426_0","index":0,"type":"function","function":{"name":"music_search","arguments":"{\"query\": \"周杰伦 晴天\", \"limit\": 1}"}}]}}]}
+
+data: {"id":"202611071947422c566e7eeeab4426","created":1794052062,"object":"chat.completion.chunk","model":"glm-4-flash","choices":[{"index":0,"finish_reason":"tool_calls","delta":{"role":"assistant","content":""}}],"usage":{"prompt_tokens":156,"completion_tokens":20,"total_tokens":176}}
+
+data: [DONE]
+

@@ -1,0 +1,8 @@
+data: {"id":"fx2","object":"chat.completion.chunk","created":0,"model":"fx","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","tool_calls":[{"id":"call_fx_2","type":"function","function":{"name":"music_search","arguments":"{\"quer"}}]}}]}
+
+data: {"id":"fx2","object":"chat.completion.chunk","created":0,"model":"fx","choices":[{"index":0,"finish_reason":null,"delta":{"tool_calls":[{"id":"call_fx_2","function":{"arguments":"y\": \"周杰伦 晴天\", \"limit\": 1}"}}]}}]}
+
+data: {"id":"fx2","object":"chat.completion.chunk","created":0,"model":"fx","choices":[{"index":0,"finish_reason":"tool_calls","delta":{}}]}
+
+data: [DONE]
+

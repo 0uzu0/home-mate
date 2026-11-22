@@ -1,0 +1,23 @@
+[workspace]
+
+[package]
+name = "genai-swap-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+genai = "=0.7.3"
+hm-core = { path = "../../crates/hm-core" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+futures = "0.3"
+serde_json = "1"
+async-trait = "0.1"
+
+[[bin]]
+name = "live"
+path = "src/live.rs"
+
+[lib]
+name = "genai_swap_spike"
+path = "src/lib.rs"
