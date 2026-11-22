@@ -1,0 +1,337 @@
+name: ci
+
+on:
+  pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - '!docs/fixtures/**'
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - '!docs/fixtures/**'
+
+# One run per ref: a new push cancels the previous run instead of queueing
+# behind it. Review feedback usually arrives faster than a 7-minute job.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: build, test, clippy
+    runs-on: self-hosted
+    timeout-minutes: 30
+    env:
+      # Keep both actual compatibility binaries within runner disk space.
+      # Test assertions and overflow checks remain enabled; only debug symbols
+      # and incremental compiler artifacts are omitted from CI builds.
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Detect changed scopes
+        id: scope
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "run_web=true" >> "$GITHUB_OUTPUT"
+            echo "run_rust=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! git fetch origin "${{ github.base_ref }}" || ! changed="$(git diff --name-only "origin/${{ github.base_ref }}...HEAD")" || [ -z "$changed" ]; then
+            echo "Scope decision: fail-closed full run (diff unavailable or empty)"
+            echo "run_web=true" >> "$GITHUB_OUTPUT"
+            echo "run_rust=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Changed files:"
+          echo "$changed"
+          run_web="false"
+          run_rust="false"
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              docs/fixtures/*) run_web="true"; run_rust="true" ;;
+              docs/*|*.md) ;;
+              web/*) run_web="true" ;;
+              *) run_web="true"; run_rust="true" ;;
+            esac
+          done <<< "$changed"
+          echo "run_web=$run_web" >> "$GITHUB_OUTPUT"
+          echo "run_rust=$run_rust" >> "$GITHUB_OUTPUT"
+          echo "Scope decision: run_web=$run_web run_rust=$run_rust"
+      - uses: actions/setup-node@v4
+        if: steps.scope.outputs.run_web == 'true'
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Line count gate
+        run: |
+          python3 tools/line_gate.py --self-test
+          python3 tools/line_gate.py
+      - name: OTA size gate self-test
+        if: steps.scope.outputs.run_rust == 'true'
+        run: python3 tools/size_gate.py --self-test
+      - name: Web console typecheck & build
+        if: steps.scope.outputs.run_web == 'true'
+        run: cd web && npm ci && npm run build
+      - name: Web form lifecycle regression
+        if: steps.scope.outputs.run_web == 'true'
+        run: cd web && node tests/ui-lifecycle.mjs
+      - name: Configuration plan UI regression
+        if: steps.scope.outputs.run_web == 'true'
+        run: cd web && node tests/config-v2.mjs
+      - name: Trusted chat scope UI regression
+        if: steps.scope.outputs.run_web == 'true'
+        run: cd web && node tests/chat-scopes.mjs
+      - name: Northbound diagnostics snapshot regression
+        if: steps.scope.outputs.run_web == 'true'
+        run: cd web && node tests/northbound-snapshot.mjs
+      - name: Real confirmation UI regression
+        if: steps.scope.outputs.run_web == 'true'
+        run: cd web && npm run test:confirmations
+      # Pinned to the released v1 tag, not @master: the toolchain this action
+      # installs is part of the build result, so it must not move on its own.
+      - uses: dtolnay/rust-toolchain@v1
+        if: steps.scope.outputs.run_web == 'true' || steps.scope.outputs.run_rust == 'true'
+        with:
+          toolchain: 1.100.0
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        if: steps.scope.outputs.run_web == 'true' || steps.scope.outputs.run_rust == 'true'
+        with:
+          key: luna-ci-no-debug-v1
+      - name: Build
+        if: steps.scope.outputs.run_web == 'true' || steps.scope.outputs.run_rust == 'true'
+        run: |
+          df -h .
+          if [ "${{ steps.scope.outputs.run_rust }}" = "true" ]; then
+            cargo build --workspace --locked --all-targets
+            cargo check -p hm-core --no-default-features --locked --all-targets
+          else
+            cargo build --bin hm-core --locked
+          fi
+          du -sh target
+          df -h .
+      - name: Real core binary carries the fat VAD marker
+        if: steps.scope.outputs.run_rust == 'true'
+        # The release-gate unit tests below prove the rule against SYNTHETIC
+        # cores whose marker literal is written next to the reader, so a format
+        # drift changed on both sides at once would still pass. This step reads
+        # the marker out of the binary the Build step just produced: every
+        # NUL-terminated `hm-core-vad` claim must be `silero`.
+        #
+        # Claims, not copies: a debug build materialises the marker constant
+        # twice (the static's data plus one inlined use), so a raw occurrence
+        # count is 2 while the claim is one — the assertion that carries
+        # meaning is "claims silero, never none".
+        run: |
+          python3 - <<'PY'
+          import re
+          import sys
+
+          data = open("target/debug/hm-core", "rb").read()
+          claims = re.findall(rb"hm-core-vad ([a-z]+)\x00", data)
+          print(f"hm-core VAD claims: {[c.decode() for c in claims]}")
+          if not claims:
+              sys.exit("FAIL: hm-core carries no 'hm-core-vad <backend>' marker")
+          wrong = [c for c in claims if c != b"silero"]
+          if wrong:
+              sys.exit(f"FAIL: non-silero VAD claim(s) in the shipped core: {wrong}")
+          PY
+      - name: Install pinned Chromium headless shell
+        if: steps.scope.outputs.run_web == 'true'
+        timeout-minutes: 10
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/luna-playwright
+        run: |
+          if [ "$(uname -s)" = "Linux" ]; then
+            cd web && ./node_modules/.bin/playwright install --with-deps --only-shell chromium
+          else
+            cd web && ./node_modules/.bin/playwright install --only-shell chromium
+          fi
+      - name: Actual browser configuration acceptance
+        if: steps.scope.outputs.run_web == 'true'
+        timeout-minutes: 4
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/luna-playwright
+          HM_CORE_BINARY: ${{ github.workspace }}/target/debug/hm-core
+          HM_BROWSER_EVIDENCE_DIR: ${{ runner.temp }}/luna-browser-evidence
+        # Chromium's documented AppArmor option on Ubuntu 24.04+: permit user
+        # namespaces for this exact pinned executable only; retain the browser
+        # sandbox. On macOS self-hosted runners AppArmor is not applicable.
+        run: |
+          rm -rf "$HM_BROWSER_EVIDENCE_DIR"
+          if [ "$(uname -s)" = "Linux" ] && command -v apparmor_parser >/dev/null 2>&1; then
+            luna_browser_binary="$(python3 - <<'PYTHON'
+          import json, os, pathlib, re
+          temporary = pathlib.Path(os.environ['RUNNER_TEMP']).resolve(strict=True)
+          installed = pathlib.Path(os.environ['PLAYWRIGHT_BROWSERS_PATH']).resolve(strict=True)
+          assert installed.is_relative_to(temporary), 'browser installation must be within RUNNER_TEMP'
+          manifest = json.loads(pathlib.Path('web/node_modules/playwright-core/browsers.json').read_text())
+          entries = [item for item in manifest['browsers'] if item['name'] == 'chromium-headless-shell']
+          assert len(entries) == 1 and re.fullmatch(r'[0-9]+', entries[0]['revision'])
+          directory = installed / ('chromium_headless_shell-' + entries[0]['revision'])
+          matches = [item.resolve(strict=True) for item in directory.rglob('chrome-headless-shell') if item.is_file() and os.access(item, os.X_OK)]
+          assert len(matches) == 1, 'expected one installed pinned headless executable'
+          binary = matches[0]
+          assert binary.is_relative_to(installed) and re.fullmatch(r'/[A-Za-z0-9_./-]+', str(binary)), 'unsafe AppArmor attachment path'
+          print(binary)
+          PYTHON
+            )"
+            sha256sum "$luna_browser_binary"
+            luna_profile="$RUNNER_TEMP/luna-playwright-userns.profile"
+            cat > "$luna_profile" <<PROFILE
+          abi <abi/4.0>,
+          include <tunables/global>
+          profile luna-playwright-userns "$luna_browser_binary" flags=(unconfined) {
+            userns,
+          }
+          PROFILE
+            luna_cleanup() {
+              luna_status=$?
+              if ! timeout 10s sudo apparmor_parser -R "$luna_profile"; then
+                echo 'Profile unload failed; this ephemeral runner will be destroyed.' >&2
+                if [ "$luna_status" -eq 0 ]; then luna_status=1; fi
+              fi
+              rm -f "$luna_profile"
+              exit "$luna_status"
+            }
+            trap luna_cleanup EXIT
+            timeout 10s sudo apparmor_parser -r "$luna_profile"
+          fi
+          npm --prefix web run test:browser
+      - name: Preserve sanitized browser acceptance evidence
+        if: always() && steps.scope.outputs.run_web == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-configuration-acceptance
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/luna-browser-evidence/**/result.json
+            ${{ runner.temp }}/luna-browser-evidence/**/core.log
+            ${{ runner.temp }}/luna-browser-evidence/**/*.png
+      - name: Three-Core production-entry smoke
+        if: steps.scope.outputs.run_rust == 'true'
+        timeout-minutes: 2
+        run: |
+          rm -rf "$RUNNER_TEMP/luna-system-smoke"
+          python3 tools/system_smoke.py --core target/debug/hm-core --output-dir "$RUNNER_TEMP/luna-system-smoke" --timeout 60
+      - name: Transport harness and partner checks
+        if: steps.scope.outputs.run_rust == 'true'
+        run: |
+          python3 -m py_compile tools/luna_transport_partners.py tools/luna_transport_compat.py
+          python3 -m unittest discover -s tools -p test_luna_transport_system.py
+      - name: Voice pipeline partner and evidence checks
+        if: steps.scope.outputs.run_rust == 'true'
+        run: |
+          python3 -m py_compile tools/luna_voice_system.py tools/luna_voice_partners.py tools/check_luna_voice_evidence.py
+          python3 -m unittest discover -s tools -p test_luna_voice_system.py
+      - name: Verify private Gateway checkout credential
+        if: steps.scope.outputs.run_rust == 'true'
+        env:
+          HAS_GATEWAY_TOKEN: ${{ secrets.GATEWAY_REPO_READ_TOKEN != '' }}
+        run: |
+          if [ "$HAS_GATEWAY_TOKEN" != "true" ]; then
+            echo "ERROR: GATEWAY_REPO_READ_TOKEN is not configured; refusing to skip real Core+Gateway voice pipeline (#139)." >&2
+            exit 1
+          fi
+      - name: Checkout pinned private Gateway repository
+        if: steps.scope.outputs.run_rust == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: yes999zc/home-mate-device-gateway-b
+          ref: 9175292d2208a89284293aff28ca041f77293a8a
+          token: ${{ secrets.GATEWAY_REPO_READ_TOKEN }}
+          path: _gateway_ci
+          persist-credentials: false
+      - name: Mandatory real Core and private Gateway voice pipeline
+        if: steps.scope.outputs.run_rust == 'true'
+        timeout-minutes: 8
+        env:
+          PINNED_GATEWAY_SHA: 9175292d2208a89284293aff28ca041f77293a8a
+          HM_VOICE_EVIDENCE_DIR: ${{ runner.temp }}/luna-voice-pipeline
+        run: |
+          rm -rf "$HM_VOICE_EVIDENCE_DIR"
+          actual_sha="$(git -C _gateway_ci rev-parse HEAD)"
+          if [ "$actual_sha" != "$PINNED_GATEWAY_SHA" ]; then
+            echo "ERROR: Gateway checkout SHA mismatch: expected $PINNED_GATEWAY_SHA, got $actual_sha" >&2
+            exit 1
+          fi
+          CARGO_TARGET_DIR="$RUNNER_TEMP/luna-gateway-target" cargo build \
+            --manifest-path _gateway_ci/Cargo.toml \
+            -p home-mate-device-gateway \
+            --example northbound_fixture \
+            --locked
+          fixture_bin="$RUNNER_TEMP/luna-gateway-target/debug/examples/northbound_fixture"
+          if [ ! -x "$fixture_bin" ]; then
+            echo "ERROR: northbound_fixture binary missing at $fixture_bin" >&2
+            exit 1
+          fi
+          for voice_case in separate-wake inline-wake closed-reconnect; do
+            case_dir="$HM_VOICE_EVIDENCE_DIR/$voice_case"
+            mkdir -p "$case_dir"
+            python3 tools/luna_voice_system.py \
+              --core target/debug/hm-core \
+              --gateway-fixture "$fixture_bin" \
+              --gateway-source _gateway_ci \
+              --output-dir "$case_dir" \
+              --timeout 120 \
+              --case "$voice_case"
+            result_file="$(find "$case_dir" -maxdepth 2 -name result.json | head -n 1)"
+            if [ -z "$result_file" ]; then
+              echo "ERROR: missing result.json for case $voice_case" >&2
+              exit 1
+            fi
+            python3 tools/check_luna_voice_evidence.py "$result_file"
+          done
+      - name: Preserve real Core and Gateway voice pipeline evidence
+        if: always() && steps.scope.outputs.run_rust == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-core-gateway-voice-pipeline
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/luna-voice-pipeline/**/result.json
+            ${{ runner.temp }}/luna-voice-pipeline/**/*.log
+      - name: Cleanup private Gateway checkout
+        if: always() && steps.scope.outputs.run_rust == 'true'
+        run: rm -rf _gateway_ci "$RUNNER_TEMP/luna-gateway-target"
+      - name: Actual old and new Core wire0 compatibility
+        if: steps.scope.outputs.run_rust == 'true'
+        timeout-minutes: 8
+        run: |
+          rm -rf "$RUNNER_TEMP/luna-old-core" "$RUNNER_TEMP/luna-old-target" "$RUNNER_TEMP/luna-transport-compat"
+          git worktree prune
+          git fetch --depth=1 origin 3b568133a61f0ad4971f8e4492429feeb7bc7f52
+          git worktree add --detach "$RUNNER_TEMP/luna-old-core" 3b568133a61f0ad4971f8e4492429feeb7bc7f52
+          CARGO_TARGET_DIR="$RUNNER_TEMP/luna-old-target" cargo build --manifest-path "$RUNNER_TEMP/luna-old-core/Cargo.toml" -p hm-core --locked
+          python3 tools/luna_transport_compat.py --old-core "$RUNNER_TEMP/luna-old-target/debug/hm-core" --new-core target/debug/hm-core --output-dir "$RUNNER_TEMP/luna-transport-compat" --timeout 60
+          rm -rf "$RUNNER_TEMP/luna-old-core" "$RUNNER_TEMP/luna-old-target"
+          git worktree prune
+      - name: Test
+        if: steps.scope.outputs.run_rust == 'true'
+        run: cargo test --workspace --locked
+      - name: Release gates (fat core + pinned VAD model)
+        if: steps.scope.outputs.run_rust == 'true'
+        # `hm-release pack` must refuse a core without in-process Silero VAD
+        # and a package whose model is not the audited silero_vad.onnx; the
+        # device `verify` must refuse the same package. These unit tests are
+        # the executable form of that release precondition, so they run as
+        # their own step and cannot be dropped from a filtered Test run.
+        run: cargo test -p hm-release --locked
+      - name: Clippy
+        if: steps.scope.outputs.run_rust == 'true'
+        # Warning level only. -D warnings stays off until the existing
+        # warning backlog is cleared; compile failures and deny-by-default
+        # lints still fail the job.
+        #
+        # Exit condition for this phase: when `cargo clippy` reports zero
+        # warnings on both repositories for a week of runs, switch this to
+        # `-D warnings` and let it gate. Until then a new warning is allowed
+        # to land, which is the trade-off this comment exists to record.
+        run: cargo clippy --workspace --locked --all-targets -- -W clippy::all

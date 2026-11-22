@@ -1,0 +1,39 @@
+[package]
+name = "hm-release"
+description = "Home Mate release verifier/installer/activator (Ed25519 manifest, A/B activation, health gate)"
+edition = "2021"
+version = "0.1.0"
+license-file = "../../NOT-LICENSED"
+
+[lib]
+name = "hm_release"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hm-release"
+path = "src/main.rs"
+
+[features]
+# Test-only entry points: `pack`/`install`/`package` against an explicit
+# expected VAD model hash, for host integration tests whose fixture packages
+# carry a synthetic model. Enabled by this package's own dev-dependency below
+# and never otherwise, so a production build has no such entry point at all —
+# the functions are compiled out, not merely hidden from the docs.
+test-seams = []
+
+[dev-dependencies]
+# The integration tests (`tests/activate.rs`) link the lib target, so the seam
+# must be compiled into that build. `cargo build`/`cargo build --release` never
+# resolve dev-dependencies, which is what keeps `test-seams` off in production.
+hm-release = { path = ".", features = ["test-seams"] }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+# BSD-3-Clause; registered in docs/commercial-licensing.md. Verification and
+# signing both live in this binary, never in the core (16 MiB gate).
+ed25519-dalek = { version = "2.2", features = ["std"] }
+# MIT/Apache-2.0; deterministic writer + path-traversal-safe reader.
+tar = "0.4"
+libc = "0.2"

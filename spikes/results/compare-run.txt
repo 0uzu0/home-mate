@@ -1,0 +1,24 @@
+=== §5 fixture decode comparison (same fixtures, three clients) ===
+client       fixture                  deltas calls args_ok   elapsed  error
+own(419)     glm-tool-normal               0     1    true    16.7ms  
+genai0.7.3   glm-tool-normal               0     1    true    18.0ms  
+rig0.46.0    glm-tool-normal               0     1    true    88.3ms  
+own(419)     glm-text-normal              14     0   false   100.4ms  
+genai0.7.3   glm-text-normal              14     0   false   100.5ms  
+rig0.46.0    glm-text-normal              14     0   false   103.5ms  
+own(419)     quirk-fragmented-tool         0     1    true    33.9ms  
+genai0.7.3   quirk-fragmented-tool         0     1    true    35.4ms  
+rig0.46.0    quirk-fragmented-tool         0     1    true    43.5ms  
+own(419)     quirk-missing-index           0     1    true    23.1ms  
+genai0.7.3   quirk-missing-index           0     1    true    21.1ms  
+rig0.46.0    quirk-missing-index           0     1    true    22.3ms  
+
+=== stall-after-first-event recovery ===
+own(419):   end after 20.005398708s
+genai0.7.3: failed: Web stream error for model 'mock-stall-body (adapter: OpenAI)'.
+Cause: model response body read timed out after 2.00692025s
+rig0.46.0:  failed: TimeoutError: the streamed reply sent nothing for 2s after 2.009776958s
+
+=== drop-cancellation: connection close latency ===
+wire-mock connection log (closed_ms - connected_ms = connection lifetime):
+[{"model":"glm-text-normal","connected_ms":1794053053961,"closed_ms":1794053053967,"close_reason":"body-dropped"},{"model":"glm-text-normal","connected_ms":1794053053964,"closed_ms":1794053053971,"close_reason":"body-dropped"},{"model":"glm-text-normal","connected_ms":1794053053967,"closed_ms":1794053053972,"close_reason":"body-dropped"}]

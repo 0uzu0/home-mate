@@ -1,0 +1,7 @@
+[toolchain]
+# Pins the compiler that can build the committed lockfile. ar_archive_writer
+# 0.5.5 (pulled in for tract-onnx) needs edition 2024, which rustc 1.83 cannot
+# parse. 1.100.0 is the stable that compiled and tested this lockfile.
+channel = "1.100.0"
+components = ["clippy"]
+profile = "minimal"

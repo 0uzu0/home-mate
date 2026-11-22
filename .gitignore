@@ -1,0 +1,33 @@
+# Local operating system files
+.DS_Store
+
+# Rust build output
+/target/
+
+# Release packages (23 MB each; signed artifacts are built, not committed)
+/build/
+
+# Frontend build output
+node_modules/
+/web/dist/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.local.yaml
+*.local.json
+
+# Runtime data and recordings
+/data/
+# At-rest secret key (M12a-1): never committed, whichever data dir it lands in
+secret.key
+/recordings/
+/logs/
+
+# Spike build output (isolated experiments, not product code)
+spikes/*/target/
+
+# Test-runtime data dir (wake-ack synth artifacts etc.)
+crates/hm-core/data-test/
+__pycache__/

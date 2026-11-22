@@ -1,0 +1,29 @@
+# NOT INSTALLABLE. NAS-era archive only. Do not copy this file into systemd.
+#
+# HM_GATEWAY_BIND below is a LAN address. A current core refuses any
+# non-loopback gateway bind and exits 1, so this unit cannot start as-is.
+# It stays in the tree because deploy/README.md, deploy/package-nas.sh,
+# docs/nas-deployment.md, and docs/HANDOFF.md still name the path.
+# The live shape is one core per speaker, gateway on 127.0.0.1.
+#
+# There is no install command in this header on purpose.
+[Unit]
+Description=Home Mate B core (NOT INSTALLABLE — NAS-era archive)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=yes999zc
+WorkingDirectory=/home/yes999zc/home-mate
+# Archive values only. This LAN gateway bind is why the unit cannot start.
+Environment=HM_BIND=192.168.1.34:8930
+Environment=HM_GATEWAY_BIND=192.168.1.34:8932
+Environment=HM_DATA_DIR=/home/yes999zc/home-mate/data
+Environment=HM_WEB_DIR=/home/yes999zc/home-mate/web/dist
+ExecStart=/home/yes999zc/home-mate/bin/hm-core
+Restart=on-failure
+RestartSec=3
+# Plain long-running service; SQLite lives in HM_DATA_DIR (no tmpfs).
+
+[Install]
+WantedBy=multi-user.target

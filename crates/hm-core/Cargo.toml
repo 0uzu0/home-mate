@@ -1,0 +1,57 @@
+[package]
+name = "hm-core"
+description = "Home Mate core service: brain loop, task runner, tool layer, management API"
+edition.workspace = true
+version.workspace = true
+license-file.workspace = true
+
+[features]
+default = ["silero-vad"]
+# In-process Silero VAD via tract-onnx (~9-10 MB static binary cost). Disable
+# with `--no-default-features` (or `./tools/build_core.sh --slim`) when the
+# device gateway provides neural VAD on `AudioChunk.vad_speech` (Stage 2).
+silero-vad = ["dep:tract-onnx"]
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+axum = { version = "0.8", features = ["multipart"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.43", features = ["bundled"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls"] }
+bytes = "1"
+futures = "0.3"
+async-trait = "0.1"
+thiserror = "2"
+base64 = "0.22"
+md-5 = "0.10"
+# M9 (2026-11-14): management-API bearer tokens are stored as SHA-256 only.
+# RustCrypto crate (MIT OR Apache-2.0), already in the workspace lock through
+# ed25519-dalek; registered in docs/commercial-licensing.md.
+sha2 = "0.10"
+# Music decode (A's proven choice, same pinned version): Subsonic/Personal
+# Services hand out the ORIGINAL file (mp3/flac) and the device only takes
+# PCM. symphonia is MPL-2.0 — recorded in docs/commercial-licensing.md.
+symphonia = { version = "=0.5.5", default-features = false, features = ["mp3", "flac", "wav", "pcm", "isomp4", "aac"] }
+pinyin = "0.11"
+# M1b (2026-11-13): Silero VAD v4 inference in-process. MIT OR Apache-2.0
+# (registered in docs/commercial-licensing.md). The model itself is not
+# embedded — it is loaded from <data_dir>/models/silero_vad.onnx, and a missing
+# model is the documented rollback to the energy VAD.
+tract-onnx = { version = "0.21", optional = true }
+libc = "0.2"
+# R2-BM6.3 (2026-11-13): Home Assistant's expose_entity/list is a WebSocket
+# command (no REST equivalent). MIT crate; registered in
+# docs/commercial-licensing.md together with tungstenite (MIT OR Apache-2.0).
+# The gateway already uses the same version for the EchoMuse WS server.
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# M12a-1 (2026-11-15): AEAD at rest for the secrets table. No `getrandom`
+# feature: nonces come from /dev/urandom through vault.rs like every other
+# 32-byte secret on this device, and the crate's OS-RNG glue is dead weight in
+# a 32 MiB update body. Apache-2.0 OR MIT (docs/commercial-licensing.md).
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }
