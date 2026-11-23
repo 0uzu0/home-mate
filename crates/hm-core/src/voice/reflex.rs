@@ -225,11 +225,7 @@ impl VoicePipeline {
                 let local = self
                     .arbiter
                     .passive_presence_for(device)
-                    .map(|mut c| {
-                        c.word = wake.to_string();
-                        c
-                    })
-                    .unwrap_or_else(|| self.build_claim(device, id::now_ms() as i64, None, wake));
+                    .unwrap_or_else(|| self.build_claim(device, id::now_ms() as i64, None, ""));
                 let all = if self.arbiter.peer_count() > 0 {
                     let round_id = self.arbiter.begin(local.clone());
                     let (claims, _answered, _peers) = self
@@ -384,6 +380,7 @@ impl VoicePipeline {
         self_heard: bool,
         rms_dbfs: Option<f32>,
         lag_ms: Option<u64>,
+        acoustics: WakeAcoustics,
         provenance: crate::gateway::InputProvenance,
     ) {
         let pipe = self.clone();
@@ -408,6 +405,7 @@ impl VoicePipeline {
                     provenance.clone(),
                     rms_dbfs,
                     lag_ms,
+                    acoustics.clone(),
                     true,
                     false,
                 );
@@ -457,8 +455,8 @@ impl VoicePipeline {
                             "action": "answered locally, single-node behaviour" }),
                 );
                 pipe.on_keyword_at(
-                    &device, &keyword, ts, fed_ms, self_heard, provenance, rms_dbfs, lag_ms, true,
-                    false,
+                    &device, &keyword, ts, fed_ms, self_heard, provenance, rms_dbfs, lag_ms,
+                    acoustics, true, false,
                 );
                 return;
             }
@@ -538,6 +536,7 @@ impl VoicePipeline {
                     provenance,
                     rms_dbfs,
                     lag_ms,
+                    acoustics,
                     true,
                     defer_takeover,
                 );
@@ -707,7 +706,17 @@ impl VoicePipeline {
         provenance: crate::gateway::InputProvenance,
     ) {
         self.on_keyword_at(
-            device, keyword, ts, fed_ms, self_heard, provenance, None, None, false, false,
+            device,
+            keyword,
+            ts,
+            fed_ms,
+            self_heard,
+            provenance,
+            None,
+            None,
+            WakeAcoustics::default(),
+            false,
+            false,
         )
     }
 
@@ -722,6 +731,7 @@ impl VoicePipeline {
         provenance: crate::gateway::InputProvenance,
         rms_dbfs: Option<f32>,
         lag_ms: Option<u64>,
+        mut acoustics: WakeAcoustics,
         arbitrated: bool,
         defer_takeover: bool,
     ) {
@@ -729,7 +739,7 @@ impl VoicePipeline {
             if self.check_fleet_bleed(device, keyword, self_heard, fed_ms) {
                 return;
             }
-            self.note("keyword_source", json!({ "device": device, "keyword": keyword, "ts": ts, "fed_ms": fed_ms, "provenance": provenance, "rms_dbfs": rms_dbfs, "lag_ms": lag_ms, "self_heard": self_heard }));
+            self.note("keyword_source", json!({ "device": device, "keyword": keyword, "ts": ts, "fed_ms": fed_ms, "provenance": provenance, "rms_dbfs": rms_dbfs, "lag_ms": lag_ms, "self_heard": self_heard, "kws_tier": acoustics.tier, "wake_dur_ms": acoustics.wake_dur_ms, "max_gap_ms": acoustics.max_gap_ms, "l2_passed": acoustics.l2_passed }));
         }
         let Some(identity) = self.source_identity(device, &provenance, "keyword") else {
             return;
@@ -869,6 +879,96 @@ impl VoicePipeline {
                 );
             }
         }
+        // Tier-3 PreWakeup acoustic gate (#261): runs BEFORE multi-room
+        // arbitration so a suspect hit or idle mid-sentence false trigger
+        // produces zero LED flash, zero ack, zero media pause, and zero
+        // household wake claim. Orthogonal to `proactive_asr_wake`: when off,
+        // the idle VAD segment stays `pending` and is skipped locally (100%
+        // XiaoAi native silent drop); when on, `asr_fallback` can still rescue
+        // genuine speech via ASR. Legacy gateways (`tier == None`) and active
+        // playback interruptions (where residual echo lowers barge-in SNR)
+        // bypass the suspect/mid-segment drop.
+        if !arbitrated && intent == interaction::KeywordIntent::Wake {
+            let playback_active = self.active_content(device).any()
+                || self.media_state(device) == Some(crate::tool::music::MediaState::Playing);
+            if acoustics.tier.as_deref() == Some("suspect") && !playback_active {
+                self.bump_reflex(device, keyword, false);
+                let proactive =
+                    crate::lock_or_recover(&self.settings, "voice.settings").proactive_asr_wake;
+                if let Some(st) =
+                    crate::lock_or_recover(&self.states, "voice.states").get_mut(device)
+                {
+                    st.keyword_ignored += 1;
+                    st.mic_counters.kws_suspect_dropped += 1;
+                }
+                self.note(
+                    "kws_suspect_wake_dropped",
+                    json!({
+                        "device": device,
+                        "keyword": keyword,
+                        "reason": "l2_or_duration_rejected",
+                        "wake_dur_ms": acoustics.wake_dur_ms,
+                        "max_gap_ms": acoustics.max_gap_ms,
+                        "l2_passed": acoustics.l2_passed,
+                        "proactive_asr_wake": proactive,
+                    }),
+                );
+                return;
+            }
+            if acoustics.tier.as_deref() == Some("real") {
+                // Capture the exact `wakeup_end` block cursor BEFORE any 200 ms
+                // arbitration delay so Tier-2 timeline slicing does not drift
+                // into a one-shot command spoken during arbitration.
+                acoustics.wake_end_cursor = crate::lock_or_recover(&self.mic, "voice.mic")
+                    .get(device)
+                    .map(|p| {
+                        p.current_block_cursor()
+                            .saturating_sub(lag_ms.unwrap_or(0) / 80)
+                    });
+                let session_open_now = crate::lock_or_recover(&self.states, "voice.states")
+                    .get(device)
+                    .is_some_and(|st| st.session_open(now));
+                if !playback_active && !session_open_now {
+                    let (elapsed_ms, control_only) = crate::lock_or_recover(&self.mic, "voice.mic")
+                        .get(device)
+                        .map(|p| (p.open_speech_elapsed_ms(), p.open_is_control_only()))
+                        .unwrap_or((0, false));
+                    if !control_only {
+                        let wake_span_ms = acoustics
+                            .wake_dur_ms
+                            .unwrap_or(700)
+                            .saturating_add(lag_ms.unwrap_or(0));
+                        let pre_wake_ms = elapsed_ms.saturating_sub(wake_span_ms);
+                        if pre_wake_ms > 800 {
+                            self.bump_reflex(device, keyword, false);
+                            let proactive =
+                                crate::lock_or_recover(&self.settings, "voice.settings")
+                                    .proactive_asr_wake;
+                            if let Some(st) =
+                                crate::lock_or_recover(&self.states, "voice.states").get_mut(device)
+                            {
+                                st.keyword_ignored += 1;
+                                st.mic_counters.kws_suspect_dropped += 1;
+                            }
+                            self.note(
+                                "kws_suspect_wake_dropped",
+                                json!({
+                                    "device": device,
+                                    "keyword": keyword,
+                                    "reason": "mid_segment_wake_trigger",
+                                    "pre_wake_speech_ms": pre_wake_ms,
+                                    "open_speech_elapsed_ms": elapsed_ms,
+                                    "wake_dur_ms": acoustics.wake_dur_ms,
+                                    "lag_ms": lag_ms,
+                                    "proactive_asr_wake": proactive,
+                                }),
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+        }
         // Wake arbitration (2026-11-15): only a WAKE is contested. A retreat
         // or a transport word is this device's own business and must never
         // wait for another room's opinion.
@@ -890,6 +990,7 @@ impl VoicePipeline {
                             self_heard,
                             rms_dbfs,
                             lag_ms,
+                            acoustics,
                             provenance,
                         );
                         return; // the spawned task answers immediately
@@ -905,6 +1006,7 @@ impl VoicePipeline {
                             self_heard,
                             rms_dbfs,
                             lag_ms,
+                            acoustics,
                             provenance,
                         );
                         return; // the spawned task decides, then re-enters
@@ -953,7 +1055,14 @@ impl VoicePipeline {
                     None
                 };
                 let _ = defer_takeover;
-                let (result, epoch, permit, bookmark, bare_wake_closed_during_arbitration) = {
+                let (
+                    result,
+                    epoch,
+                    permit,
+                    bookmark,
+                    bare_wake_closed_during_arbitration,
+                    arm_slice_cursor,
+                ) = {
                     let mut states = crate::lock_or_recover(&self.states, "voice.states");
                     let Some(st) = states.get_mut(device) else {
                         return;
@@ -986,11 +1095,20 @@ impl VoicePipeline {
                         return;
                     };
                     self.restore_wake_capture_locked(device, st, capture, &provenance, context);
+                    let mic_closed_ms = crate::lock_or_recover(&self.mic, "voice.mic")
+                        .get(device)
+                        .and_then(|p| p.last_close_ms());
+                    let last_close_ms = match (st.mic_last_close_ms, mic_closed_ms) {
+                        (Some(a), Some(b)) => Some(a.max(b)),
+                        (a, b) => a.or(b),
+                    };
+                    let bare_wake_close_window_ms =
+                        600u64.saturating_add(lag_ms.unwrap_or(0).min(800));
                     let bare_wake_closed = !content.media
                         && st.input.is_none()
-                        && st
-                            .mic_last_close_ms
-                            .is_some_and(|closed_ms| now.saturating_sub(closed_ms) <= 600);
+                        && last_close_ms.is_some_and(|closed_ms| {
+                            now.saturating_sub(closed_ms) <= bare_wake_close_window_ms
+                        });
                     st.participation.opened_by = Some("keyword");
                     st.last_wake = Some((
                         "kws".into(),
@@ -1003,13 +1121,38 @@ impl VoicePipeline {
                     } else {
                         Some("keyword")
                     };
+                    // Arm Tier-2 physical timeline slicing ONLY when a capture lease was
+                    // actually transferred (never on a closed segment or media interrupt,
+                    // which would risk slicing a subsequent follow-up utterance).
+                    let arm_slice_cursor = if !content.media
+                        && st.input.is_some()
+                        && acoustics.tier.as_deref() == Some("real")
+                        && wake_timeline_slice_enabled()
+                    {
+                        acoustics.wake_end_cursor
+                    } else {
+                        None
+                    };
                     let permit = OutputPermit {
                         generation: st.participation.generation(),
                         stop_epoch: st.stop_epoch,
                         request: None,
                     };
-                    (result, st.kws_epoch, permit, bookmark, bare_wake_closed)
+                    (
+                        result,
+                        st.kws_epoch,
+                        permit,
+                        bookmark,
+                        bare_wake_closed,
+                        arm_slice_cursor,
+                    )
                 };
+                if let Some(end_cursor) = arm_slice_cursor {
+                    if let Some(p) = crate::lock_or_recover(&self.mic, "voice.mic").get_mut(device)
+                    {
+                        p.arm_wake_slice(end_cursor);
+                    }
+                }
                 self.claim_sovereignty(device, now);
                 if !bookmark.is_null() {
                     self.note(

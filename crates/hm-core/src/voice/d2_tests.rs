@@ -118,6 +118,7 @@ async fn d2_exit_transcript_precedes_zero_credits_and_live_voice() {
         capture_seq: 1,
         window_epoch: 0,
         control_only: false,
+        wake_sliced: false,
         ticket: crate::mic::CaptureProvenance::legacy(0),
         enqueued_at: std::time::Instant::now(),
     })
@@ -191,6 +192,7 @@ async fn d2_old_events_and_deferred_ack_are_inert_in_every_order_after_reactivat
                             window_epoch: 0,
                             ticket: crate::mic::CaptureProvenance::chunk(old.clone(), 1280),
                             control_only: false,
+                            wake_sliced: false,
                             enqueued_at: std::time::Instant::now(),
                         })
                         .await
@@ -786,6 +788,7 @@ async fn rc2_rc3_rc4_serial94_field_audit_regressions() {
         InputProvenance::default(),
         Some(-38.58),
         Some(90),
+        WakeAcoustics::default(),
         false,
         false,
     );
@@ -812,6 +815,7 @@ async fn rc2_rc3_rc4_serial94_field_audit_regressions() {
         InputProvenance::default(),
         Some(-17.63),
         Some(90),
+        WakeAcoustics::default(),
         false,
         false,
     );
@@ -866,6 +870,7 @@ async fn rc2_rc3_rc4_serial94_field_audit_regressions() {
         InputProvenance::default(),
         Some(-15.9),
         Some(90),
+        WakeAcoustics::default(),
         true,
         true, // defer_takeover = true (Solo / < 6 dB margin)
     );

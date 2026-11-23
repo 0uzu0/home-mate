@@ -455,6 +455,7 @@ async fn pure_punctuation_transcripts_are_ignored_without_consuming_followup_whi
             capture_seq: input_id,
             window_epoch,
             control_only: false,
+            wake_sliced: false,
             ticket: crate::mic::CaptureProvenance::legacy(0),
             enqueued_at: std::time::Instant::now(),
         }

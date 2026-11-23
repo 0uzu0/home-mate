@@ -1587,6 +1587,10 @@ impl DeviceHub {
                 origin,
                 bundle_id,
                 kws_generation,
+                kws_tier,
+                wake_dur_ms,
+                max_gap_ms,
+                l2_passed,
             } => {
                 let provenance = InputProvenance {
                     origin,
@@ -1632,6 +1636,8 @@ impl DeviceHub {
                     json!({ "device": device, "keyword": keyword, "seq": seq, "fed_ms": fed_ms,
                             "self_heard": self_heard, "rms_dbfs": rms_dbfs, "lag_ms": lag_ms,
                             "bundle_id": bundle_id, "kws_generation": kws_generation,
+                            "kws_tier": kws_tier, "wake_dur_ms": wake_dur_ms,
+                            "max_gap_ms": max_gap_ms, "l2_passed": l2_passed,
                             "provenance": provenance }),
                 );
                 self.emit_control(DeviceEvent::Keyword {
@@ -1642,6 +1648,10 @@ impl DeviceHub {
                     self_heard,
                     rms_dbfs,
                     lag_ms,
+                    kws_tier,
+                    wake_dur_ms,
+                    max_gap_ms,
+                    l2_passed,
                     provenance,
                 });
             }

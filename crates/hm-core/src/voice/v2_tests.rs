@@ -36,6 +36,7 @@ fn transcript(device: &str, text: &str, input_id: u64) -> MicTranscript {
         capture_seq: input_id,
         window_epoch: 0,
         control_only: false,
+        wake_sliced: false,
         ticket: crate::mic::CaptureProvenance::legacy(0),
         enqueued_at: std::time::Instant::now(),
     }
@@ -704,6 +705,7 @@ async fn confirmation_reply_bypasses_mic_filler_ignored_when_close_confirmation_
         capture_seq: input_id,
         window_epoch: 0,
         control_only: false,
+        wake_sliced: false,
         enqueued_at: std::time::Instant::now(),
     };
 
@@ -763,6 +765,7 @@ async fn confirmation_table_expiry_gates_mic_filler_bypass() {
         capture_seq: input_id,
         window_epoch: 0,
         control_only: false,
+        wake_sliced: false,
         enqueued_at: std::time::Instant::now(),
     };
 
@@ -1792,9 +1795,10 @@ async fn bathroom_dot2a_just_ended_presence_and_misrecognized_bare_wake_regressi
         "dismissed unwoken transcript must clear peer passive_presence"
     );
 
-    // 3. Bare wake segment transferred across KWS ("你好小智", 1120 ms) but mis-transcribed
-    // by ASR as 4-char near-homophone "据我所知。" must be treated as InWindow::Bare (play wake_ack)
-    // rather than dispatched to the LLM as a command.
+    // 3. Any KWS wake-transferred segment (short like "还显不显示？" at 1600 ms or
+    // long like "游戏画面，看到没有..." at 12000 ms) that contains NO wake word in
+    // the ASR transcript (`c == text`) is rejected by `kws_wake_rejected_by_asr`
+    // and silently retreats the session to Idle without playing wake_ack or calling the LLM.
     let loud = vec![6000i16; 1280];
     for i in 0..4u64 {
         pipe.feed_chunk(
@@ -1815,33 +1819,1018 @@ async fn bathroom_dot2a_just_ended_presence_and_misrecognized_bare_wake_regressi
         crate::gateway::InputProvenance::default(),
     );
     let transferred_id = {
-        let states = pipe.states.lock().unwrap();
-        let st = states.get(dev).unwrap();
-        assert_eq!(st.window_opener, Some("keyword"));
-        st.last_wake_transferred_input_id
-            .expect("transferred input id")
-    };
-    {
         let mut states = pipe.states.lock().unwrap();
         let st = states.get_mut(dev).unwrap();
+        assert_eq!(st.window_opener, Some("keyword"));
+        let id = st
+            .last_wake_transferred_input_id
+            .expect("transferred input id");
         let input = st.input.as_mut().expect("transferred input lease");
         input.recognizing = true;
         st.mic_counters.asr_inflight += 1;
-    }
-    let mut t = transcript(dev, "据我所知。", transferred_id);
+        id
+    };
+    let mut t = transcript(dev, "还显不显示？", transferred_id);
     t.leased = true;
     t.window_epoch = 1;
-    t.duration_ms = 1120;
+    t.duration_ms = 1600;
     pipe.handle_mic_transcript(t).await;
     let events = pipe.recent(30);
     assert!(
         events
             .iter()
-            .any(|e| e["kind"] == "mic_wake_echo_in_window" && e["text"] == "据我所知。"),
-        "misrecognized short wake-transferred segment must fold to Bare wake: {events:?}"
+            .any(|e| e["kind"] == "kws_wake_rejected_by_asr" && e["device"] == dev),
+        "short unconfirmed wake-transferred segment must be rejected by ASR secondary confirmation: {events:?}"
     );
     assert!(
-        !events.iter().any(|e| e["kind"] == "request_started"),
-        "misrecognized bare wake must not start an LLM request: {events:?}"
+        !events
+            .iter()
+            .any(|e| e["kind"] == "request_started" || e["kind"] == "wake_ack"),
+        "rejected short KWS false wake must not play wake_ack or start an LLM turn: {events:?}"
+    );
+
+    let bedroom = "dot2-bedroom";
+    ensure_device(&pipe, bedroom);
+    for i in 0..4u64 {
+        pipe.feed_chunk(
+            bedroom.into(),
+            loud.clone(),
+            16_000,
+            1,
+            now + 1000 + i * 80,
+            crate::gateway::InputProvenance::default(),
+        );
+    }
+    pipe.on_keyword(
+        bedroom,
+        "你好高达",
+        now + 1320,
+        Some(320),
+        false,
+        crate::gateway::InputProvenance::default(),
+    );
+    let peer_transferred_id = {
+        let mut states = pipe.states.lock().unwrap();
+        let st = states.get_mut(bedroom).unwrap();
+        assert_eq!(st.window_opener, Some("keyword"));
+        let id = st
+            .last_wake_transferred_input_id
+            .expect("peer transferred id");
+        let input = st.input.as_mut().expect("peer transferred input lease");
+        input.recognizing = true;
+        st.mic_counters.asr_inflight += 1;
+        id
+    };
+    let mut tv_t = transcript(
+        bedroom,
+        "游戏画面，看到没有？就是不知道什么时候咱们这里开始推送这样的版本。据说这个看起来像实际接近的画面，全部是通过摄像头采集画面之后，再用算法像游戏画面一样把。",
+        peer_transferred_id,
+    );
+    tv_t.leased = true;
+    tv_t.window_epoch = 1;
+    tv_t.duration_ms = 12_000;
+    pipe.handle_mic_transcript(tv_t).await;
+    let peer_events = pipe.recent(30);
+    assert!(
+        peer_events
+            .iter()
+            .any(|e| e["kind"] == "kws_wake_rejected_by_asr" && e["device"] == bedroom),
+        "unconfirmed long wake-transferred segment must emit kws_wake_rejected_by_asr: {peer_events:?}"
+    );
+    assert!(
+        !peer_events.iter().any(|e| e["kind"] == "request_started"),
+        "rejected KWS false wake must not start an LLM turn: {peer_events:?}"
+    );
+    assert_eq!(
+        pipe.states
+            .lock()
+            .unwrap()
+            .get(bedroom)
+            .unwrap()
+            .participation
+            .session
+            .state,
+        SessionState::Idle,
+        "rejected KWS false wake must silently close the session back to Idle"
+    );
+}
+
+#[tokio::test]
+async fn xiaoai_3tier_wake_suspect_drop_mid_segment_bare_wake_and_oneshot_slice() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ScriptedAsr {
+        calls: Arc<AtomicUsize>,
+        replies: Arc<Mutex<VecDeque<Result<String, String>>>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::speech::AsrClient for ScriptedAsr {
+        async fn transcribe(&self, _wav: &[u8]) -> Result<String, crate::speech::SpeechError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self
+                .replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Ok(String::new()))
+            {
+                Ok(text) => Ok(text),
+                Err(msg) => Err(crate::speech::SpeechError::Transport(msg)),
+            }
+        }
+        fn provider(&self) -> &str {
+            "scripted-test-asr"
+        }
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    let asr_calls = Arc::new(AtomicUsize::new(0));
+    let asr_replies = Arc::new(Mutex::new(VecDeque::from([
+        Ok("现在几点了".into()), // d4: oneshot sliced command
+        Ok("咳。".into()),       // d7: oneshot sliced filler
+        Ok(String::new()),       // d8: oneshot sliced empty/unusable
+        Ok("明天天气".into()),   // d10: pre-arbitration cursor survival
+        Ok("据我所知。".into()), // d11: HM_WAKE_TIMELINE_SLICE=0 rollback
+    ])));
+    let asr_calls_f = asr_calls.clone();
+    let asr_replies_f = asr_replies.clone();
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let hub = DeviceHub::new();
+    let music = crate::tool::music::MusicRuntime::new(store.clone(), hub.clone());
+    let pipe = VoicePipeline::new(
+        hub,
+        store.clone(),
+        Arc::new(TaskRegistry::new(store)),
+        Arc::new(|| Err("isolated: no agent".into())),
+        Arc::new(|| Err("isolated: no TTS".into())),
+        Arc::new(move || {
+            Ok(Arc::new(ScriptedAsr {
+                calls: asr_calls_f.clone(),
+                replies: asr_replies_f.clone(),
+            }))
+        }),
+        std::env::temp_dir().join(id::next("hm-xiaoai-3tier")),
+    );
+    pipe.attach_music(&music);
+    {
+        let mut s = pipe.settings.lock().unwrap();
+        s.follow_window_enabled = true;
+        s.proactive_asr_wake = false;
+        s.wake_words = vec!["你好小智".into()];
+    }
+    pipe.project_follow_window_policy();
+    let mut mic_rx = pipe.mic_rx.lock().unwrap().take().expect("mic_rx");
+
+    let now = id::now_ms();
+    let loud = vec![10_000i16; 1280];
+    let quiet = vec![0i16; 1280];
+
+    // 1) Tier-3 Suspect drop with proactive_asr_wake=false:
+    //    zero session activation, zero ASR call, kws_suspect_wake_dropped emitted.
+    let d1 = "dot2-suspect";
+    ensure_device(&pipe, d1);
+    for i in 0..6u64 {
+        pipe.feed_chunk(
+            d1.into(),
+            loud.clone(),
+            16_000,
+            1,
+            now + i * 80,
+            crate::gateway::InputProvenance::default(),
+        );
+    }
+    pipe.on_keyword_at(
+        d1,
+        "你好小智",
+        now + 480,
+        Some(480),
+        false,
+        crate::gateway::InputProvenance::default(),
+        Some(-22.0),
+        Some(40),
+        WakeAcoustics {
+            tier: Some("suspect".into()),
+            wake_dur_ms: Some(180),
+            max_gap_ms: Some(420),
+            l2_passed: Some(false),
+            wake_end_cursor: None,
+        },
+        false,
+        false,
+    );
+    assert_eq!(
+        pipe.states.lock().unwrap()[d1].participation.session.state,
+        SessionState::Idle,
+        "suspect KWS wake must not open a session"
+    );
+    assert_eq!(
+        pipe.states.lock().unwrap()[d1]
+            .mic_counters
+            .kws_suspect_dropped,
+        1
+    );
+    for i in 6..18u64 {
+        pipe.feed_chunk(
+            d1.into(),
+            quiet.clone(),
+            16_000,
+            1,
+            now + i * 80,
+            crate::gateway::InputProvenance::default(),
+        );
+    }
+    assert_eq!(
+        asr_calls.load(Ordering::SeqCst),
+        0,
+        "suspect wake with proactive_asr_wake=false must skip ASR completely"
+    );
+    assert!(
+        pipe.recent(30).iter().any(|e| {
+            e["kind"] == "kws_suspect_wake_dropped"
+                && e["device"] == d1
+                && e["reason"] == "l2_or_duration_rejected"
+        }),
+        "must emit kws_suspect_wake_dropped"
+    );
+
+    // 2) Tier-3 Mid-segment idle drop (e.g. 2.4 s TV monologue before a real KWS hit):
+    let d2 = "dot2-midseg";
+    ensure_device(&pipe, d2);
+    for i in 0..30u64 {
+        pipe.feed_chunk(
+            d2.into(),
+            loud.clone(),
+            16_000,
+            1,
+            now + i * 80,
+            crate::gateway::InputProvenance::default(),
+        );
+    }
+    pipe.on_keyword_at(
+        d2,
+        "你好小智",
+        now + 2400,
+        Some(2400),
+        false,
+        crate::gateway::InputProvenance::default(),
+        Some(-20.0),
+        Some(40),
+        WakeAcoustics {
+            tier: Some("real".into()),
+            wake_dur_ms: Some(720),
+            max_gap_ms: Some(120),
+            l2_passed: Some(true),
+            wake_end_cursor: None,
+        },
+        false,
+        false,
+    );
+    assert_eq!(
+        pipe.states.lock().unwrap()[d2].participation.session.state,
+        SessionState::Idle,
+        "mid-segment idle KWS trigger (>800 ms pre-wake speech) must be dropped silently"
+    );
+    assert!(
+        pipe.recent(30).iter().any(|e| {
+            e["kind"] == "kws_suspect_wake_dropped"
+                && e["device"] == d2
+                && e["reason"] == "mid_segment_wake_trigger"
+        }),
+        "must emit mid_segment_wake_trigger"
+    );
+
+    // 3) Tier-2 wakeup-normal (Bare Wake): real hit + silence -> skip ASR, confirm locally.
+    let d3 = "dot2-bare";
+    ensure_device(&pipe, d3);
+    for i in 0..9u64 {
+        pipe.feed_chunk(
+            d3.into(),
+            loud.clone(),
+            16_000,
+            1,
+            now + i * 80,
+            crate::gateway::InputProvenance::default(),
+        );
+    }
+    pipe.on_keyword_at(
+        d3,
+        "你好小智",
+        now + 720,
+        Some(720),
+        false,
+        crate::gateway::InputProvenance::default(),
+        Some(-20.0),
+        Some(0),
+        WakeAcoustics {
+            tier: Some("real".into()),
+            wake_dur_ms: Some(720),
+            max_gap_ms: Some(120),
+            l2_passed: Some(true),
+            wake_end_cursor: None,
+        },
+        false,
+        false,
+    );
+    assert_eq!(
+        pipe.states.lock().unwrap()[d3].participation.session.state,
+        SessionState::Listening
+    );
+    for i in 9..20u64 {
+        pipe.feed_chunk(
+            d3.into(),
+            quiet.clone(),
+            16_000,
+            1,
+            now + i * 80,
+            crate::gateway::InputProvenance::default(),
+        );
+    }
+    assert_eq!(
+        asr_calls.load(Ordering::SeqCst),
+        0,
+        "verified bare wake must NOT call ASR"
+    );
+    assert_eq!(
+        pipe.states.lock().unwrap()[d3]
+            .mic_counters
+            .bare_wake_asr_skipped,
+        1
+    );
+    assert_eq!(
+        pipe.states.lock().unwrap()[d3].participation.session.state,
+        SessionState::Listening,
+        "bare wake must keep Listening follow-up window open"
+    );
+    assert!(
+        pipe.recent(30)
+            .iter()
+            .any(|e| e["kind"] == "kws_bare_wake_confirmed" && e["device"] == d3),
+        "must emit kws_bare_wake_confirmed"
+    );
+
+    // Verify mode_snapshot() exposes both new counters on live devices.
+    let snap = pipe.mode_snapshot();
+    let devs = snap["devices"].as_array().expect("devices array");
+    let snap_d1 = devs.iter().find(|d| d["device"] == d1).expect("d1 in snap");
+    assert_eq!(snap_d1["mic"]["counters"]["kws_suspect_dropped"], json!(1));
+    let snap_d3 = devs.iter().find(|d| d["device"] == d3).expect("d3 in snap");
+    assert_eq!(
+        snap_d3["mic"]["counters"]["bare_wake_asr_skipped"],
+        json!(1)
+    );
+
+    // 4) Tier-2 wakeup-oneshot (CommandSliced): real hit + 6 command blocks ->
+    //    sliced audio sent to ASR, wake-free command "现在几点了" admitted directly.
+    let d4 = "dot2-oneshot";
+    ensure_device(&pipe, d4);
+    for i in 0..8u64 {
+        pipe.feed_chunk(
+            d4.into(),
+            loud.clone(),
+            16_000,
+            1,
+            now + i * 80,
+            crate::gateway::InputProvenance::default(),
+        );
+    }
+    pipe.on_keyword_at(
+        d4,
+        "你好小智",
+        now + 640,
+        Some(640),
+        false,
+        crate::gateway::InputProvenance::default(),
+        Some(-20.0),
+        Some(0),
+        WakeAcoustics {
+            tier: Some("real".into()),
+            wake_dur_ms: Some(640),
+            max_gap_ms: Some(120),
+            l2_passed: Some(true),
+            wake_end_cursor: None,
+        },
+        false,
+        false,
+    );
+    for i in 8..14u64 {
+        pipe.feed_chunk(
+            d4.into(),
+            loud.clone(),
+            16_000,
+            1,
+            now + i * 80,
+            crate::gateway::InputProvenance::default(),
+        );
+    }
+    for i in 14..26u64 {
+        pipe.feed_chunk(
+            d4.into(),
+            quiet.clone(),
+            16_000,
+            1,
+            now + i * 80,
+            crate::gateway::InputProvenance::default(),
+        );
+    }
+    let tx_msg = tokio::time::timeout(std::time::Duration::from_secs(2), mic_rx.recv())
+        .await
+        .expect("oneshot ASR transcript timeout")
+        .expect("oneshot ASR transcript");
+    assert!(
+        tx_msg.wake_sliced,
+        "oneshot transcript must be marked wake_sliced=true"
+    );
+    assert_eq!(asr_calls.load(Ordering::SeqCst), 1);
+    pipe.handle_mic_transcript(tx_msg).await;
+    let evs = pipe.recent(40);
+    assert!(
+        evs.iter()
+            .any(|e| e["kind"] == "kws_oneshot_sliced_admitted" && e["device"] == d4),
+        "sliced oneshot command must be admitted without wake word in transcript: {evs:?}"
+    );
+    assert!(
+        !evs.iter()
+            .any(|e| e["kind"] == "kws_wake_rejected_by_asr" && e["device"] == d4),
+        "sliced oneshot command must NOT be rejected by kws_wake_rejected_by_asr"
+    );
+
+    // 5) Orthogonal proactive_asr_wake=true: suspect wake still drops before arbitration,
+    //    while the idle VAD segment stays `asr_fallback` and wakes ONLY if ASR matches wake word.
+    {
+        pipe.settings.lock().unwrap().proactive_asr_wake = true;
+    }
+    let d5 = "dot2-suspect-fallback";
+    ensure_device(&pipe, d5);
+    for i in 0..6u64 {
+        pipe.feed_chunk(
+            d5.into(),
+            loud.clone(),
+            16_000,
+            1,
+            now + i * 80,
+            crate::gateway::InputProvenance::default(),
+        );
+    }
+    pipe.on_keyword_at(
+        d5,
+        "你好小智",
+        now + 480,
+        Some(480),
+        false,
+        crate::gateway::InputProvenance::default(),
+        Some(-22.0),
+        Some(40),
+        WakeAcoustics {
+            tier: Some("suspect".into()),
+            wake_dur_ms: Some(180),
+            max_gap_ms: Some(420),
+            l2_passed: Some(false),
+            wake_end_cursor: None,
+        },
+        false,
+        false,
+    );
+    assert_eq!(
+        pipe.states.lock().unwrap()[d5].participation.session.state,
+        SessionState::Idle,
+        "suspect wake must stay idle before ASR even when proactive_asr_wake=true"
+    );
+    assert_eq!(
+        pipe.states.lock().unwrap()[d5]
+            .input
+            .as_ref()
+            .map(|i| i.eligibility),
+        Some("asr_fallback"),
+        "when proactive_asr_wake=true, idle segment remains eligible for ASR fallback"
+    );
+    {
+        pipe.settings.lock().unwrap().proactive_asr_wake = false;
+    }
+
+    // 6) Non-wake reflex intent (Retreat) is unaffected by kws_tier="suspect".
+    let d6 = "dot2-retreat";
+    ensure_device(&pipe, d6);
+    pipe.open_participation(d6, CreditGrant::Full);
+    pipe.claim_sovereignty(d6, now);
+    pipe.on_keyword_at(
+        d6,
+        "停止播放",
+        now + 500,
+        Some(500),
+        false,
+        crate::gateway::InputProvenance::default(),
+        Some(-18.0),
+        Some(20),
+        WakeAcoustics {
+            tier: Some("suspect".into()),
+            wake_dur_ms: Some(220),
+            max_gap_ms: Some(120),
+            l2_passed: Some(false),
+            wake_end_cursor: None,
+        },
+        false,
+        false,
+    );
+    assert_eq!(
+        pipe.states.lock().unwrap()[d6].participation.close_reason,
+        Some(participation::CloseReason::ExplicitExit),
+        "Retreat reflex must execute regardless of kws_tier=suspect"
+    );
+
+    // 7) Real end-to-end CommandSliced + post-wake filler ("咳。") consumes keyword window
+    //    and confirms bare wake instead of leaving the user silent.
+    let d7 = "dot2-sliced-filler";
+    ensure_device(&pipe, d7);
+    for i in 0..8u64 {
+        pipe.feed_chunk(
+            d7.into(),
+            loud.clone(),
+            16_000,
+            1,
+            now + i * 80,
+            crate::gateway::InputProvenance::default(),
+        );
+    }
+    pipe.on_keyword_at(
+        d7,
+        "你好小智",
+        now + 640,
+        Some(640),
+        false,
+        crate::gateway::InputProvenance::default(),
+        Some(-20.0),
+        Some(0),
+        WakeAcoustics {
+            tier: Some("real".into()),
+            wake_dur_ms: Some(640),
+            max_gap_ms: Some(120),
+            l2_passed: Some(true),
+            wake_end_cursor: None,
+        },
+        false,
+        false,
+    );
+    for i in 8..12u64 {
+        pipe.feed_chunk(
+            d7.into(),
+            loud.clone(),
+            16_000,
+            1,
+            now + i * 80,
+            crate::gateway::InputProvenance::default(),
+        );
+    }
+    for i in 12..24u64 {
+        pipe.feed_chunk(
+            d7.into(),
+            quiet.clone(),
+            16_000,
+            1,
+            now + i * 80,
+            crate::gateway::InputProvenance::default(),
+        );
+    }
+    let filler_tx = tokio::time::timeout(std::time::Duration::from_secs(2), mic_rx.recv())
+        .await
+        .expect("filler ASR transcript timeout")
+        .expect("filler ASR transcript");
+    assert!(filler_tx.wake_sliced);
+    pipe.handle_mic_transcript(filler_tx).await;
+    assert!(
+        pipe.recent(30).iter().any(|e| {
+            e["kind"] == "kws_bare_wake_confirmed"
+                && e["device"] == d7
+                && e["reason"] == "post_wake_filler_only"
+        }),
+        "post-wake filler on wake_sliced segment must confirm bare wake"
+    );
+
+    // 8) Real end-to-end CommandSliced + empty/unusable ASR still triggers wake ack fallback.
+    let d8 = "dot2-sliced-empty";
+    ensure_device(&pipe, d8);
+    for i in 0..8u64 {
+        pipe.feed_chunk(
+            d8.into(),
+            loud.clone(),
+            16_000,
+            1,
+            now + i * 80,
+            crate::gateway::InputProvenance::default(),
+        );
+    }
+    pipe.on_keyword_at(
+        d8,
+        "你好小智",
+        now + 640,
+        Some(640),
+        false,
+        crate::gateway::InputProvenance::default(),
+        Some(-20.0),
+        Some(0),
+        WakeAcoustics {
+            tier: Some("real".into()),
+            wake_dur_ms: Some(640),
+            max_gap_ms: Some(120),
+            l2_passed: Some(true),
+            wake_end_cursor: None,
+        },
+        false,
+        false,
+    );
+    for i in 8..12u64 {
+        pipe.feed_chunk(
+            d8.into(),
+            loud.clone(),
+            16_000,
+            1,
+            now + i * 80,
+            crate::gateway::InputProvenance::default(),
+        );
+    }
+    for i in 12..24u64 {
+        pipe.feed_chunk(
+            d8.into(),
+            quiet.clone(),
+            16_000,
+            1,
+            now + i * 80,
+            crate::gateway::InputProvenance::default(),
+        );
+    }
+    let empty_tx = tokio::time::timeout(std::time::Duration::from_secs(2), mic_rx.recv())
+        .await
+        .expect("empty ASR transcript timeout")
+        .expect("empty ASR transcript");
+    assert!(empty_tx.wake_sliced);
+    pipe.handle_mic_transcript(empty_tx).await;
+    tokio::task::yield_now().await;
+    assert!(
+        pipe.recent(30).iter().any(|e| {
+            e["kind"] == "mic_segment_empty" && e["device"] == d8 && e["wake_sliced"] == json!(true)
+        }),
+        "empty post-wake slice must record wake_sliced=true"
+    );
+    assert_eq!(
+        pipe.states.lock().unwrap()[d8].window_opener,
+        None,
+        "empty post-wake slice must consume keyword window to fire wake ack fallback"
+    );
+
+    // 9) Playback-active wakes (both `suspect` and `real` with >800 ms pre-wake echo)
+    //    must NOT be blocked by Tier-3 PreWakeup drop, and media takeover must NOT arm wake_slice.
+    let d9 = "dot2-media-wake";
+    ensure_device(&pipe, d9);
+    music.seed_media_session_for_test(
+        d9,
+        crate::tool::music::MediaSession {
+            tracks: vec![crate::tool::music::Track {
+                source: crate::tool::music::Source::Library,
+                id: "m1".into(),
+                title: "夜曲".into(),
+                artist: "周杰伦".into(),
+                binding: "lib".into(),
+            }],
+            index: 0,
+            state: crate::tool::music::MediaState::Playing,
+            position_ms: 5_000,
+            play_id: None,
+            started_ms: now,
+            base_ms: 5_000,
+            updated_ms: now,
+            repeat: crate::tool::music::RepeatMode::Off,
+        },
+    );
+    for i in 0..20u64 {
+        pipe.feed_chunk(
+            d9.into(),
+            loud.clone(),
+            16_000,
+            1,
+            now + i * 80,
+            crate::gateway::InputProvenance::default(),
+        );
+    }
+    pipe.on_keyword_at(
+        d9,
+        "你好小智",
+        now + 1600,
+        Some(1600),
+        false,
+        crate::gateway::InputProvenance::default(),
+        Some(-18.0),
+        Some(20),
+        WakeAcoustics {
+            tier: Some("suspect".into()),
+            wake_dur_ms: Some(320),
+            max_gap_ms: Some(150),
+            l2_passed: Some(false),
+            wake_end_cursor: None,
+        },
+        false,
+        false,
+    );
+    assert_eq!(
+        pipe.media_state(d9),
+        Some(crate::tool::music::MediaState::Paused),
+        "playback-active suspect wake must NOT be dropped; it must pause media and wake"
+    );
+    assert_eq!(
+        pipe.states.lock().unwrap()[d9].participation.session.state,
+        SessionState::Listening
+    );
+    // Also verify playback-active real wake with >800 ms pre-wake audio is NOT dropped
+    // and does NOT arm wake_cut_cursor on media takeover.
+    let d9b = "dot2-media-real";
+    ensure_device(&pipe, d9b);
+    music.seed_media_session_for_test(
+        d9b,
+        crate::tool::music::MediaSession {
+            tracks: vec![crate::tool::music::Track {
+                source: crate::tool::music::Source::Library,
+                id: "m2".into(),
+                title: "稻香".into(),
+                artist: "周杰伦".into(),
+                binding: "lib".into(),
+            }],
+            index: 0,
+            state: crate::tool::music::MediaState::Playing,
+            position_ms: 8_000,
+            play_id: None,
+            started_ms: now,
+            base_ms: 8_000,
+            updated_ms: now,
+            repeat: crate::tool::music::RepeatMode::Off,
+        },
+    );
+    for i in 0..30u64 {
+        pipe.feed_chunk(
+            d9b.into(),
+            loud.clone(),
+            16_000,
+            1,
+            now + i * 80,
+            crate::gateway::InputProvenance::default(),
+        );
+    }
+    pipe.on_keyword_at(
+        d9b,
+        "你好小智",
+        now + 2400,
+        Some(2400),
+        false,
+        crate::gateway::InputProvenance::default(),
+        Some(-18.0),
+        Some(20),
+        WakeAcoustics {
+            tier: Some("real".into()),
+            wake_dur_ms: Some(700),
+            max_gap_ms: Some(120),
+            l2_passed: Some(true),
+            wake_end_cursor: None,
+        },
+        false,
+        false,
+    );
+    assert_eq!(
+        pipe.media_state(d9b),
+        Some(crate::tool::music::MediaState::Paused),
+        "playback-active real wake with >800 ms pre-wake audio must not be blocked"
+    );
+
+    // 10) Pre-arbitration cursor capture survives an arbitration delay while post-wake
+    //     command blocks arrive during the 200 ms arbitration window.
+    let d10 = "dot2-arb-cursor";
+    ensure_device(&pipe, d10);
+    for i in 0..8u64 {
+        pipe.feed_chunk(
+            d10.into(),
+            loud.clone(),
+            16_000,
+            1,
+            now + i * 80,
+            crate::gateway::InputProvenance::default(),
+        );
+    }
+    let captured_cursor = pipe.mic.lock().unwrap()[d10].current_block_cursor();
+    // Simulate 4 post-wake command blocks (320 ms) arriving during the arbitration window
+    // BEFORE `on_keyword_at(..., arbitrated=true)` re-enters with the preserved cursor.
+    for i in 8..12u64 {
+        pipe.feed_chunk(
+            d10.into(),
+            loud.clone(),
+            16_000,
+            1,
+            now + i * 80,
+            crate::gateway::InputProvenance::default(),
+        );
+    }
+    pipe.on_keyword_at(
+        d10,
+        "你好小智",
+        now + 640,
+        Some(640),
+        false,
+        crate::gateway::InputProvenance::default(),
+        Some(-20.0),
+        Some(0),
+        WakeAcoustics {
+            tier: Some("real".into()),
+            wake_dur_ms: Some(640),
+            max_gap_ms: Some(120),
+            l2_passed: Some(true),
+            wake_end_cursor: Some(captured_cursor),
+        },
+        true,
+        false,
+    );
+    for i in 12..24u64 {
+        pipe.feed_chunk(
+            d10.into(),
+            quiet.clone(),
+            16_000,
+            1,
+            now + i * 80,
+            crate::gateway::InputProvenance::default(),
+        );
+    }
+    let arb_tx = tokio::time::timeout(std::time::Duration::from_secs(2), mic_rx.recv())
+        .await
+        .expect("arbitrated oneshot transcript timeout")
+        .expect("arbitrated oneshot transcript");
+    assert!(
+        arb_tx.wake_sliced,
+        "command blocks arriving during 200 ms arbitration window must still classify as CommandSliced using pre-arbitration cursor"
+    );
+    pipe.handle_mic_transcript(arb_tx).await;
+    assert!(
+        pipe.recent(30)
+            .iter()
+            .any(|e| e["kind"] == "kws_oneshot_sliced_admitted" && e["device"] == d10),
+        "arbitrated oneshot command must be admitted via pre-arbitration cursor"
+    );
+
+    // 11) Rollback switch HM_WAKE_TIMELINE_SLICE=0 disables Tier-2 slicing and restores
+    //     legacy full-segment ASR + kws_wake_rejected_by_asr.
+    {
+        let _guard = EnvGuard {
+            key: "HM_WAKE_TIMELINE_SLICE",
+            prev: std::env::var("HM_WAKE_TIMELINE_SLICE").ok(),
+        };
+        std::env::set_var("HM_WAKE_TIMELINE_SLICE", "0");
+        assert!(!wake_timeline_slice_enabled());
+        let d11 = "dot2-rollback";
+        ensure_device(&pipe, d11);
+        for i in 0..9u64 {
+            pipe.feed_chunk(
+                d11.into(),
+                loud.clone(),
+                16_000,
+                1,
+                now + i * 80,
+                crate::gateway::InputProvenance::default(),
+            );
+        }
+        pipe.on_keyword_at(
+            d11,
+            "你好小智",
+            now + 720,
+            Some(720),
+            false,
+            crate::gateway::InputProvenance::default(),
+            Some(-20.0),
+            Some(0),
+            WakeAcoustics {
+                tier: Some("real".into()),
+                wake_dur_ms: Some(720),
+                max_gap_ms: Some(120),
+                l2_passed: Some(true),
+                wake_end_cursor: None,
+            },
+            false,
+            false,
+        );
+        for i in 9..20u64 {
+            pipe.feed_chunk(
+                d11.into(),
+                quiet.clone(),
+                16_000,
+                1,
+                now + i * 80,
+                crate::gateway::InputProvenance::default(),
+            );
+        }
+        let rb_tx = tokio::time::timeout(std::time::Duration::from_secs(2), mic_rx.recv())
+            .await
+            .expect("rollback ASR transcript timeout")
+            .expect("rollback ASR transcript");
+        assert!(
+            !rb_tx.wake_sliced,
+            "HM_WAKE_TIMELINE_SLICE=0 must disable wake slicing"
+        );
+        pipe.handle_mic_transcript(rb_tx).await;
+        assert!(
+            pipe.recent(30)
+                .iter()
+                .any(|e| e["kind"] == "kws_wake_rejected_by_asr" && e["device"] == d11),
+            "HM_WAKE_TIMELINE_SLICE=0 must restore legacy kws_wake_rejected_by_asr path"
+        );
+    }
+
+    // 12) Wire backwards-compat: legacy GatewayFrame::Keyword without kws_tier deserializes cleanly.
+    let legacy_json = r#"{"type":"keyword","device":"lx06","ts":1000,"seq":1,"keyword":"你好小智","self_heard":false}"#;
+    let decoded: crate::gateway::GatewayFrame = serde_json::from_str(legacy_json).unwrap();
+    match decoded {
+        crate::gateway::GatewayFrame::Keyword {
+            kws_tier,
+            wake_dur_ms,
+            max_gap_ms,
+            l2_passed,
+            ..
+        } => {
+            assert_eq!(kws_tier, None);
+            assert_eq!(wake_dur_ms, None);
+            assert_eq!(max_gap_ms, None);
+            assert_eq!(l2_passed, None);
+        }
+        other => panic!("unexpected frame: {other:?}"),
+    }
+
+    // 13) Cross-lock race regression: VAD segment closes inside MicProcessor (in_speech=false,
+    //     mic.last_close_ms=Some(now)) while st.mic_last_close_ms is still None (fresh boot).
+    //     on_keyword_at must still detect bare_wake_closed and spawn wake_ack_after_keyword_window.
+    let d13 = "dot2-race-boot";
+    ensure_device(&pipe, d13);
+    for i in 0..8u64 {
+        pipe.feed_chunk(
+            d13.into(),
+            loud.clone(),
+            16_000,
+            1,
+            now + i * 80,
+            crate::gateway::InputProvenance::default(),
+        );
+    }
+    // Close VAD directly inside MicProcessor WITHOUT letting handle_mic_outcome stamp
+    // st.mic_last_close_ms, reproducing the exact 2 ms cross-lock race from dot2-d seq 32..34.
+    {
+        let mut procs = pipe.mic.lock().unwrap();
+        let p = procs.get_mut(d13).unwrap();
+        let mut closed = false;
+        for _ in 0..12 {
+            if matches!(
+                p.feed(quiet.clone(), 16_000),
+                crate::mic::FeedOutcome::Segment(Some(_))
+            ) {
+                closed = true;
+                break;
+            }
+        }
+        assert!(closed, "segment must close inside MicProcessor");
+        assert!(!p.in_speech());
+        assert!(p.last_close_ms().is_some());
+    }
+    {
+        let mut states = pipe.states.lock().unwrap();
+        let st = states.get_mut(d13).unwrap();
+        st.mic_last_close_ms = None;
+        st.input = None;
+    }
+    pipe.on_keyword_at(
+        d13,
+        "你好小智",
+        id::now_ms(),
+        Some(1200),
+        false,
+        crate::gateway::InputProvenance::default(),
+        Some(-22.0),
+        Some(480),
+        WakeAcoustics {
+            tier: Some("real".into()),
+            wake_dur_ms: Some(720),
+            max_gap_ms: Some(120),
+            l2_passed: Some(true),
+            wake_end_cursor: None,
+        },
+        true,
+        false,
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    assert!(
+        pipe.recent(30)
+            .iter()
+            .any(|e| e["kind"] == "wake_ack_after_keyword_window" && e["device"] == d13),
+        "fresh-boot 2 ms cross-lock race must still trigger wake_ack_after_keyword_window"
     );
 }

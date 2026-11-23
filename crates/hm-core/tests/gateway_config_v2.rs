@@ -1018,6 +1018,10 @@ async fn coordinator_dispatches_node_wake_phrases_as_full_compiled_kws_and_led_w
             lag_ms: None,
             bundle_id: None,
             kws_generation: None,
+            kws_tier: None,
+            wake_dur_ms: None,
+            max_gap_ms: None,
+            l2_passed: None,
         },
     )
     .await;
@@ -1660,6 +1664,10 @@ async fn deploy_reflex_auto_recovers_after_invalid_kws_rejection_and_fences_stal
             lag_ms: None,
             bundle_id: Some("old-bundle".into()),
             kws_generation: Some(g - 1),
+            kws_tier: None,
+            wake_dur_ms: None,
+            max_gap_ms: None,
+            l2_passed: None,
         },
     )
     .await;
@@ -1677,6 +1685,10 @@ async fn deploy_reflex_auto_recovers_after_invalid_kws_rejection_and_fences_stal
             lag_ms: None,
             bundle_id: Some("current-bundle".into()),
             kws_generation: Some(g),
+            kws_tier: None,
+            wake_dur_ms: None,
+            max_gap_ms: None,
+            l2_passed: None,
         },
     )
     .await;

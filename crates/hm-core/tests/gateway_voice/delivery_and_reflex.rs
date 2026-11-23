@@ -1219,6 +1219,10 @@ async fn a_wake_only_transcript_after_a_keyword_hit_says_the_ack() {
         lag_ms: None,
         bundle_id: None,
         kws_generation: None,
+        kws_tier: None,
+        wake_dur_ms: None,
+        max_gap_ms: None,
+        l2_passed: None,
     })
     .await;
     for seq in 2..=11 {
@@ -1298,6 +1302,10 @@ async fn kws_and_asr_unified_admission_executes_once_and_retreat_stops_playback(
         lag_ms: None,
         bundle_id: None,
         kws_generation: None,
+        kws_tier: None,
+        wake_dur_ms: None,
+        max_gap_ms: None,
+        l2_passed: None,
     })
     .await;
     let loud = loud_block();
@@ -1341,6 +1349,10 @@ async fn kws_and_asr_unified_admission_executes_once_and_retreat_stops_playback(
         lag_ms: None,
         bundle_id: None,
         kws_generation: None,
+        kws_tier: None,
+        wake_dur_ms: None,
+        max_gap_ms: None,
+        l2_passed: None,
     })
     .await;
     let stop = gw

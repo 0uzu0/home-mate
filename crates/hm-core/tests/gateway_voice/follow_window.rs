@@ -57,6 +57,10 @@ async fn a_failed_bare_wake_ack_is_not_reported_as_heard() {
         lag_ms: None,
         bundle_id: None,
         kws_generation: None,
+        kws_tier: None,
+        wake_dur_ms: None,
+        max_gap_ms: None,
+        l2_passed: None,
     })
     .await;
     for seq in 2..=11 {
@@ -167,6 +171,10 @@ async fn media_takeover_acks_without_waiting_for_asr() {
         lag_ms: None,
         bundle_id: None,
         kws_generation: None,
+        kws_tier: None,
+        wake_dur_ms: None,
+        max_gap_ms: None,
+        l2_passed: None,
     })
     .await;
 
@@ -687,6 +695,10 @@ async fn asr_wake_fallback_off_still_transcribes_after_a_keyword_wake() {
         lag_ms: None,
         bundle_id: None,
         kws_generation: None,
+        kws_tier: None,
+        wake_dur_ms: None,
+        max_gap_ms: None,
+        l2_passed: None,
     })
     .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1025,6 +1037,10 @@ async fn a_continue_without_a_bookmark_does_not_claim_a_resume() {
         lag_ms: None,
         bundle_id: None,
         kws_generation: None,
+        kws_tier: None,
+        wake_dur_ms: None,
+        max_gap_ms: None,
+        l2_passed: None,
     })
     .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1220,6 +1236,10 @@ async fn a_retreat_keyword_closes_an_idle_device_and_says_so() {
         lag_ms: None,
         bundle_id: None,
         kws_generation: None,
+        kws_tier: None,
+        wake_dur_ms: None,
+        max_gap_ms: None,
+        l2_passed: None,
     })
     .await;
 
@@ -1264,6 +1284,10 @@ async fn a_retreat_keyword_closes_an_idle_device_and_says_so() {
         lag_ms: None,
         bundle_id: None,
         kws_generation: None,
+        kws_tier: None,
+        wake_dur_ms: None,
+        max_gap_ms: None,
+        l2_passed: None,
     })
     .await;
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1280,6 +1304,10 @@ async fn a_retreat_keyword_closes_an_idle_device_and_says_so() {
         lag_ms: None,
         bundle_id: None,
         kws_generation: None,
+        kws_tier: None,
+        wake_dur_ms: None,
+        max_gap_ms: None,
+        l2_passed: None,
     })
     .await;
 
@@ -1508,6 +1536,10 @@ async fn disabled_follow_window_still_admits_keyword_first_question_then_closes(
         lag_ms: None,
         bundle_id: None,
         kws_generation: None,
+        kws_tier: None,
+        wake_dur_ms: None,
+        max_gap_ms: None,
+        l2_passed: None,
     })
     .await;
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1615,6 +1647,10 @@ async fn disabled_follow_window_resumed_answer_closes_after_playback() {
         lag_ms: None,
         bundle_id: None,
         kws_generation: None,
+        kws_tier: None,
+        wake_dur_ms: None,
+        max_gap_ms: None,
+        l2_passed: None,
     })
     .await;
     tokio::time::sleep(Duration::from_millis(100)).await;

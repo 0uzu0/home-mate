@@ -580,6 +580,10 @@ mod d0_source_tests {
             origin: InputOrigin::Legacy,
             bundle_id: Some("b5".into()),
             kws_generation,
+            kws_tier: None,
+            wake_dur_ms: None,
+            max_gap_ms: None,
+            l2_passed: None,
         };
 
         // Older KWS generation (4 < 5) must be dropped and recorded as stale_kws_keyword.

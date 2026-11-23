@@ -1260,6 +1260,10 @@ impl VoicePipeline {
                 self_heard,
                 rms_dbfs,
                 lag_ms,
+                kws_tier,
+                wake_dur_ms,
+                max_gap_ms,
+                l2_passed,
                 provenance,
             } => {
                 if let Some(db) = rms_dbfs.and_then(crate::gateway::valid_db) {
@@ -1268,9 +1272,16 @@ impl VoicePipeline {
                     entry.rms_dbfs = Some(db);
                     entry.at_ms = id::now_ms();
                 }
+                let acoustics = WakeAcoustics {
+                    tier: kws_tier,
+                    wake_dur_ms,
+                    max_gap_ms,
+                    l2_passed,
+                    wake_end_cursor: None,
+                };
                 self.on_keyword_at(
-                    &device, &keyword, ts, fed_ms, self_heard, provenance, rms_dbfs, lag_ms, false,
-                    false,
+                    &device, &keyword, ts, fed_ms, self_heard, provenance, rms_dbfs, lag_ms,
+                    acoustics, false, false,
                 );
             }
             DeviceEvent::KwsDeployReceipt {

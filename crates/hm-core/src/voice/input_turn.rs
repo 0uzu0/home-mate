@@ -7,7 +7,7 @@ impl VoicePipeline {
     /// A certified barge episode still retains its original head/provenance.
     #[cfg(test)]
     pub(super) fn feed_chunk(
-        &self,
+        self: &Arc<Self>,
         device: String,
         pcm: Vec<i16>,
         sample_rate: u32,
@@ -19,7 +19,7 @@ impl VoicePipeline {
     }
 
     pub(super) fn feed_chunk_with_vad(
-        &self,
+        self: &Arc<Self>,
         device: String,
         pcm: Vec<i16>,
         sample_rate: u32,
@@ -274,7 +274,7 @@ impl VoicePipeline {
 
     /// Shared tail of every mic feed path: counters, notes, ASR dispatch.
     pub(super) fn handle_mic_outcome(
-        &self,
+        self: &Arc<Self>,
         device: &str,
         outcome: FeedOutcome,
         sample_rate: u32,
@@ -320,6 +320,7 @@ impl VoicePipeline {
                     );
                     return;
                 }
+                let wake_slice = seg.wake_slice;
                 let duration_ms = seg.pcm.len() as u64 * 1000 / sample_rate as u64;
                 let ticket = seg.provenance;
                 let lead_pcm = seg.lead_pcm;
@@ -364,6 +365,62 @@ impl VoicePipeline {
                             "floor_db": floor, "start_db": vad_start, "end_db": vad_end,
                             "ticket": ticket }),
                 );
+                let bare_wake_confirmed = if wake_slice == crate::mic::WakeSliceOutcome::BareWake {
+                    let mut states = crate::lock_or_recover(&self.states, "voice.states");
+                    states.get_mut(device).and_then(|st| {
+                        let input = st.input.as_ref()?;
+                        if input.recognizing
+                            || !input.valid(st)
+                            || !input.admitted()
+                            || !input.confirmed
+                            || st.window_opener != Some("keyword")
+                            || st.last_wake_transferred_input_id != Some(input.id)
+                        {
+                            return None;
+                        }
+                        let input_id = input.id;
+                        st.window_opener = None;
+                        st.last_wake_transferred_input_id = None;
+                        st.mic_counters.bare_wake_asr_skipped += 1;
+                        st.mic_counters.wakes += 1;
+                        st.revoke_input("bare_wake_confirmed");
+                        let permit = OutputPermit {
+                            generation: st.participation.generation(),
+                            stop_epoch: st.stop_epoch,
+                            request: None,
+                        };
+                        Some((input_id, permit))
+                    })
+                } else {
+                    None
+                };
+                if let Some((input_id, permit)) = bare_wake_confirmed {
+                    self.clear_passive_presence_if_idle(device);
+                    self.note(
+                        "kws_bare_wake_confirmed",
+                        json!({
+                            "device": device,
+                            "input_id": input_id,
+                            "duration_ms": duration_ms,
+                            "blocks": seg.blocks,
+                            "why": "L1+L2 verified bare wake (<=3 post-wake speech blocks); skipped ASR",
+                        }),
+                    );
+                    let pipe = self.clone();
+                    let ack_device = device.to_string();
+                    tokio::spawn(async move {
+                        let ack = pipe.speak_wake_ack(&ack_device, permit).await;
+                        pipe.note(
+                            "wake_ack_after_keyword_window",
+                            json!({
+                                "device": ack_device,
+                                "ack": ack.label(),
+                                "via": "kws_bare_wake_confirmed",
+                            }),
+                        );
+                    });
+                    return;
+                }
                 let reservation = {
                     let mut states = crate::lock_or_recover(&self.states, "voice.states");
                     let Some(st) = states.get_mut(device) else {
@@ -395,6 +452,7 @@ impl VoicePipeline {
                     st.mic_counters.asr_inflight += 1;
                     reservation
                 };
+                let wake_sliced = wake_slice == crate::mic::WakeSliceOutcome::CommandSliced;
                 // #216: prepend the 160 ms (2 blocks) pre-onset lead-in PCM (or
                 // 160 ms leading silence pad if no pre-onset blocks were buffered)
                 // when encoding the WAV for ASR so initial plosives/affricates
@@ -450,6 +508,7 @@ impl VoicePipeline {
                             window_epoch,
                             ticket,
                             control_only,
+                            wake_sliced,
                             enqueued_at: std::time::Instant::now(),
                         })
                         .await;
@@ -498,6 +557,19 @@ impl VoicePipeline {
     /// not consume the identity watermark — nothing was acted on.
     pub(super) async fn handle_mic_transcript_unusable(self: &Arc<Self>, t: MicTranscript) {
         self.clear_passive_presence_if_idle(&t.device);
+        let wake_ack_permit = if t.wake_sliced && self.take_keyword_window(&t.device) {
+            let states = crate::lock_or_recover(&self.states, "voice.states");
+            states
+                .get(&t.device)
+                .filter(|st| st.participation.session.state == SessionState::Listening)
+                .map(|st| OutputPermit {
+                    generation: st.participation.generation(),
+                    stop_epoch: st.stop_epoch,
+                    request: None,
+                })
+        } else {
+            None
+        };
         match t.result {
             Ok(_) => {
                 if let Some(st) =
@@ -507,7 +579,7 @@ impl VoicePipeline {
                 }
                 self.note(
                     "mic_segment_empty",
-                    json!({ "device": t.device, "input_id": t.input_id }),
+                    json!({ "device": t.device, "input_id": t.input_id, "wake_sliced": t.wake_sliced }),
                 );
             }
             Err(e) => {
@@ -518,9 +590,24 @@ impl VoicePipeline {
                 }
                 self.note(
                     "mic_asr_failed",
-                    json!({ "device": t.device, "error": e, "input_id": t.input_id }),
+                    json!({ "device": t.device, "error": e, "input_id": t.input_id, "wake_sliced": t.wake_sliced }),
                 );
             }
+        }
+        if let Some(permit) = wake_ack_permit {
+            let pipe = self.clone();
+            let ack_device = t.device.clone();
+            tokio::spawn(async move {
+                let ack = pipe.speak_wake_ack(&ack_device, permit).await;
+                pipe.note(
+                    "wake_ack_after_keyword_window",
+                    json!({
+                        "device": ack_device,
+                        "ack": ack.label(),
+                        "via": "wake_sliced_unusable_post_audio",
+                    }),
+                );
+            });
         }
     }
 
@@ -669,7 +756,9 @@ impl VoicePipeline {
         let has_wake = wakes
             .iter()
             .any(|w| mic::wake_span_near(&text, w).is_some());
-        if !has_wake && self.music_blocks_transcript(&t.device, t.input_id, t.duration_ms) {
+        let has_wake_or_sliced = has_wake || t.wake_sliced;
+        if !has_wake_or_sliced && self.music_blocks_transcript(&t.device, t.input_id, t.duration_ms)
+        {
             self.reject_passive_music_input(&t.device, t.input_id, &text);
             return;
         }
@@ -685,7 +774,7 @@ impl VoicePipeline {
                 })
                 .unwrap_or(false)
         };
-        if t.control_only && !has_wake && !ack_overlap_only {
+        if t.control_only && !has_wake_or_sliced && !ack_overlap_only {
             self.note(
                 "mic_ignored_unwoken",
                 json!({"device":t.device,"text":text}),
@@ -747,7 +836,7 @@ impl VoicePipeline {
                 })
                 .unwrap_or(false)
         };
-        if voice_live && !(t.control_only && has_wake) {
+        if voice_live && !(t.control_only && has_wake_or_sliced) {
             if let Some(st) =
                 crate::lock_or_recover(&self.states, "voice.states").get_mut(&t.device)
             {
@@ -756,7 +845,7 @@ impl VoicePipeline {
             self.note("mic_suppressed_self_echo", json!({ "device": t.device }));
             return;
         }
-        let keyword_window_pending = has_wake
+        let keyword_window_pending = has_wake_or_sliced
             && !media_playing
             && !voice_live
             && crate::lock_or_recover(&self.states, "voice.states")
@@ -807,6 +896,30 @@ impl VoicePipeline {
                 });
 
         if crate::mic::is_filler_utterance(&text) && !awaiting_confirmation {
+            if t.wake_sliced && self.take_keyword_window(&t.device) {
+                self.clear_passive_presence_if_idle(&t.device);
+                self.note(
+                    "kws_bare_wake_confirmed",
+                    json!({
+                        "device": t.device,
+                        "input_id": t.input_id,
+                        "text": text,
+                        "reason": "post_wake_filler_only",
+                    }),
+                );
+                if let Some(permit) = self.permit_for_identity(&t.device, input_identity) {
+                    let pipe = self.clone();
+                    let d = t.device.clone();
+                    tokio::spawn(async move {
+                        let ack = pipe.speak_wake_ack(&d, permit).await;
+                        pipe.note(
+                            "wake_ack_after_keyword_window",
+                            json!({ "device": d, "ack": ack.label(), "via": "post_wake_filler_only" }),
+                        );
+                    });
+                }
+                return;
+            }
             self.clear_passive_presence_if_idle(&t.device);
             if let Some(st) =
                 crate::lock_or_recover(&self.states, "voice.states").get_mut(&t.device)
@@ -883,16 +996,30 @@ impl VoicePipeline {
                     eff
                 }
             };
-            let is_misrecognized_bare_wake = crate::lock_or_recover(&self.states, "voice.states")
+            let is_wake_transferred = crate::lock_or_recover(&self.states, "voice.states")
                 .get(&t.device)
                 .is_some_and(|st| {
                     st.window_opener == Some("keyword")
                         && st.last_wake_transferred_input_id == Some(t.input_id)
-                })
-                && t.duration_ms <= 1600
-                && text.chars().filter(|ch| ch.is_alphanumeric()).count() <= 5;
+                });
             let in_win = match Self::in_window_command(&text, &wakes) {
-                InWindow::Command(c) if c == text && is_misrecognized_bare_wake => InWindow::Bare,
+                InWindow::Command(c) if c == text && is_wake_transferred && !t.wake_sliced => {
+                    self.take_keyword_window(&t.device);
+                    self.clear_passive_presence_if_idle(&t.device);
+                    self.note(
+                        "kws_wake_rejected_by_asr",
+                        json!({
+                            "device": t.device,
+                            "input_id": t.input_id,
+                            "duration_ms": t.duration_ms,
+                            "text": text,
+                            "reason": "no_wake_word_in_transcript",
+                            "why": "wake-transferred segment contained no wake word in ASR transcript",
+                        }),
+                    );
+                    self.retreat_session_silent(&t.device, "kws_unconfirmed_by_asr", identity);
+                    return;
+                }
                 other => other,
             };
             let command = match in_win {
@@ -925,8 +1052,19 @@ impl VoicePipeline {
                     return;
                 }
                 InWindow::Command(c) => {
-                    let wake_confirmed = c != text;
-                    if wake_confirmed {
+                    let wake_confirmed = c != text || t.wake_sliced;
+                    if t.wake_sliced {
+                        self.take_keyword_window(&t.device);
+                        self.note(
+                            "kws_oneshot_sliced_admitted",
+                            json!({
+                                "device": t.device,
+                                "input_id": t.input_id,
+                                "command": c,
+                                "duration_ms": t.duration_ms,
+                            }),
+                        );
+                    } else if wake_confirmed {
                         self.note(
                             "mic_wake_stripped_in_window",
                             json!({ "device": t.device, "text": text, "command": c }),

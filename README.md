@@ -140,7 +140,7 @@ Please deploy Home Mate (XiaoRui) to my Xiaomi AI Speaker Pro (model LX06, root 
 Steps to execute and verify (use my actual IPs above):
 1. Clone https://github.com/yes999zc/home-mate.git and https://github.com/yes999zc/home-mate-gateway-lx06.git side by side.
 2. SSH into root@<SPEAKER_IP> to verify `uname -m` is `aarch64` and `df -k /data` has >= 5500 KB available (clean old logs in /data/log/* if needed).
-3. In home-mate-gateway-lx06, run `./tools/pack_lx06_bundle.sh` (or download prebuilt `hm-bundle.tar.xz` and `hm-kws-lx06.tar.xz` from GitHub Release v0.1.0), serve `build/lx06/` over HTTP on <HOST_IP>:18089, and verify `http://<HOST_IP>:18089/hm-kws-lx06.tar.xz` returns HTTP 200.
+3. In home-mate-gateway-lx06, run `./tools/pack_lx06_bundle.sh` (or download prebuilt `hm-bundle.tar.xz` and `hm-kws-lx06.tar.xz` from GitHub Release v0.2.0), serve `build/lx06/` over HTTP on <HOST_IP>:18089, and verify `http://<HOST_IP>:18089/hm-kws-lx06.tar.xz` returns HTTP 200.
 4. Run `./deploy/lx06/install-lx06.sh --device-ip <SPEAKER_IP> --kws-url http://<HOST_IP>:18089/hm-kws-lx06.tar.xz`.
 5. Wait 15s for RAM unpack, call `POST http://<SPEAKER_IP>:8930/api/v0/auth/provision`, save the token to `~/.home-mate/lx06.token` (mode 0600), and print the console URL and token.
 ```
@@ -160,7 +160,7 @@ Our bundled `tools/hm-provision.sh` (with built-in `tools/serial_cmd.py`) automa
 # 1. Run a read-only --dry-run first (verifies serial console, ID=emos, Wi-Fi IP & package hashes without writing):
 ./tools/hm-provision.sh --device-id dot2-living \
   --seed build/bootstrap/home-mate-bootstrap-dot2-living.tar.gz \
-  --release build/release/home-mate-release-2026.11.22-98.tar \
+  --release build/release/home-mate-release-2026.11.23-106.tar \
   --serial /dev/cu.usbmodem8401 --ip 192.168.1.73 \
   --reference-node lx06 --reference-ip 192.168.1.50 \
   --wake-word 你好小智 --dry-run
@@ -168,7 +168,7 @@ Our bundled `tools/hm-provision.sh` (with built-in `tools/serial_cmd.py`) automa
 # 2. Remove --dry-run to execute full installation, activation, token pairing & fleet config cloning:
 ./tools/hm-provision.sh --device-id dot2-living \
   --seed build/bootstrap/home-mate-bootstrap-dot2-living.tar.gz \
-  --release build/release/home-mate-release-2026.11.22-98.tar \
+  --release build/release/home-mate-release-2026.11.23-106.tar \
   --serial /dev/cu.usbmodem8401 --ip 192.168.1.73 \
   --reference-node lx06 --reference-ip 192.168.1.50 \
   --wake-word 你好小智

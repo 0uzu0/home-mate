@@ -256,6 +256,10 @@ async fn hit(link: &Arc<Link>) {
         lag_ms: Some(30),
         bundle_id: None,
         kws_generation: None,
+        kws_tier: None,
+        wake_dur_ms: None,
+        max_gap_ms: None,
+        l2_passed: None,
     })
     .await;
 }
@@ -1064,6 +1068,10 @@ async fn three_cores_cross_room_bleed_single_winner_and_non_owner_local_exit_is_
             lag_ms: Some(20),
             bundle_id: None,
             kws_generation: None,
+            kws_tier: None,
+            wake_dur_ms: None,
+            max_gap_ms: None,
+            l2_passed: None,
         })
         .await;
     }
@@ -1169,6 +1177,10 @@ async fn two_passive_nodes_stronger_than_active_node_produce_unique_final_winner
             lag_ms: Some(10),
             bundle_id: None,
             kws_generation: None,
+            kws_tier: None,
+            wake_dur_ms: None,
+            max_gap_ms: None,
+            l2_passed: None,
         })
         .await;
 

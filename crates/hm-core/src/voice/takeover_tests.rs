@@ -219,6 +219,7 @@ async fn unwoken_pause_transcript_ignores_paused_media_with_inflight_hub_stop() 
             capture_seq: input_id,
             window_epoch: epoch,
             control_only: false,
+            wake_sliced: false,
             ticket: crate::mic::CaptureProvenance::legacy(0),
             enqueued_at: std::time::Instant::now(),
         }

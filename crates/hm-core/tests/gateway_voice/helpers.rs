@@ -1626,6 +1626,10 @@ pub async fn send_keyword(gw: &FakeGateway, seq: u64, word: &str, self_heard: bo
         lag_ms: None,
         bundle_id: None,
         kws_generation: None,
+        kws_tier: None,
+        wake_dur_ms: None,
+        max_gap_ms: None,
+        l2_passed: None,
     })
     .await;
 }

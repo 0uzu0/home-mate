@@ -368,6 +368,10 @@ async fn music_lifecycle_tail_capture_remains_denied_after_delayed_asr_with_fall
             lag_ms: None,
             bundle_id: None,
             kws_generation: None,
+            kws_tier: None,
+            wake_dur_ms: None,
+            max_gap_ms: None,
+            l2_passed: None,
         };
         gw.send(&wake(1)).await;
         wait_mode(&base, |m| device(m)["input_window_open"] == true).await;
@@ -478,6 +482,10 @@ async fn music_lifecycle_wake_during_play_can_admit_after_confirmed_pause_inside
         lag_ms: None,
         bundle_id: None,
         kws_generation: None,
+        kws_tier: None,
+        wake_dur_ms: None,
+        max_gap_ms: None,
+        l2_passed: None,
     })
     .await;
     gw.until(|frame| matches!(frame, CoreFrame::Stop { task_id, .. } if task_id == &play_id))

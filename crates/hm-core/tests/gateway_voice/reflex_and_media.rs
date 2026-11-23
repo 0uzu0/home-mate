@@ -43,6 +43,10 @@ async fn keyword_ignored_when_interrupt_disabled() {
         lag_ms: None,
         bundle_id: None,
         kws_generation: None,
+        kws_tier: None,
+        wake_dur_ms: None,
+        max_gap_ms: None,
+        l2_passed: None,
     })
     .await;
 
@@ -97,6 +101,10 @@ async fn keyword_stops_media_playback_and_opens_the_window() {
         lag_ms: None,
         bundle_id: None,
         kws_generation: None,
+        kws_tier: None,
+        wake_dur_ms: None,
+        max_gap_ms: None,
+        l2_passed: None,
     })
     .await;
 
@@ -173,6 +181,10 @@ async fn a_wake_in_media_pauses_the_session_and_keeps_it() {
         lag_ms: None,
         bundle_id: None,
         kws_generation: None,
+        kws_tier: None,
+        wake_dur_ms: None,
+        max_gap_ms: None,
+        l2_passed: None,
     })
     .await;
 
@@ -268,6 +280,10 @@ async fn a_reflex_word_is_not_undone_by_its_own_transcript() {
         lag_ms: None,
         bundle_id: None,
         kws_generation: None,
+        kws_tier: None,
+        wake_dur_ms: None,
+        max_gap_ms: None,
+        l2_passed: None,
     })
     .await;
     let f = gw
@@ -301,6 +317,10 @@ async fn a_reflex_word_is_not_undone_by_its_own_transcript() {
         lag_ms: None,
         bundle_id: None,
         kws_generation: None,
+        kws_tier: None,
+        wake_dur_ms: None,
+        max_gap_ms: None,
+        l2_passed: None,
     })
     .await;
     let (resumed_id, _) = gw.until_media_play().await;
@@ -888,6 +908,10 @@ async fn keyword_with_no_playback_wakes_and_opens_the_window() {
         lag_ms: None,
         bundle_id: None,
         kws_generation: None,
+        kws_tier: None,
+        wake_dur_ms: None,
+        max_gap_ms: None,
+        l2_passed: None,
     })
     .await;
 
@@ -1250,6 +1274,10 @@ async fn a_self_heard_hit_inside_our_own_answer_text_is_refused() {
         lag_ms: None,
         bundle_id: None,
         kws_generation: None,
+        kws_tier: None,
+        wake_dur_ms: None,
+        max_gap_ms: None,
+        l2_passed: None,
     })
     .await;
 
@@ -1289,6 +1317,10 @@ async fn a_suspected_hit_outside_our_own_text_still_interrupts() {
         lag_ms: None,
         bundle_id: None,
         kws_generation: None,
+        kws_tier: None,
+        wake_dur_ms: None,
+        max_gap_ms: None,
+        l2_passed: None,
     })
     .await;
 
