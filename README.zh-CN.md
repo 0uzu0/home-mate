@@ -110,7 +110,7 @@
 ### 设备 A：小米小爱音箱 Pro (`LX06`) 免刷机双系统部署
 
 #### LX06 必备前置条件
-1. **确认硬件型号**：必须是黑色高圆柱款**小米小爱音箱 Pro（底部铭牌型号为 `LX06`，Amlogic A113X `aarch64`）**。
+1. **确认硬件型号与内存版本**：必须是黑色高圆柱款**小米小爱音箱 Pro（底部铭牌型号为 `LX06`，Amlogic A113X `aarch64`）**，且全本地双系统模式需 **256 MB 内存版本**（如为 128 MB 内存版，请改用下方「方式 C：NAS / Docker 容器化部署」+ 音箱仅跑 `hm-gateway` 薄网关）。
 2. **自行完成 SSH 解锁**：请先参照开源社区项目 [idootop/open-xiaoai](https://github.com/idootop/open-xiaoai) 开启音箱的 root SSH 权限（端口 22），确认在电脑终端可执行 `ssh root@<音箱IP>` 登录。
 3. **检查 `/data` 可用空间**：SSH 登录后执行 `df -k /data`，确认剩余可用空间 ≥ **`5.5 MiB`**。
 
@@ -186,6 +186,36 @@ python3 -m http.server 18089 --directory build/lx06 &
 1. 先加上 `--dry-run` 参数运行一次 `./tools/hm-provision.sh`，向我展示串口 `ID=emos` 核验、`/data/emos/sockets` 状态、wlan0 IP 与将要执行的计划，确认 0 报错后再继续。
 2. 去掉 `--dry-run` 正式执行 `./tools/hm-provision.sh`（若我上面提供了参考节点 IP，请加上 `--reference-node <参考节点ID> --reference-ip <参考节点真实IP>`），自动完成 bootstrap 种子包安装、重启交由 emOS init 守护、Ed25519 签名 release 包激活、7/7 健康自检与全屋配置克隆，并将生成的令牌保存到 `~/.home-mate/dot2-living.token`。
 ```
+
+---
+
+### 方式 C：NAS / Docker 容器化部署（支持局域网网关接入 & 128 MB 音箱分离部署）
+
+现已原生支持 **Docker 一键部署**（多架构镜像 `linux/amd64` + `linux/arm64`，适用于群晖、飞牛 fnOS、绿联、Unraid、树莓派及 Linux/macOS 主机）。
+
+通过显式环境变量 **`HM_GATEWAY_ALLOW_LAN=1`**，容器内的 `hm-core` 可在 `:8932` 接收局域网远程语音网关（如 **128 MB 内存版 LX06 薄网关**、通用 Android / Linux 客户端等）通过 Northbound Protocol v2 接入；音箱本体独立运行模式默认仍保持严格的 `127.0.0.1` 回环限制。
+
+#### 一行命令启动（拉取预编译多架构镜像）
+```bash
+docker run -d \
+  --name home-mate-core \
+  --restart unless-stopped \
+  -p 8930:8930 \
+  -p 8932:8932 \
+  -e TZ=Asia/Shanghai \
+  -e HM_GATEWAY_ALLOW_LAN=1 \
+  -v "$(pwd)/data:/data" \
+  ghcr.io/yes999zc/home-mate:latest
+```
+
+#### 或使用 Docker Compose 启动
+```bash
+# 直接使用仓库内置 docker-compose.yml（自动拉取 ghcr.io 预编译镜像；如需本地源码构建请加 --build）
+docker compose up -d
+```
+
+- **Web 控制台**：启动后访问 `http://<NAS_IP>:8930`（首次登录按页面引导签发家庭访问令牌）。
+- **离线镜像包（国内 NAS 友好）**：若 NAS 访问 GHCR 较慢，可直接从 [GitHub Releases (`v0.2.1`)](https://github.com/yes999zc/home-mate/releases/tag/v0.2.1) 下载 `hm-core-docker-linux-amd64.tar.gz` 或 `hm-core-docker-linux-arm64.tar.gz`，执行 `docker load -i <压缩包>` 导入后运行上述命令即可。
 
 ---
 

@@ -760,4 +760,26 @@ mod d0_source_tests {
             matches!(f_c1, CoreFrame::PlayChunk { ref task_id, seq: 1, .. } if task_id == &play_id)
         );
     }
+
+    #[test]
+    fn gateway_bind_policy_enforces_loopback_by_default_and_allows_lan_opt_in() {
+        let lo_v4: std::net::SocketAddr = "127.0.0.1:8932".parse().unwrap();
+        let lo_v6: std::net::SocketAddr = "[::1]:8932".parse().unwrap();
+        let any_v4: std::net::SocketAddr = "0.0.0.0:8932".parse().unwrap();
+        let lan_v4: std::net::SocketAddr = "192.168.1.27:8932".parse().unwrap();
+
+        // Default embedded speaker policy (allow_lan = false)
+        assert!(ensure_loopback_bind(lo_v4).is_ok());
+        assert!(ensure_loopback_bind(lo_v6).is_ok());
+        assert!(ensure_loopback_bind(any_v4).is_err());
+        assert!(ensure_loopback_bind(lan_v4).is_err());
+        assert!(ensure_gateway_bind_with_policy(lo_v4, false).is_ok());
+        assert!(ensure_gateway_bind_with_policy(any_v4, false).is_err());
+        assert!(ensure_gateway_bind_with_policy(lan_v4, false).is_err());
+
+        // Opt-in Docker/NAS LAN policy (allow_lan = true via HM_GATEWAY_ALLOW_LAN=1)
+        assert!(ensure_gateway_bind_with_policy(lo_v4, true).is_ok());
+        assert!(ensure_gateway_bind_with_policy(any_v4, true).is_ok());
+        assert!(ensure_gateway_bind_with_policy(lan_v4, true).is_ok());
+    }
 }

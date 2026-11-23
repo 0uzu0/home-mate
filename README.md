@@ -111,7 +111,7 @@ Xiaomi AI Speaker Pro (`LX06`) and Amazon Echo Dot 2 (`RS03QR`) are two complete
 ### Track A: Xiaomi AI Speaker Pro (`LX06`) — Zero-Flash Dual-System Install
 
 #### Prerequisites for LX06
-1. **Hardware Model**: Black cylinder **Xiaomi AI Speaker Pro** (bottom label model **`LX06`**, Amlogic A113X `aarch64`).
+1. **Hardware Model & RAM**: Black cylinder **Xiaomi AI Speaker Pro** (bottom label model **`LX06`**, Amlogic A113X `aarch64`) with **256 MB RAM** for full on-speaker dual-system mode *(if you have a 128 MB RAM LX06 revision, use Track C: NAS / Docker Deployment below with a thin `hm-gateway` on the speaker)*.
 2. **Root SSH Unlocked via `open-xiaoai`**: You must first enable root SSH access (port 22) using the community [idootop/open-xiaoai](https://github.com/idootop/open-xiaoai) project and verify `ssh root@<LX06_IP>` works.
 3. **Free `/data` Space**: At least **5.5 MiB** free in `/data` (`df -k /data`).
 
@@ -187,6 +187,36 @@ In the `home-mate` repository, please run `./tools/hm-provision.sh` to provision
 1. Run `./tools/hm-provision.sh` with `--dry-run` first to verify serial reachability (`ID=emos`), `/data/emos/sockets`, and package hashes. Report the dry-run output before making changes.
 2. Run `./tools/hm-provision.sh` without `--dry-run` (passing `--reference-node <REF_ID> --reference-ip <REF_ACTUAL_IP>` if a reference speaker exists) to install the seed, activate the signed release, verify 7/7 health checks, and save the token to `~/.home-mate/dot2-living.token`.
 ```
+
+---
+
+### Track C: NAS / Docker Deployment (LAN Gateway Support & Thin-Client Mode)
+
+Home Mate now natively supports **Docker deployment** with prebuilt multi-arch images (`linux/amd64` + `linux/arm64`) for Synology, fnOS, UGREEN, Unraid, Raspberry Pi, and Linux/macOS servers.
+
+With the opt-in **`HM_GATEWAY_ALLOW_LAN=1`** environment variable, `hm-core` listens on `:8932` for remote Northbound Protocol v2 device gateways over your LAN/Tailscale (such as a **128 MB RAM LX06 running a thin `hm-gateway`**, Android/Linux clients, etc.), while embedded on-speaker deployments keep strict `127.0.0.1` loopback binding by default.
+
+#### One-Line Docker Run (Prebuilt Multi-Arch Image)
+```bash
+docker run -d \
+  --name home-mate-core \
+  --restart unless-stopped \
+  -p 8930:8930 \
+  -p 8932:8932 \
+  -e TZ=Asia/Shanghai \
+  -e HM_GATEWAY_ALLOW_LAN=1 \
+  -v "$(pwd)/data:/data" \
+  ghcr.io/yes999zc/home-mate:latest
+```
+
+#### Or Start With Docker Compose
+```bash
+# Uses the bundled docker-compose.yml (pulls ghcr.io prebuilt image; append --build to build from source)
+docker compose up -d
+```
+
+- **Web Console**: Open `http://<NAS_IP>:8930` to pair your household access token and configure LLM/ASR/TTS & devices.
+- **Offline Docker Tarballs**: Download `hm-core-docker-linux-amd64.tar.gz` or `hm-core-docker-linux-arm64.tar.gz` directly from [GitHub Releases (`v0.2.1`)](https://github.com/yes999zc/home-mate/releases/tag/v0.2.1) and import via `docker load -i <tarball>`.
 
 ---
 

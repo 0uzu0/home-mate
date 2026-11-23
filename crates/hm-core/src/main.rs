@@ -254,15 +254,24 @@ async fn main() {
     let _config_worker = hm_core::config_delivery::ConfigApplyCoordinator::start_for_app(&state);
 
     // Device-gateway listener. The gateway dials in; default 127.0.0.1:8932.
-    // A non-loopback bind is refused: the firmware link has no authentication
-    // of its own, so it must stay on this machine.
+    // A non-loopback bind is refused by default (embedded speaker mode) unless
+    // HM_GATEWAY_ALLOW_LAN=1 is explicitly enabled for Docker/NAS deployments.
     let gateway_bind: SocketAddr = std::env::var("HM_GATEWAY_BIND")
         .unwrap_or_else(|_| "127.0.0.1:8932".into())
         .parse()
         .expect("HM_GATEWAY_BIND must be host:port");
-    if let Err(e) = hm_core::gateway::ensure_loopback_bind(gateway_bind) {
+    let allow_lan_gateway = hm_core::gateway::gateway_allow_lan_from_env();
+    if let Err(e) =
+        hm_core::gateway::ensure_gateway_bind_with_policy(gateway_bind, allow_lan_gateway)
+    {
         eprintln!("refusing to start: {e}");
         std::process::exit(1);
+    }
+    if allow_lan_gateway && !gateway_bind.ip().is_loopback() {
+        tracing::warn!(
+            %gateway_bind,
+            "HM_GATEWAY_ALLOW_LAN=1 enabled: device gateway listener bound to non-loopback address for Docker/NAS mode"
+        );
     }
     state.start_gateway_listener(gateway_bind);
 
