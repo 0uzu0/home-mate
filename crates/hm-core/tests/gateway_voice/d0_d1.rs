@@ -347,6 +347,10 @@ async fn d1_first_and_followup_asr_requests_keep_one_generation_and_unique_ids()
         lag_ms: None,
         bundle_id: None,
         kws_generation: None,
+        kws_tier: None,
+        wake_dur_ms: None,
+        max_gap_ms: None,
+        l2_passed: None,
     })
     .await;
     tokio::time::sleep(Duration::from_millis(60)).await;
@@ -584,6 +588,10 @@ async fn an_answer_ends_the_conversation_by_default() {
         lag_ms: None,
         bundle_id: None,
         kws_generation: None,
+        kws_tier: None,
+        wake_dur_ms: None,
+        max_gap_ms: None,
+        l2_passed: None,
     })
     .await;
     tokio::time::sleep(Duration::from_millis(120)).await;
@@ -783,6 +791,10 @@ async fn only_an_answer_end_moves_the_follow_window_end_to_end() {
         lag_ms: None,
         bundle_id: None,
         kws_generation: None,
+        kws_tier: None,
+        wake_dur_ms: None,
+        max_gap_ms: None,
+        l2_passed: None,
     })
     .await;
     tokio::time::sleep(Duration::from_millis(120)).await;

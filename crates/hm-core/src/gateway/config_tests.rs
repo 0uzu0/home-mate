@@ -57,6 +57,10 @@ fn config_v2_and_keyword_frames_round_trip() {
         lag_ms: Some(12),
         bundle_id: Some("bundle-1".into()),
         kws_generation: Some(4),
+        kws_tier: None,
+        wake_dur_ms: None,
+        max_gap_ms: None,
+        l2_passed: None,
     };
     let s = serde_json::to_string(&kw).unwrap();
     let decoded: GatewayFrame = serde_json::from_str(&s).unwrap();

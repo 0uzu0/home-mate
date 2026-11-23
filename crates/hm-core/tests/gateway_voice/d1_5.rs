@@ -159,6 +159,10 @@ async fn retreat_and_window_close_play_distinct_phrases_and_wavs() {
         lag_ms: None,
         bundle_id: None,
         kws_generation: None,
+        kws_tier: None,
+        wake_dur_ms: None,
+        max_gap_ms: None,
+        l2_passed: None,
     })
     .await;
     let (retreat_id, retreat_ref, retreat_wav) = ack_play(&gw, 2).await;

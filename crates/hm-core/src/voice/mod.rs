@@ -60,6 +60,25 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{broadcast, mpsc};
 
+/// XiaoAi-style L1+L2 acoustic telemetry & pre-arbitration timeline cursor (#261).
+#[derive(Debug, Clone, Default)]
+pub(super) struct WakeAcoustics {
+    pub(super) tier: Option<String>,
+    pub(super) wake_dur_ms: Option<u64>,
+    pub(super) max_gap_ms: Option<u64>,
+    pub(super) l2_passed: Option<bool>,
+    pub(super) wake_end_cursor: Option<u64>,
+}
+
+/// Runtime rollback switch for Tier-2 physical wake-word timeline slicing
+/// (`HM_WAKE_TIMELINE_SLICE=0` or `false` restores legacy full-segment ASR).
+pub(super) fn wake_timeline_slice_enabled() -> bool {
+    !matches!(
+        std::env::var("HM_WAKE_TIMELINE_SLICE").as_deref(),
+        Ok("0") | Ok("false") | Ok("FALSE") | Ok("off") | Ok("OFF")
+    )
+}
+
 /// A finished ASR transcription of one mic segment, re-entering the pump.
 struct MicTranscript {
     /// Frozen from retained segment PCM, before asynchronous ASR starts.
@@ -81,6 +100,9 @@ struct MicTranscript {
     /// the source-issued capture epoch in ticket.
     window_epoch: u64,
     control_only: bool,
+    /// True when Tier-2 timeline slicing physically removed the wake word prefix
+    /// before ASR so the post-wake command does not need to repeat the wake word (#261).
+    wake_sliced: bool,
     enqueued_at: std::time::Instant,
 }
 
@@ -287,6 +309,12 @@ struct MicCounters {
     /// session was closed (idle room speech). Counted so the privacy trade-off
     /// is visible as a number, not a claim — the console shows it.
     asr_skipped: u64,
+    /// KWS wake hits dropped before arbitration by Tier-1 L2/duration rejection
+    /// or Tier-3 idle mid-segment gating (#261).
+    kws_suspect_dropped: u64,
+    /// L1+L2 verified bare wakes (`wakeup-normal`) confirmed locally without
+    /// invoking ASR (#261).
+    bare_wake_asr_skipped: u64,
 }
 
 /// One completed voice-play latency sample (G4 accounting): TTS synthesis
@@ -1542,6 +1570,7 @@ impl VoicePipeline {
             capture_seq,
             window_epoch,
             control_only: false,
+            wake_sliced: false,
             enqueued_at: std::time::Instant::now(),
         })
         .await;

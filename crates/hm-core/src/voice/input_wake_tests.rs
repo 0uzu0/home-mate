@@ -27,7 +27,7 @@ fn source(p: &VoicePipeline, ticketed: bool) -> InputProvenance {
     }
 }
 
-fn feed(p: &VoicePipeline, source: &InputProvenance) {
+fn feed(p: &Arc<VoicePipeline>, source: &InputProvenance) {
     p.feed_chunk(
         "test".into(),
         vec![12000; 1280],

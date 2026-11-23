@@ -139,7 +139,7 @@ python3 -m http.server 18089 --directory build/lx06 &
 请按以下步骤依次执行并在每一步向我汇报事实结果（执行时请统一使用我上面提供的真实 IP）：
 1. 克隆 https://github.com/yes999zc/home-mate.git 与 https://github.com/yes999zc/home-mate-gateway-lx06.git 到平级目录。
 2. SSH 登录 root@<音箱IP> 检查 `uname -m`（确认为 aarch64）与 `df -k /data /tmp`（确认 /data 可用空间 >= 5500 KB；若不足请先帮我清理 /data/log/* 旧日志）。
-3. 在 home-mate-gateway-lx06 目录执行 `./tools/pack_lx06_bundle.sh`（或直接从 GitHub Release v0.1.0 下载预编译好的 hm-bundle.tar.xz 与 hm-kws-lx06.tar.xz），并用后台 HTTP 服务在 <托管机IP>:18089 托管 build/lx06/ 目录（验证 curl -I http://<托管机IP>:18089/hm-kws-lx06.tar.xz 返回 200）。
+3. 在 home-mate-gateway-lx06 目录执行 `./tools/pack_lx06_bundle.sh`（或直接从 GitHub Release v0.2.0 下载预编译好的 hm-bundle.tar.xz 与 hm-kws-lx06.tar.xz），并用后台 HTTP 服务在 <托管机IP>:18089 托管 build/lx06/ 目录（验证 curl -I http://<托管机IP>:18089/hm-kws-lx06.tar.xz 返回 200）。
 4. 执行 `./deploy/lx06/install-lx06.sh --device-ip <音箱IP> --kws-url http://<托管机IP>:18089/hm-kws-lx06.tar.xz` 完成方案 A 免刷机安装（绝不修改 mtd4/mtd5 原厂只读分区）。
 5. 等待 15 秒内存盘解压完成后，调用 `POST http://<音箱IP>:8930/api/v0/auth/provision` 生成家庭访问令牌并保存到本机 `~/.home-mate/lx06.token`（权限 0600），最后打印控制台地址与令牌供我登录。
 ```
@@ -159,7 +159,7 @@ python3 -m http.server 18089 --directory build/lx06 &
 # 1. 先加 --dry-run 执行只读预检（验证串口 ID=emos、Wi-Fi IP 与安装包哈希，不写入设备任何字节）：
 ./tools/hm-provision.sh --device-id dot2-living \
   --seed build/bootstrap/home-mate-bootstrap-dot2-living.tar.gz \
-  --release build/release/home-mate-release-2026.11.22-98.tar \
+  --release build/release/home-mate-release-2026.11.23-106.tar \
   --serial /dev/cu.usbmodem8401 --ip 192.168.1.73 \
   --reference-node lx06 --reference-ip 192.168.1.50 \
   --wake-word 你好小智 --dry-run
@@ -167,7 +167,7 @@ python3 -m http.server 18089 --directory build/lx06 &
 # 2. 预检无误后，去掉 --dry-run 正式执行安装、激活、配对与全屋配置克隆：
 ./tools/hm-provision.sh --device-id dot2-living \
   --seed build/bootstrap/home-mate-bootstrap-dot2-living.tar.gz \
-  --release build/release/home-mate-release-2026.11.22-98.tar \
+  --release build/release/home-mate-release-2026.11.23-106.tar \
   --serial /dev/cu.usbmodem8401 --ip 192.168.1.73 \
   --reference-node lx06 --reference-ip 192.168.1.50 \
   --wake-word 你好小智

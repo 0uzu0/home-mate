@@ -1605,6 +1605,10 @@ impl VoicePipeline {
                     dev["media_guard"] = music.playback_status(&name);
                 }
                 dev["mic"]["counters"]["asr_skipped"] = json!(st.mic_counters.asr_skipped);
+                dev["mic"]["counters"]["kws_suspect_dropped"] =
+                    json!(st.mic_counters.kws_suspect_dropped);
+                dev["mic"]["counters"]["bare_wake_asr_skipped"] =
+                    json!(st.mic_counters.bare_wake_asr_skipped);
                 // Contract v2 §2.5 (#5): the local-exit half of a deploy.
                 // `local_exit` is the DEVICE's armed count, `local_exit_matches`
                 // says it equals what was sent, and `local_exits` counts the
@@ -1714,6 +1718,8 @@ pub(super) fn mic_counters_json(c: &MicCounters) -> serde_json::Value {
         "ignored_unwoken": c.ignored_unwoken,
         "asr_failed": c.asr_failed,
         "asr_skipped": c.asr_skipped,
+        "kws_suspect_dropped": c.kws_suspect_dropped,
+        "bare_wake_asr_skipped": c.bare_wake_asr_skipped,
         "self_echo_suppressed": c.self_echo_suppressed,
         "tail_suppressed": c.tail_suppressed,
         // Chunks dropped because our own voice was live (half duplex).

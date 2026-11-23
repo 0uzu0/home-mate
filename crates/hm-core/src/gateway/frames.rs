@@ -415,6 +415,16 @@ pub enum GatewayFrame {
         bundle_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kws_generation: Option<u64>,
+        /// XiaoAi-style L1+L2 acoustic tier ("real" | "suspect"). Optional so
+        /// older gateways (0.0.53 / LX06) preserve legacy ASR confirmation (#261).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kws_tier: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wake_dur_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_gap_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        l2_passed: Option<bool>,
     },
     /// v0.2.5 (D/T5): the device heard genuine near-end speech while its
     /// voice channel was playing (onset + echo cross-correlation guard),
@@ -1050,6 +1060,10 @@ pub enum DeviceEvent {
         /// v0.2.9: acoustic evidence for the wake claim (see the frame).
         rms_dbfs: Option<f32>,
         lag_ms: Option<u64>,
+        kws_tier: Option<String>,
+        wake_dur_ms: Option<u64>,
+        max_gap_ms: Option<u64>,
+        l2_passed: Option<bool>,
     },
     /// v0.2.5 (D/T5): genuine near-end speech detected during voice
     /// playback, with the onset pre-roll PCM (decoded S16LE @16k mono).

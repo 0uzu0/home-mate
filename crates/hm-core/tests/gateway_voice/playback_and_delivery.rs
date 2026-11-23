@@ -848,6 +848,10 @@ async fn a_wake_word_during_a_story_leaves_a_bookmark() {
         lag_ms: None,
         bundle_id: None,
         kws_generation: None,
+        kws_tier: None,
+        wake_dur_ms: None,
+        max_gap_ms: None,
+        l2_passed: None,
     })
     .await;
     let stopped = stops_within(&gw, Duration::from_millis(800)).await;
@@ -1197,6 +1201,10 @@ async fn a_wake_word_then_retreat_clears_the_paused_amber() {
         lag_ms: None,
         bundle_id: None,
         kws_generation: None,
+        kws_tier: None,
+        wake_dur_ms: None,
+        max_gap_ms: None,
+        l2_passed: None,
     })
     .await;
     tokio::time::sleep(Duration::from_millis(150)).await;
