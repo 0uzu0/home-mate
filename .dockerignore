@@ -1,0 +1,9 @@
+target/
+web/node_modules/
+web/dist/
+data/
+.git/
+.github/
+docs/
+*.log
+.DS_Store

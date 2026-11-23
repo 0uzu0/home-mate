@@ -1,0 +1,22 @@
+services:
+  hm-core:
+    image: ghcr.io/yes999zc/home-mate:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: home-mate-core
+    restart: unless-stopped
+    ports:
+      - "8930:8930" # Web Console & HTTP Management API
+      - "8932:8932" # Northbound Protocol v2 TCP Listener for Android / Linux Gateways
+    environment:
+      TZ: Asia/Shanghai
+      HM_NODE_ID: nas-core-1
+      HM_DATA_DIR: /data
+      HM_WEB_DIR: /app/web/dist
+      HM_BIND: 0.0.0.0:8930
+      HM_GATEWAY_BIND: 0.0.0.0:8932
+      HM_GATEWAY_ALLOW_LAN: "1"
+      RUST_LOG: hm_core=info
+    volumes:
+      - ./data:/data

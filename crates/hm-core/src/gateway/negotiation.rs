@@ -72,15 +72,41 @@ pub fn protocol_no_intersection_reason(mine: (u32, u32), peer: (u32, u32)) -> St
 
 /// The firmware link has no authentication of its own. Startup refuses any
 /// bind that is not loopback (`127.0.0.0/8` or `::1`). `0.0.0.0` and a LAN
-/// address are both rejected.
+/// address are both rejected unless `allow_lan` (`HM_GATEWAY_ALLOW_LAN=1`)
+/// is explicitly enabled for Docker / NAS deployment.
 pub fn ensure_loopback_bind(addr: std::net::SocketAddr) -> Result<(), String> {
     if addr.ip().is_loopback() {
         Ok(())
     } else {
         Err(format!(
-            "HM_GATEWAY_BIND {addr} is not loopback; the device gateway must use 127.0.0.1 or ::1"
+            "HM_GATEWAY_BIND {addr} is not loopback; the device gateway must use 127.0.0.1 or ::1 (or set HM_GATEWAY_ALLOW_LAN=1 for Docker/NAS mode)"
         ))
     }
+}
+
+/// Validate `HM_GATEWAY_BIND` against the active bind policy.
+/// - `allow_lan == false` (default on embedded speakers): strictly requires loopback (`127.0.0.0/8` or `::1`).
+/// - `allow_lan == true` (`HM_GATEWAY_ALLOW_LAN=1` on NAS/Docker): allows `0.0.0.0` or LAN interface addresses.
+pub fn ensure_gateway_bind_with_policy(
+    addr: std::net::SocketAddr,
+    allow_lan: bool,
+) -> Result<(), String> {
+    if allow_lan {
+        Ok(())
+    } else {
+        ensure_loopback_bind(addr)
+    }
+}
+
+/// Read `HM_GATEWAY_ALLOW_LAN` from the environment (`"1"` or `"true"`, case-insensitive).
+pub fn gateway_allow_lan_from_env() -> bool {
+    std::env::var("HM_GATEWAY_ALLOW_LAN")
+        .ok()
+        .map(|v| {
+            let trimmed = v.trim();
+            trimmed == "1" || trimmed.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false)
 }
 
 /// Refuse a hello that announces the same stable id twice. Every per-device
