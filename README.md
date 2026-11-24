@@ -1,156 +1,247 @@
-<div align="center">
-  <img src="web/public/home-mate-icon-v2.svg" alt="Home Mate Logo" width="84" height="84" />
-  <h1>Home Mate (小瑞)</h1>
-  <p>
-    <strong>从零设计的全屋家庭伙伴 Agent 核心</strong> — 自适应全量/精简 Rust 大脑、多房间协同仲裁、零桥接主脑直连与中英双语控制台
-  </p>
-  <p>
-    <em>A home companion agent built from scratch: adaptive full &amp; <code>--slim</code> Rust monolith core, multi-room mesh arbitration, direct Hermes Master Brain delegation, and bilingual Vue 3 console.</em>
-  </p>
+<p align="center">
+  <img src="docs/assets/hero-banner-en.png" alt="Home Mate · XiaoRui (小瑞) — 100% On-Speaker Sovereign Voice Runtime" width="100%" />
+</p>
 
-  <p>
-    <img src="https://img.shields.io/badge/Core-Rust%20(aarch64%20%7C%20x86__64)-DEA584?style=flat-square&logo=rust&logoColor=white" alt="Rust Core" />
-    <img src="https://img.shields.io/badge/Console-Vue%203%20%2B%20TypeScript-42B883?style=flat-square&logo=vuedotjs&logoColor=white" alt="Vue 3 Console" />
-    <img src="https://img.shields.io/badge/Protocol-Northbound%20v0%2Fv2-2563EB?style=flat-square" alt="Northbound Protocol" />
-    <img src="https://img.shields.io/badge/License-AGPL--3.0--only%20%2B%20Commercial-16A34A?style=flat-square" alt="License" />
-  </p>
+<p align="center">
+  <strong>English</strong> · <a href="README.zh-CN.md"><strong>简体中文</strong></a> · <a href="https://mymate.homes"><strong>Official Website (mymate.homes)</strong></a>
+</p>
 
-  <p>
-    <a href="#生态三仓架构">生态三仓</a> ·
-    <a href="#自适应构建与部署矩阵">部署矩阵</a> ·
-    <a href="#使用前提条件">前提条件</a> ·
-    <a href="#核心能力">核心能力</a> ·
-    <a href="#快速启动与构建">快速启动</a> ·
-    <a href="#许可协议">许可协议</a>
-  </p>
-</div>
+<p align="center">
+  <a href="https://mymate.homes"><img src="https://img.shields.io/badge/Website-mymate.homes-1f6b45?style=flat-square" alt="Website" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL--3.0-2e7d4f?style=flat-square" alt="AGPL-3.0" /></a>
+  <a href="LICENSE-PROTOCOL-APACHE-2.0"><img src="https://img.shields.io/badge/Protocol_v2_Spec-Apache--2.0-245a8d?style=flat-square" alt="Apache-2.0" /></a>
+  <img src="https://img.shields.io/badge/Execution-100%25_On--Speaker_ARM64-175536?style=flat-square" alt="100% On-Speaker" />
+  <img src="https://img.shields.io/badge/Hardware-Xiaomi_LX06_%7C_Echo_Dot_2-364239?style=flat-square" alt="Supported Hardware" />
+</p>
 
 ---
 
-## 生态三仓架构
+## What is Home Mate (XiaoRui / 小瑞)?
 
-**Home Mate** 采用 **核心大脑与硬件网关彻底解耦** 的模块化架构，由三大开源仓库组成：
+**Home Mate (小瑞)** is the next-generation evolution of [rui (小瑞)](https://github.com/yes999zc/rui). We rewrote the entire stack from scratch in **pure Rust** and fundamentally changed the architectural route:
 
-| 仓库 | 定位 | 适用对象 |
-|---|---|---|
-| **`yes999zc/home-mate`**（本仓） | **核心大脑（`hm-core`）+ Vue 3 控制台 + 发布工具** | NAS / Docker / Linux 主机 / Echo Dot 2 / 小米 LX06 等单节点与全屋 Mesh |
-| **[`yes999zc/home-mate-gateway-linux`](https://github.com/yes999zc/home-mate-gateway-linux)** | **Linux 多板卡硬件语音网关** | Echo Dot 2 (`board-dot2`)、小米小爱音箱 Pro LX06 (`board-lx06`) 等嵌入式音箱 |
-| **[`yes999zc/home-mate-gateway-android`](https://github.com/yes999zc/home-mate-gateway-android)** | **Android 通用自适应 APK 客户端与语音网关** | 安卓手机、折叠屏、平板、带屏音箱、4 寸 86 墙面屏、斐讯 R1（Android 5–16） |
+Where first-generation `rui` required an always-on external server or NAS running Python/FastAPI in Docker while smart speakers acted as thin network microphones, **Home Mate moves the entire voice runtime 100% inside the speaker hardware itself**:
+- **`hm-core`** — The voice agent brain, multi-room SNR wake arbiter, closed-loop Home Assistant controller, AEAD secret vault, and Vue 3 management plane (`:8930`).
+- **`hm-gateway`** — Hardware-specific Rust daemon owning ALSA capture/playback, acoustic echo cancellation (AEC), LED ring animations, physical buttons, and speaker voicing EQ over Northbound Protocol v2 (`127.0.0.1:8932`).
+- **`hm-kws`** — On-speaker C-ABI sidecar running a 3.3M int8 Zipformer keyword spotter and Silero VAD v4 neural endpoint detector with a 160ms pre-onset audio ring buffer.
 
-```mermaid
-flowchart LR
-  subgraph Gateways["多形态硬件语音网关 (Northbound v2 LDJSON :8932)"]
-    LX["Linux 硬件网关<br/>Echo Dot 2 / 小米 LX06<br/>(Loopback 127.0.0.1:8932)"]
-    AND["Android 通用 APK<br/>手机 / 平板 / 86 屏 / 斐讯 R1<br/>(LAN / Tailscale :8932 + :8930)"]
-  end
+> [!IMPORTANT]
+> **Hardware Research Disclaimer & Custom Speaker Roadmap**
+> 1. **For Research & Personal Experimentation Only**: Adaptation of third-party commercial speakers (**Xiaomi AI Speaker Pro `LX06`** and **Amazon Echo Dot 2 `RS03QR`**) in this project is provided **strictly for edge-AI architectural research, acoustic arbitration validation, and personal non-commercial experimentation**. All trademarks belong to their respective owners. This project is not affiliated with Xiaomi or Amazon and **does not sell modified third-party brand-name speakers**.
+> 2. **First-Party Custom Speaker Under Active Development**: We are actively engineering a **dedicated custom Home Mate (小瑞) smart speaker hardware platform** featuring an open far-field microphone array, tuned acoustic enclosure, and native sovereign Rust firmware out of the box—requiring zero third-party unlock steps.
 
-  subgraph Core["Home Mate Core (hm-core, Rust)"]
-    VOICE["语音流水线<br/>Silero VAD · 流式 TTS · 打断冲刷"]
-    AGENT["对话与工具编排<br/>家庭工具 · 记忆 · 加密凭证库"]
-    UI["内嵌 Web 控制台 (Vue 3)<br/>中英双语 · 方案 1A 局域网免密开关"]
-  end
+---
 
-  subgraph Ext["按需接入后端"]
-    LLM["BYOK LLM / ASR / Streaming TTS"]
-    HA["Home Assistant (可选)"]
-    MB["Hermes Agent 主脑直连 (可选)"]
-    MESH["全屋其他 hm-core 节点 (Mesh 唤醒仲裁)"]
-  end
+## Xiaomi AI Speaker Pro (`LX06`) Three Core Highlights
 
-  LX <-->|"Loopback"| Core
-  AND <-->|"Bearer Token / 方案 1A 豁免 + UDP 8933"| Core
-  Core <--> LLM
-  Core <--> HA
-  Core <-->|"SSE + 语音审批/打断"| MB
-  Core <-->|"RTT 时钟对齐仲裁"| MESH
+When deployed on the **Xiaomi AI Speaker Pro (`LX06`, Amlogic A113X `aarch64`)** via [yes999zc/home-mate-gateway-lx06](https://github.com/yes999zc/home-mate-gateway-lx06), Home Mate provides a non-invasive dual-system experience:
+
+1. **100% On-Speaker Execution (No External Streaming Server)**
+   - Through LTO optimization and `--no-default-features` (`--slim`) decoupling, `hm-core`, the Vue 3 Web Console, `hm-gateway` (`1.68 MiB`), and Silero `gateway_vad` pack into a **`4.84 MiB`** archive (`/data/hm/hm-bundle.tar.xz`).
+   - On boot, `/data/hm/init.sh` unpacks the runtime into the speaker's **`120.9 MiB /tmp` RAM tmpfs**. Keyword spotting, neural VAD endpointing, the `:8930` Web Console, and multi-room SNR arbitration all execute on the speaker's own 4-core ARM64 CPU.
+2. **Zero Damage to Stock Firmware (Dual-System Coexistence)**
+   - **0 bytes modified in stock SquashFS**: Factory read-only `mtd4 (system0)` and `mtd5 (system1)` partitions remain **100% untouched** (zero brick risk).
+   - Stock Xiaomi services (`mipns-xiaomi`, `mediaplayer`, Bluetooth, MiHome control) continue running normally alongside Home Mate.
+   - **1-Line Factory Restore**: Run `rm -rf /data/hm /data/init.sh && reboot` over SSH to return to 100% factory stock state.
+3. **Instant System Switching by Wake Word**
+   - Both wake engines listen concurrently via ALSA `noop` (`dsnoop`) shared capture and release ALSA `softvol` playback immediately on idle:
+     - Say **"XiaoAi TongXue" (小爱同学)** → Answered natively by stock Xiaomi XiaoAi.
+     - Say **your custom wake word (e.g., "NiHao XiaoZhi")** → Answered by **Home Mate** (DeepSeek / GLM / OpenAI LLMs, local Qwen3-ASR, Volcengine `seed-tts-2.0`, and closed-loop Home Assistant readback).
+     - Say **"QieHuan XiaoAi" (切换小爱)** during a session *(or double-tap the physical **CH** button on top of the speaker)* → Immediately hands off or pins exclusive stock XiaoAi control.
+
+---
+
+## Live Web Console Gallery (Light Theme Default · `:8930`)
+
+Every speaker serves the responsive **Home Mate Web Console** directly from `http://<SPEAKER_IP>:8930` (defaulting to the high-contrast Light theme, with 1-click Dark theme and English/Chinese switching):
+
+<table>
+  <tr>
+    <td width="50%">
+      <img src="docs/assets/lx06-en-status-light.png" alt="Status Overview (/status)" />
+      <p align="center"><strong>1. Status Overview (<code>/status</code>)</strong><br>Readiness checks, gateway connection generation, microphone capture state, and active program</p>
+    </td>
+    <td width="50%">
+      <img src="docs/assets/lx06-en-interaction-light.png" alt="Wake Word & Interaction (/interaction)" />
+      <p align="center"><strong>2. Wake Words &amp; Follow-up (<code>/interaction</code>)</strong><br>Custom wake phrases, sensitivity thresholds, 9s follow-up window, and local exit words</p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <img src="docs/assets/lx06-en-devices-light.png" alt="Hardware & Audio Gate (/devices)" />
+      <p align="center"><strong>3. Hardware &amp; Audio Gate (<code>/devices</code>)</strong><br>Speaker firmware status, room assignment, Silero VAD dBFS thresholds, and post-playback blind window</p>
+    </td>
+    <td width="50%">
+      <img src="docs/assets/lx06-en-eq-vad-light.png" alt="Custom 3-Band EQ (/devices)" />
+      <p align="center"><strong>4. Speaker Voicing EQ (<code>/devices</code>)</strong><br>Dedicated 3-band custom woofer curve for Xiaomi LX06 and 10-band EchoMuse curve for Echo Dot 2</p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <img src="docs/assets/console-en-services-light.png" alt="AI Brain Services (/services)" />
+      <p align="center"><strong>5. LLM, ASR &amp; TTS Services (<code>/services</code>)</strong><br>Primary/fallback LLMs (DeepSeek / GLM / OpenAI), Qwen3-ASR, and Volcengine seed-tts-2.0</p>
+    </td>
+    <td width="50%">
+      <img src="docs/assets/console-en-ha-readback-light.png" alt="Home Assistant Readback (/tools)" />
+      <p align="center"><strong>6. Home Assistant Closed-Loop Readback (<code>/tools</code>)</strong><br>Auto-discovered Assist entities with mandatory post-action state readback verification</p>
+    </td>
+  </tr>
+</table>
+
+---
+
+## On-Speaker Architecture & Repository Matrix
+
+<p align="center">
+  <img src="docs/assets/architecture-v2-light.png" alt="Home Mate Layered On-Speaker Architecture" width="100%" />
+</p>
+
+| Repository | Target Role | License |
+| :--- | :--- | :--- |
+| **[yes999zc/home-mate](https://github.com/yes999zc/home-mate)** *(this repo)* | `hm-core` brain, `hm-release` Ed25519 signed OTA manager, Vue 3 Web Console (`web/`), `tools/hm-provision.sh`, and Northbound v2 protocol contract | `AGPL-3.0` (`Apache-2.0` for Protocol v2 spec) |
+| **[yes999zc/home-mate-gateway-lx06](https://github.com/yes999zc/home-mate-gateway-lx06)** | Dedicated gateway for **Xiaomi AI Speaker Pro (`LX06`, Amlogic A113X `aarch64`)** — Storage Scheme A (`/data/hm` -> `/tmp/hm`), 100% on-speaker execution & Dual-System wake-word switching | `AGPL-3.0` |
+| **[yes999zc/home-mate-gateway-dot2](https://github.com/yes999zc/home-mate-gateway-dot2)** | Dedicated gateway for **Amazon Echo Dot 2 (`RS03QR`, MT8163 7-mic array)** — 160ms hardware reference AEC lock, 12-LED 60fps RGB ring & emOS integration | `AGPL-3.0` |
+
+---
+
+## Device-Specific Prerequisites & Quickstart (Choose Your Speaker)
+
+Xiaomi AI Speaker Pro (`LX06`) and Amazon Echo Dot 2 (`RS03QR`) are two completely separate hardware platforms. Follow the track for your specific speaker below.
+
+### Track A: Xiaomi AI Speaker Pro (`LX06`) — Zero-Flash Dual-System Install
+
+#### Prerequisites for LX06
+1. **Hardware Model & RAM**: Black cylinder **Xiaomi AI Speaker Pro** (bottom label model **`LX06`**, Amlogic A113X `aarch64`) with **256 MB RAM** for full on-speaker dual-system mode *(if you have a 128 MB RAM LX06 revision, use Track C: NAS / Docker Deployment below with a thin `hm-gateway` on the speaker)*.
+2. **Root SSH Unlocked via `open-xiaoai`**: You must first enable root SSH access (port 22) using the community [idootop/open-xiaoai](https://github.com/idootop/open-xiaoai) project and verify `ssh root@<LX06_IP>` works.
+3. **Free `/data` Space**: At least **5.5 MiB** free in `/data` (`df -k /data`).
+
+#### Manual Commands for LX06
+```bash
+git clone https://github.com/yes999zc/home-mate.git "../home mate b"
+git clone https://github.com/yes999zc/home-mate-gateway-lx06.git
+cd home-mate-gateway-lx06
+./tools/pack_lx06_bundle.sh
+
+# Host the 8.5 MiB KWS model bundle on your LAN (fetched into /tmp/hm-kws on boot)
+python3 -m http.server 18089 --directory build/lx06 &
+
+# Deploy to /data/hm on your LX06 speaker (stock mtd4/mtd5 SquashFS untouched)
+./deploy/lx06/install-lx06.sh --device-ip 192.168.1.50 --kws-url http://192.168.1.10:18089/hm-kws-lx06.tar.xz
+```
+
+#### Let an AI Coding Agent Deploy LX06 For You
+Copy and paste this prompt into **Claude Code, Cursor, or Codex** *(remember to replace `192.168.1.50` and `192.168.1.10` with your own actual LAN IPs!)*:
+```text
+Please deploy Home Mate (XiaoRui) to my Xiaomi AI Speaker Pro (model LX06, root SSH already enabled via open-xiaoai):
+[IMPORTANT: Replace the two example IPs below with your own actual LAN IPs]
+- Speaker SSH: root@192.168.1.50        <-- Replace with your LX06 speaker's actual LAN IP
+- LAN HTTP host IP: 192.168.1.10        <-- Replace with this computer's or your NAS's actual LAN IP
+
+Steps to execute and verify (use my actual IPs above):
+1. Clone https://github.com/yes999zc/home-mate.git and https://github.com/yes999zc/home-mate-gateway-lx06.git side by side.
+2. SSH into root@<SPEAKER_IP> to verify `uname -m` is `aarch64` and `df -k /data` has >= 5500 KB available (clean old logs in /data/log/* if needed).
+3. In home-mate-gateway-lx06, run `./tools/pack_lx06_bundle.sh` (or download prebuilt `hm-bundle.tar.xz` and `hm-kws-lx06.tar.xz` from GitHub Release v0.2.0), serve `build/lx06/` over HTTP on <HOST_IP>:18089, and verify `http://<HOST_IP>:18089/hm-kws-lx06.tar.xz` returns HTTP 200.
+4. Run `./deploy/lx06/install-lx06.sh --device-ip <SPEAKER_IP> --kws-url http://<HOST_IP>:18089/hm-kws-lx06.tar.xz`.
+5. Wait 15s for RAM unpack, call `POST http://<SPEAKER_IP>:8930/api/v0/auth/provision`, save the token to `~/.home-mate/lx06.token` (mode 0600), and print the console URL and token.
 ```
 
 ---
 
-## 自适应构建与部署矩阵
+### Track B: Amazon Echo Dot 2 (`RS03QR`) — 1-Command Provisioning (`tools/hm-provision.sh`)
 
-同一份 `hm-core` 源码通过编译特征与运行参数自动适配不同算力与闪存约束的载体：
+#### Prerequisites for Echo Dot 2
+1. **Bootrom Unlocked via `firebreak` (`amonet`)**: Your 2nd-Generation Echo Dot (`RS03QR` "biscuit") must first be unlocked over Micro-USB using [yes999zc/firebreak](https://github.com/yes999zc/firebreak) (`uvx firebreak@latest`) with your stock `p10` partition backed up.
+2. **`emOS` Audio Base Flashed & Connected to Wi-Fi**: The speaker must be running the `emOS` system layer (so the USB serial console `/dev/cu.usbmodem*` on macOS or `/dev/ttyACM*` on Linux reports `ID=emos`) and joined to your LAN via `em-wifi`.
 
-| 形态 | 构建方式 | 二进制 / 镜像特点 | 适用场景 |
-|---|---|---|---|
-| **NAS / Docker 容器版** | `docker compose up -d --build`（含全量特性） | 默认映射 TCP `:8930` 控制台与 `:8932` 语音网关（`HM_GATEWAY_ALLOW_LAN=1`）；若需 UDP `:8933` 广播发现可改用 `network_mode: host`（否则 Android 端仍可通过局域网网段扫描或手动 IP 接入） | 搭配 `home-mate-gateway-android`（手机/平板/86 屏/R1），一台 NAS 即可驱动全屋安卓终端 |
-| **全量音箱版 (`full`)** | `./tools/build_core.sh`（默认启用 `silero-vad`） | 静态 `aarch64-unknown-linux-musl`（含内嵌 `tract-onnx` Silero VAD，约 19–25 MB） | Amazon Echo Dot 2 等具备充裕根分区/A/B 槽的独立音箱节点 |
-| **精简音箱版 (`--slim`)** | `./tools/build_core.sh --slim`（`--no-default-features`） | 剔除 `tract-onnx`（约 13 MB，XZ 压缩后约 5 MB），依赖外部/侧车 VAD | 小米小爱 Pro (`LX06`, `/data` 仅 8 MB 可用) 等低闪存嵌入式设备 |
-
----
-
-## 使用前提条件
-
-1. **自带模型 API Key（BYOK）**：需在 Web 控制台「服务设置」中配置至少一组 OpenAI 兼容的 **LLM**（必需），以及用于语音交互的 **ASR** 与 **TTS** 服务（支持火山引擎、OpenAI 兼容接口或局域网自建语音服务）。所有密钥经 ChaCha20-Poly1305 本地加密存储在 `data/secret.key` 保护的 SQLite Vault 中。
-2. **可选智能家居与主脑后端**：
-   - **Home Assistant**：可选，配置 URL 与长期访问令牌后支持自然语言控灯/空调/场景并带写后回读校验。
-   - **Hermes Agent 主脑直连**：可选，零桥接直连 Hermes HTTP/SSE API，支持将复杂长任务异步委派给电脑/服务器主脑，并通过音箱进行实时进度播报、语音审批确认与随时取消。
-3. **局域网接入安全（方案 1A）**：
-   - 默认 fail-closed：非本机回环请求要求管理员 Bearer Token。
-   - 支持在 Web 控制台「安全设置」一键开启 **局域网可信设备免密豁免（`lan_gateway_exempt`）**：开启后仅对 RFC1918 私网与 Tailscale (`100.64.0.0/10`) 放行 `:8932` 语音网关及 `:8930` 日常对话/只读/媒体接口；高危管理接口（OTA、安全鉴权、凭证 Vault、备份导出/导入、出厂重置）**始终严格要求管理员 Token**。
-   - 每个 `hm-core` 节点自动生成持久化非敏感指纹 `core_id`（`hmcore_<16hex>`）并通过 UDP `8933` 与 `/api/v0/auth` 广播，供客户端合并去重多网卡 / Tailscale 路由。
-
----
-
-## 核心能力
-
-| 领域 | 能力说明 |
-|---|---|
-| **低延迟全双工/半双工语音** | 唤醒词 + 退场/控播词本地反射、Silero VAD 端点检测、流式 TTS 边下边播与打断冲刷、防自听保护与多房间 RTT 时钟对齐唤醒仲裁 |
-| **多网关并发与硬件隔离** | 同一 `hm-core` 支持本机回环音箱网关与多个局域网/Tailscale Android 端并发在线；强制防劫持隔离，本机音箱始终保持主输出与 OTA 健康校验优先权 |
-| **家庭工具与长期记忆** | 天气、RSS/Atom 新闻、网络搜索、音乐（Subsonic/OpenAPI 曲库）、故事续播/笑话、定时提醒、Home Assistant 控家、共享家庭记忆与版本化 `USER.md` / `Agent.md` |
-| **Hermes 主脑直连** | 内置 `brain.{delegate,status,steer,cancel}` 工具，SSE 实时监听 + 轮询降级，支持语音审批与即时取消 |
-| **中英双语 Web 控制台** | Vue 3 + TypeScript，浅色/深色主题、简体中文/English 双语、4-Tab 分组设置、实时语音/网关诊断、全量加密配置导入导出 |
-| **安全与 A/B 槽升级** | ChaCha20-Poly1305 静态凭证库、Ed25519 离线签名发布包、设备端验签、A/B 槽原子激活与健康检查自动回滚 |
-
----
-
-## 快速启动与构建
-
-### 1. NAS / Docker 一键启动（配合 Android 通用 APK）
+#### Manual Commands for Echo Dot 2
+Our bundled `tools/hm-provision.sh` (with built-in `tools/serial_cmd.py`) automates the entire Home Mate application layer—repairing `/data/emos/sockets`, installing the bootstrap seed, activating the Ed25519-signed release bundle, running `7/7` health checks, pairing the household token, and cloning household config from a reference speaker:
 
 ```bash
-# 克隆本仓库后构建并启动（默认映射 TCP :8930 控制台与 :8932 语音网关，数据持久化至 ./data；如需 UDP :8933 广播发现可使用 network_mode: host）
-docker compose up -d --build
+# 1. Run a read-only --dry-run first (verifies serial console, ID=emos, Wi-Fi IP & package hashes without writing):
+./tools/hm-provision.sh --device-id dot2-living \
+  --seed build/bootstrap/home-mate-bootstrap-dot2-living.tar.gz \
+  --release build/release/home-mate-release-2026.11.23-106.tar \
+  --serial /dev/cu.usbmodem8401 --ip 192.168.1.73 \
+  --reference-node lx06 --reference-ip 192.168.1.50 \
+  --wake-word 你好小智 --dry-run
+
+# 2. Remove --dry-run to execute full installation, activation, token pairing & fleet config cloning:
+./tools/hm-provision.sh --device-id dot2-living \
+  --seed build/bootstrap/home-mate-bootstrap-dot2-living.tar.gz \
+  --release build/release/home-mate-release-2026.11.23-106.tar \
+  --serial /dev/cu.usbmodem8401 --ip 192.168.1.73 \
+  --reference-node lx06 --reference-ip 192.168.1.50 \
+  --wake-word 你好小智
 ```
 
-启动后访问 `http://<你的NAS或主机IP>:8930` 完成初始管理员配对与模型 Key 配置，并在 Android 客户端中点击「扫描局域网核心」即可连入。
+#### Let an AI Coding Agent Provision Echo Dot 2 For You
+Copy and paste this prompt into **Claude Code, Cursor, or Codex** *(remember to replace the example serial device and IPs with your own actual values!)*:
+```text
+I have an Amazon Echo Dot 2 (RS03QR) already unlocked via firebreak (amonet) and running the emOS audio base:
+[IMPORTANT: Replace the example serial device and LAN IPs below with your own actual values]
+- USB Serial Port: /dev/cu.usbmodem8401   <-- Replace with your actual USB serial device (or detect via `ls /dev/cu.usbmodem* /dev/ttyACM*`)
+- Speaker LAN IP:  192.168.1.73           <-- Replace with your Echo Dot 2's actual Wi-Fi LAN IP
+- (Optional) Reference Speaker IP: 192.168.1.50 <-- Replace with an existing configured speaker's IP if cloning household config
 
-### 2. 本地源码编译与全量测试（需要 Rust 1.100+ 与 Node.js 20+）
-
-```bash
-# 1. 代码行号门禁与体积门禁自测
-python3 tools/line_gate.py
-python3 tools/size_gate.py --self-test
-
-# 2. Rust 格式、精简版编译校验、Clippy 与工作区全量测试
-cargo fmt --all -- --check
-cargo check -p hm-core --no-default-features --locked --all-targets
-cargo clippy --workspace --locked --all-targets -- -W clippy::all
-cargo test --workspace --locked
-
-# 3. Web 控制台构建与全部回归测试
-cd web && npm ci && npm run build
-for t in tests/*.mjs; do node "$t"; done
-```
-
-### 3. 交叉编译嵌入式音箱二进制（`aarch64-unknown-linux-musl`）
-
-```bash
-# 全量版（含 in-process Silero VAD，供 Echo Dot 2 等设备使用）
-./tools/build_core.sh
-
-# 精简版（剔除 tract-onnx，供小米 LX06 等低闪存设备使用）
-./tools/build_core.sh --slim
+In the `home-mate` repository, please run `./tools/hm-provision.sh` to provision this speaker as `--device-id dot2-living` with `--wake-word 你好小智`:
+1. Run `./tools/hm-provision.sh` with `--dry-run` first to verify serial reachability (`ID=emos`), `/data/emos/sockets`, and package hashes. Report the dry-run output before making changes.
+2. Run `./tools/hm-provision.sh` without `--dry-run` (passing `--reference-node <REF_ID> --reference-ip <REF_ACTUAL_IP>` if a reference speaker exists) to install the seed, activate the signed release, verify 7/7 health checks, and save the token to `~/.home-mate/dot2-living.token`.
 ```
 
 ---
 
-## 许可协议
+### Track C: NAS / Docker Deployment (LAN Gateway Support & Thin-Client Mode)
 
-Home Mate (小瑞) 采用 **开源双许可 + 协议例外** 策略：
+Home Mate now natively supports **Docker deployment** with prebuilt multi-arch images (`linux/amd64` + `linux/arm64`) for Synology, fnOS, UGREEN, Unraid, Raspberry Pi, and Linux/macOS servers.
 
-- **开源使用 (`AGPL-3.0-only`)**：遵循 GNU Affero General Public License v3.0（见 [`LICENSE`](LICENSE)），面向个人、家庭自托管、学术研究与开源社区免费开放。
-- **Northbound v2 协议例外 (`Apache-2.0`)**：设备网关北向协议规范与契约定义另行适用 Apache License 2.0（见 [`LICENSE-PROTOCOL-APACHE-2.0`](LICENSE-PROTOCOL-APACHE-2.0)），允许第三方硬件网关与 DIY 客户端自由对接而不受 AGPL 传染约束。
-- **商业授权 / OEM 预装**：如需商业硬件预装、OEM 分发或闭源衍生，请联系版权方：`zhangcong1985@gmail.com` / `yes999zc@163.com`（官方网站：[https://mymate.homes](https://mymate.homes)）。
-- 第三方依赖许可与模型致谢见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
+With the opt-in **`HM_GATEWAY_ALLOW_LAN=1`** environment variable, `hm-core` listens on `:8932` for remote Northbound Protocol v2 device gateways over your LAN/Tailscale (such as a **128 MB RAM LX06 running a thin `hm-gateway`**, Android/Linux clients, etc.), while embedded on-speaker deployments keep strict `127.0.0.1` loopback binding by default.
+
+#### One-Line Docker Run (Prebuilt Multi-Arch Image)
+```bash
+docker run -d \
+  --name home-mate-core \
+  --restart unless-stopped \
+  -p 8930:8930 \
+  -p 8932:8932 \
+  -e TZ=Asia/Shanghai \
+  -e HM_GATEWAY_ALLOW_LAN=1 \
+  -v "$(pwd)/data:/data" \
+  ghcr.io/yes999zc/home-mate:latest
+```
+
+#### Or Start With Docker Compose
+```bash
+# Uses the bundled docker-compose.yml (pulls ghcr.io prebuilt image; append --build to build from source)
+docker compose up -d
+```
+
+- **Web Console**: Open `http://<NAS_IP>:8930` to pair your household access token and configure LLM/ASR/TTS & devices.
+- **Offline Docker Tarballs**: Download `hm-core-docker-linux-amd64.tar.gz` or `hm-core-docker-linux-arm64.tar.gz` directly from [GitHub Releases (`v0.2.1`)](https://github.com/yes999zc/home-mate/releases/tag/v0.2.1) and import via `docker load -i <tarball>`.
+
+---
+
+## Acknowledgments
+
+Home Mate stands on the shoulders of many open-source projects and hardware communities. Full license details live in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+**Running in the on-speaker pipeline & unlock prerequisites**
+- [idootop/open-xiaoai](https://github.com/idootop/open-xiaoai) & [@coderzc/open-xiaoai](https://github.com/coderzc/open-xiaoai) (MIT) — Community SSH unlock prerequisite and early voice client research for the Xiaomi AI Speaker Pro (`LX06`).
+- [k2-fsa/sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) (Apache-2.0) & [Microsoft ONNX Runtime](https://github.com/microsoft/onnxruntime) (MIT) — C-ABI keyword spotting runtime and 3.3M int8 Zipformer model in `hm-kws`.
+- [snakers4/silero-vad](https://github.com/snakers4/silero-vad) (MIT) — Silero VAD v4 neural voice activity detection model (`silero_vad.onnx`).
+- [xiph/speexdsp](https://github.com/xiph/speexdsp) (BSD-3-Clause) — Acoustic echo cancellation (AEC) DSP primitives.
+- [pdeljanov/Symphonia](https://github.com/pdeljanov/Symphonia) (MPL-2.0) — Pure-Rust streaming audio decoder (`mp3`, `flac`, `aac`, `isomp4`, `wav`, `pcm`).
+- [Tokio](https://github.com/tokio-rs/tokio), [Axum](https://github.com/tokio-rs/axum), [Rusqlite](https://github.com/rusqlite/rusqlite), [RustCrypto](https://github.com/RustCrypto) (`chacha20poly1305`, `ed25519-dalek`), [Vue 3](https://github.com/vuejs/core), and [Lucide](https://github.com/lucide-icons/lucide).
+
+**Architectural lineage & design inspirations**
+- [yes999zc/rui (小瑞)](https://github.com/yes999zc/rui) — The predecessor of Home Mate. Home Mate inherits rui's household voice philosophy while rewriting the entire runtime in pure Rust to run 100% inside the speaker hardware.
+- [wilbowes/EchoMuse](https://github.com/wilbowes/EchoMuse) — State machine, 2-inch driver voicing curve insights (`echomuse` EQ preset), and explainable-wizard console philosophy for Echo Dot 2 (no code copied).
+- [Rhasspy](https://github.com/rhasspy/rhasspy) & [rhasspy/wyoming](https://github.com/rhasspy/wyoming) — Domain split and protocol layering between the core control plane and local audio gateway.
+- [Home Assistant](https://github.com/home-assistant/core) & [Navidrome](https://github.com/navidrome/navidrome) / OpenSubsonic — Smart home entity exposure over WebSocket and self-hosted music library streaming.
+
+---
+
+## License & Contact
+
+- **Open-Source License**: **[GNU AGPL v3.0](LICENSE)** for personal, family, and community self-hosting. The Northbound v2 protocol specification is licensed under **[Apache-2.0](LICENSE-PROTOCOL-APACHE-2.0)**.
+- **Official Website**: **[https://mymate.homes](https://mymate.homes)**
+- **Contact (Custom Speaker R&D / Commercial OEM Licensing)**: **`zhangcong1985@gmail.com`** / **`yes999zc@163.com`**
