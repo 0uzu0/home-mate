@@ -120,10 +120,7 @@ pub(super) fn validate_array_elements(path: &str, items: &[Value]) -> Result<()>
                 if let Some(sub_items) = v.as_array() {
                     validate_array_elements(&elem_path, sub_items)?;
                 }
-            } else if desc.kind == "object"
-                && !(matches!(path, "remote_socket.capabilities" | "open_sockets")
-                    && k == "parameters")
-            {
+            } else if desc.kind == "object" && !(path == "open_sockets" && k == "parameters") {
                 // Remote parameters are a schema document with dynamic property names.
                 if let Some(sub_obj) = v.as_object() {
                     for (sk, sv) in sub_obj {
@@ -647,6 +644,15 @@ pub fn convert_for_purpose(
             continue;
         }
 
+        if block == "remote_socket" {
+            report.push(json!({
+                "pointer": "/remote_socket",
+                "action": "ignored_retired",
+                "detail": "remote_socket was retired in favor of master_brain"
+            }));
+            continue;
+        }
+
         let known_object_blocks = [
             "services",
             "shared_memory",
@@ -661,7 +667,6 @@ pub fn convert_for_purpose(
             "reflex",
             "audio_eq",
             "devices",
-            "remote_socket",
             "device_led_configs",
             "privacy",
             "node",
@@ -746,35 +751,7 @@ pub fn convert_for_purpose(
             }
         }
 
-        if block == "remote_socket" {
-            if purpose == Purpose::FamilyPolicy {
-                family_choice_or_strip(
-                    "/remote_socket".into(),
-                    "node",
-                    "remote_socket is node-local and cannot be included in family_policy",
-                    sanitize_family,
-                    &mut report,
-                );
-                continue;
-            }
-            if let Some(source) = map.get("source_node") {
-                if source.as_str().is_none_or(|node| {
-                    node.is_empty() || Some(node) != state["target"]["node_id"].as_str()
-                }) {
-                    return Err(DeliveryError::conflict(
-                        "REMOTE_SOCKET_RESTORE_TARGET_MISMATCH",
-                        "Remote socket backups can only be restored on their source node",
-                    )
-                    .at("remote_socket.source_node"));
-                }
-                report.push(json!({"pointer":"/remote_socket/source_node","action":"verified"}));
-            }
-        }
-
         for (key, val) in map {
-            if block == "remote_socket" && key == "source_node" {
-                continue;
-            }
             if block == "music" && matches!(key.as_str(), "library" | "online") {
                 if let Some(connection) = val.as_object() {
                     music_connection_v1(

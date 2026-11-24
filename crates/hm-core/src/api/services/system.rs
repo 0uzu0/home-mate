@@ -216,6 +216,14 @@ pub fn build_config_document(state: &AppState, include_secrets: bool) -> Result<
         },
         "news": state.config.news_status().map_err(|e| e.to_string())?,
         "search": crate::tool::search::status_json(&state.search),
+        "master_brain": {
+            "enabled": state.master_brain.config().0.enabled,
+            "protocol": state.master_brain.config().0.protocol,
+            "url": state.master_brain.config().0.url,
+            "callback_url": state.master_brain.config().0.callback_url,
+            "timeout_ms": state.master_brain.config().0.timeout_ms,
+            "bearer_token_set": state.master_brain.config().1.is_some(),
+        },
         "openapi": {
             "enabled": openapi.enabled,
             "spec_url": openapi.spec_url,
@@ -237,10 +245,6 @@ pub fn build_config_document(state: &AppState, include_secrets: bool) -> Result<
     });
     let (node, source) = state.fleet.self_id(None);
     if source != "default" {
-        if let Some(mut remote) = state.remote_socket.export().map_err(|error| error.detail)? {
-            remote["source_node"] = json!(node);
-            doc["remote_socket"] = remote;
-        }
         if let Some(sockets) =
             crate::config_delivery::ConfigDelivery::open_sockets_export(state, &node)
         {
@@ -335,13 +339,14 @@ pub struct ConfigImportBody {
     /// The key travels in `secrets` only (`?secrets=1` backups).
     #[serde(default)]
     pub search: Option<Value>,
+    /// External Master Brain (#267 / #270): { enabled, protocol, url, callback_url, timeout_ms }.
+    /// Bearer token travels in `secrets["master_brain_token"]` only (`?secrets=1` backups).
+    #[serde(default)]
+    pub master_brain: Option<Value>,
     /// OpenAPI adapter (R2-BM6). Import validates the stored catalogue
     /// STRUCTURALLY (GET only, local paths); it never makes an HTTP request.
     #[serde(default)]
     pub openapi: Option<Value>,
-    /// Node-local remote socket settings. Its credential is always kept on the target.
-    #[serde(default)]
-    pub remote_socket: Option<Value>,
     #[serde(default)]
     pub open_sockets: Option<Value>,
     #[serde(default)]
@@ -522,7 +527,6 @@ fn prevalidate_config_import(
     state: &AppState,
     body: &ConfigImportBody,
     fleet: bool,
-    remote_restore_node: Option<&str>,
 ) -> Result<(), (StatusCode, Json<Value>)> {
     let allow_loopback = state.store.allows_loopback_public();
     let secret = |name: &str| {
@@ -604,6 +608,14 @@ fn prevalidate_config_import(
         cfg.normalized(allow_loopback)
             .map_err(|e| bad_section("search", e))?;
     }
+    if let Some(mb) = &body.master_brain {
+        let cfg: crate::config::MasterBrainConfig =
+            serde_json::from_value::<crate::config::MasterBrainConfig>(mb.clone())
+                .map_err(|e| bad_section("master_brain", e))?
+                .normalized();
+        cfg.validate(allow_loopback)
+            .map_err(|e| bad_section("master_brain", e))?;
+    }
     if let Some(openapi) = &body.openapi {
         let mut cfg: crate::config::OpenApiConfig =
             serde_json::from_value(openapi.clone()).map_err(|e| bad_section("openapi", e))?;
@@ -633,23 +645,6 @@ fn prevalidate_config_import(
         }
         cfg.normalized(allow_loopback)
             .map_err(|e| bad_section("openapi", e))?;
-    }
-    if let (Some(remote), Some(_node)) = (&body.remote_socket, remote_restore_node) {
-        let fail = |error: crate::config_delivery::DeliveryError| {
-            (
-                StatusCode::from_u16(error.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                Json(json!({"error": error.detail, "code": error.code, "pointer": error.pointer})),
-            )
-        };
-        let mut config: crate::tool::remote_socket::RemoteSocketConfig =
-            serde_json::from_value(remote.clone()).map_err(|error| fail(error.into()))?;
-        crate::tool::remote_socket::validate_remote_config(&mut config).map_err(|detail| {
-            fail(
-                crate::config_delivery::DeliveryError::new("INVALID_REMOTE_SOCKET_CONFIG", detail)
-                    .at("remote_socket"),
-            )
-        })?;
-        let _ = state.remote_socket.snapshot().map_err(fail)?;
     }
     if let Some(reflex) = &body.reflex {
         let incoming: crate::config::ReflexConfig =
@@ -716,21 +711,6 @@ pub async fn apply_config_import(
             ));
         }
     }
-    let remote_restore_node = if let Some(remote) = body.remote_socket.as_ref().filter(|_| !fleet) {
-        let (node, source) = state.fleet.self_id(None);
-        if source == "default" || remote["source_node"].as_str() != Some(&node) {
-            return Err((
-                StatusCode::CONFLICT,
-                Json(json!({
-                    "error":"Remote socket backups can only be restored on their source node.",
-                    "code":"REMOTE_SOCKET_RESTORE_TARGET_MISMATCH"
-                })),
-            ));
-        }
-        Some(node)
-    } else {
-        None
-    };
     let open_sockets_error = |error: crate::config_delivery::DeliveryError| {
         (
             StatusCode::from_u16(error.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -809,7 +789,7 @@ pub async fn apply_config_import(
 
     // Pre-validate every present block before the first write so any invalid
     // section fails with zero partial modifications.
-    prevalidate_config_import(state, &body, fleet, remote_restore_node.as_deref())?;
+    prevalidate_config_import(state, &body, fleet)?;
     let checkpoint = capture_import_checkpoint(state);
 
     let write_res: Result<(), (StatusCode, Json<Value>)> = async {
@@ -989,6 +969,23 @@ pub async fn apply_config_import(
             applied.push("news".into());
         }
 
+        if let Some(mb) = &body.master_brain {
+            let cfg: crate::config::MasterBrainConfig = serde_json::from_value(mb.clone())
+                .map_err(|e| bad_section("master_brain", e))?;
+            let tok = secret(crate::config::MASTER_BRAIN_TOKEN_SECRET);
+            if tok.is_none() && mb["bearer_token_set"].as_bool().unwrap_or(false) {
+                warnings.push(
+                    "master_brain: backup had a stored token but no secret value; the current stored token was kept"
+                        .into(),
+                );
+            }
+            state
+                .config
+                .save_master_brain(cfg, tok.as_deref(), actor)
+                .map_err(|e| bad_section("master_brain", e))?;
+            applied.push("master_brain".into());
+        }
+
         if let Some(search) = &body.search {
             let cfg: crate::config::SearchConfig =
                 serde_json::from_value(search.clone()).map_err(|e| {
@@ -1037,25 +1034,6 @@ pub async fn apply_config_import(
             state.config.save_openapi_expected(cfg, token.as_deref(), actor, Some(&captured.revision))
                 .map_err(|error| bad(error.to_string()))?;
             applied.push("openapi".into());
-        }
-
-        if let Some(remote) = &body.remote_socket {
-            if let Some(node) = remote_restore_node.as_deref() {
-                let fail = |error: crate::config_delivery::DeliveryError| {
-                    (StatusCode::from_u16(error.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                        Json(json!({"error": error.detail, "code": error.code, "pointer": error.pointer})))
-                };
-                let config = serde_json::from_value(remote.clone())
-                    .map_err(|error| fail(error.into()))?;
-                let baseline = state.remote_socket.snapshot().map_err(fail)?;
-                state.remote_socket.restore(config, actor, &baseline.revision, node).map_err(fail)?;
-                if remote["token_set"] == true && baseline.token.is_none() {
-                    warnings.push("remote_socket: configure the target's local credential".into());
-                }
-                applied.push("remote_socket".into());
-            } else {
-                warnings.push("remote_socket: node-local settings were kept".into());
-            }
         }
 
         if let Some(reflex) = &body.reflex {

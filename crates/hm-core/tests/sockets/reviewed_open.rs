@@ -378,7 +378,7 @@ async fn whole_socket_registry_publishes_real_tools_and_rolls_back_with_local_cr
     )
     .await;
     let delivered = incoming.lock().unwrap().take().unwrap();
-    for key in ["open_sockets", "open_sockets_source_node", "remote_socket"] {
+    for key in ["open_sockets", "open_sockets_source_node"] {
         assert!(delivered.get(key).is_none(), "fleet forwarded {key}");
     }
     peer_task.abort();

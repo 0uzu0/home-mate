@@ -69,8 +69,24 @@ fn mode_get(paths: &Paths) -> Option<Value> {
     paths.mode().ok()
 }
 
-fn first_device(mode: &Value) -> Option<&Value> {
-    mode.get("devices")?.as_array()?.first()
+fn select_gateway_device<'a>(devices: &'a [Value], want_model: &str) -> Option<&'a Value> {
+    devices
+        .iter()
+        .find(|d| {
+            let is_loopback = d.get("loopback").and_then(|v| v.as_bool()).unwrap_or(false);
+            let is_fw = d
+                .get("firmware")
+                .and_then(|v| v.as_str())
+                .is_some_and(|fw| fw.contains("hm-firmware "));
+            is_loopback || is_fw
+        })
+        .or_else(|| {
+            devices.iter().find(|d| {
+                !want_model.is_empty()
+                    && d.get("model").and_then(|v| v.as_str()) == Some(want_model)
+            })
+        })
+        .or_else(|| devices.first())
 }
 
 /// One evaluation pass. Every criterion is reported with its evidence even
@@ -108,17 +124,29 @@ pub fn evaluate(paths: &Paths, want: &Expect) -> Report {
         .and_then(|g| g.get("gateway"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let device_online = gw
-        .and_then(|g| g.get("devices"))
-        .and_then(|d| d.as_array())
-        .map(|d| {
-            d.iter()
-                .any(|x| x.get("online").and_then(|v| v.as_bool()).unwrap_or(false))
-        })
+    let gw_devices = gw.and_then(|g| g.get("devices")).and_then(|d| d.as_array());
+    // Select the local speaker device (matching loopback / hm-firmware / want.model)
+    // so concurrent LAN/Android companion gateways never hijack OTA health verification.
+    let gw_dev = gw_devices.and_then(|arr| select_gateway_device(arr, &want.model));
+    let device_online = gw_dev
+        .and_then(|x| x.get("online"))
+        .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let matches_gw_ver = |s: &str| {
+        s.contains(&format!(" {}", want.gateway_version)) || s.contains(&want.gateway_version)
+    };
     let gw_version_ok = want.gateway_version.is_empty()
-        || gw_version.contains(&format!(" {}", want.gateway_version))
-        || gw_version.contains(&want.gateway_version);
+        || matches_gw_ver(gw_version)
+        || gw
+            .and_then(|g| g.get("connections"))
+            .and_then(|c| c.as_array())
+            .is_some_and(|conns| {
+                conns.iter().any(|c| {
+                    c.get("gateway")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(matches_gw_ver)
+                })
+            });
     checks.push(check(
         "gateway",
         gw_connected && device_online && gw_version_ok,
@@ -127,15 +155,6 @@ pub fn evaluate(paths: &Paths, want: &Expect) -> Report {
             want.gateway_version
         ),
     ));
-
-    // Device model + firmware come from the gateway descriptor in /status;
-    // /mode reports behavior state, not the device identity.
-    let gw_dev = status
-        .as_ref()
-        .and_then(|s| s.get("gateway"))
-        .and_then(|g| g.get("devices"))
-        .and_then(|d| d.as_array())
-        .and_then(|d| d.first());
 
     let got_model = gw_dev
         .and_then(|d| d.get("model"))
@@ -178,8 +197,21 @@ pub fn evaluate(paths: &Paths, want: &Expect) -> Report {
         ),
     ));
 
+    let target_stable_id = gw_dev
+        .and_then(|d| d.get("stable_id"))
+        .and_then(|v| v.as_str());
+    let mode_dev = mode.as_ref().and_then(|m| {
+        let arr = m.get("devices").and_then(|d| d.as_array())?;
+        target_stable_id
+            .and_then(|id| {
+                arr.iter()
+                    .find(|d| d.get("device").and_then(|v| v.as_str()) == Some(id))
+            })
+            .or_else(|| arr.first())
+    });
+
     // KWS running.
-    let kws_state = first_device_opt(mode.as_ref())
+    let kws_state = mode_dev
         .and_then(|d| d.get("kws"))
         .and_then(|k| k.get("state"))
         .and_then(|v| v.as_str())
@@ -191,7 +223,7 @@ pub fn evaluate(paths: &Paths, want: &Expect) -> Report {
     ));
 
     // VAD model actually loaded (not the energy fallback).
-    let endpoint = first_device_opt(mode.as_ref())
+    let endpoint = mode_dev
         .and_then(|d| d.get("mic"))
         .and_then(|m| m.get("vad"))
         .and_then(|v| v.get("endpoint"));
@@ -246,10 +278,6 @@ fn vad_endpoint_ok(kind: &str, fallback: Option<&str>, detail: &str) -> bool {
     matches!(kind, "silero" | "gateway_vad") && fallback.is_none() && !detail.is_empty()
 }
 
-fn first_device_opt(mode: Option<&Value>) -> Option<&Value> {
-    mode.and_then(first_device)
-}
-
 /// Poll until every criterion passes or the budget runs out.
 pub fn wait_healthy(paths: &Paths, want: &Expect, budget: Duration) -> (Report, u64) {
     let start = Instant::now();
@@ -297,5 +325,27 @@ mod tests {
         assert_eq!(e.build_id, "abc");
         assert_eq!(e.console_index, "index-x.js");
         assert_eq!(e.model, "AEOBC");
+    }
+
+    #[test]
+    fn select_gateway_device_prefers_local_speaker_over_android_companion() {
+        let devices = vec![
+            serde_json::json!({
+                "stable_id": "android-a",
+                "model": "AndroidPhone",
+                "firmware": "home-mate-android 2.3.0",
+                "loopback": false,
+                "online": true
+            }),
+            serde_json::json!({
+                "stable_id": "dot2-d",
+                "model": "AEOBC",
+                "firmware": "hm-firmware 0.0.53 abcdef0 (fireos)",
+                "loopback": true,
+                "online": true
+            }),
+        ];
+        let picked = super::select_gateway_device(&devices, "AEOBC").unwrap();
+        assert_eq!(picked["stable_id"], "dot2-d");
     }
 }

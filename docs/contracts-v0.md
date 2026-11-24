@@ -557,7 +557,7 @@ b（书房，−32.8）比它响 6.7 dB。原因＝"最响的两个差 <3 dB →
    `kws_report`/`kws_deploy_receipt` 回显，`/mode.kws.threshold|score` 是**模型自报的在用值**。
    控制台新增「识别灵敏度（设备端）」卡：只保存配置 / 保存并部署 两个动作，并显示"设备在用"。
 
-**个人服务「故事」接入现状（2026-11-16 实测）**：`http://192.168.1.10:18083` 有 OpenAPI 3.1 文档，
+**个人服务「故事」接入现状（2026-11-16 实测）**：`http://192.168.1.168:18083` 有 OpenAPI 3.1 文档，
 `/v1/search`、`/v1/album/{id}` 是 JSON GET，`/v1/stream/{id}` 是 `audio/mp4`（支持 Range）。
 **搜索/列集已可用**：`openapi` 服务块（spec_url + `auth_header: X-Internal-Token` + 同一枚家庭令牌 +
 白名单 `search_v1_search_get`/`album_v1_album__album_id__get`）在 dot2-c 上配置成功，

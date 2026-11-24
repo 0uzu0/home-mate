@@ -422,7 +422,7 @@ async fn typed_stop_actual_hub_send_failure_and_dropped_waiter_are_unknown() {
         .hub
         .play_begin("fixture-dot", "voice", 16000, None)
         .unwrap();
-    *crate::lock_or_recover(&state.hub.outbound, "hub.outbound") = None;
+    state.hub.detach_test_outbounds();
     let submission = state.hub.stop_and_wait(&play.play_id);
     assert!(matches!(&submission, StopSubmission::SendFailed { .. }));
     assert!(

@@ -160,14 +160,14 @@ async fn install_and_activate_spawn_the_detached_tool_and_reject_when_busy() {
     let (status, v) = call(
         &base,
         "/api/v0/release/install",
-        Some(json!({"url": "http://192.168.1.20:8000/pkg.tar", "activate": true})),
+        Some(json!({"url": "http://192.168.1.27:8000/pkg.tar", "activate": true})),
     )
     .await;
     assert_eq!(status, 200, "{v}");
     assert_eq!(v["state"], "started");
     let lines = wait_called(&root, 1).await;
     assert_eq!(
-        lines[0], "install --package http://192.168.1.20:8000/pkg.tar --activate",
+        lines[0], "install --package http://192.168.1.27:8000/pkg.tar --activate",
         "{lines:?}"
     );
 
@@ -271,7 +271,7 @@ async fn install_rejects_a_non_http_or_relative_url_and_reports_a_missing_instal
     let (status, v) = call(
         &base,
         "/api/v0/release/install",
-        Some(json!({"url": "http://192.168.1.20:8000/pkg.tar"})),
+        Some(json!({"url": "http://192.168.1.27:8000/pkg.tar"})),
     )
     .await;
     assert_eq!(status, 409, "{v}");

@@ -62,12 +62,18 @@ fn check_frame_size(frame: &CoreFrame) -> Result<(), String> {
 }
 
 impl DeviceHub {
-    /// Verify that the live gateway negotiated protocol >= 2, the target device
-    /// is online, and its descriptor advertises both `config_apply_v2` and
-    /// `config_block_<block>`.
+    /// Verify that the device's live gateway negotiated protocol >= 2, the
+    /// target device is online, and its descriptor advertises both
+    /// `config_apply_v2` and `config_block_<block>`.
     pub fn supports_config_apply_v2(&self, device: &str, block: ConfigBlock) -> Result<(), String> {
         let st = self.lock_state();
-        let proto = st.protocol_operating.unwrap_or(0);
+        let proto = st
+            .device_to_conn
+            .get(device)
+            .and_then(|cid| st.connections.get(cid))
+            .map(|c| c.protocol_operating)
+            .or(st.protocol_operating)
+            .unwrap_or(0);
         if proto < 2 {
             return Err(format!(
                 "gateway negotiated protocol {proto} < 2; config_apply_v2 unavailable"
@@ -100,7 +106,13 @@ impl DeviceHub {
     /// Verify protocol >= 2 and `config_apply_v2` capability for `config_state_get`.
     pub fn supports_config_state_get(&self, device: &str) -> Result<(), String> {
         let st = self.lock_state();
-        let proto = st.protocol_operating.unwrap_or(0);
+        let proto = st
+            .device_to_conn
+            .get(device)
+            .and_then(|cid| st.connections.get(cid))
+            .map(|c| c.protocol_operating)
+            .or(st.protocol_operating)
+            .unwrap_or(0);
         if proto < 2 {
             return Err(format!(
                 "gateway negotiated protocol {proto} < 2; config_apply_v2 unavailable"
@@ -161,7 +173,7 @@ impl DeviceHub {
         let (tx, rx) = oneshot::channel();
         {
             let mut st = self.lock_state();
-            let gen = st.generation;
+            let gen = Self::device_generation(&st, device);
             st.config_state_waiters.insert(
                 request_id.clone(),
                 ConfigOneshotWaiter {
@@ -174,7 +186,7 @@ impl DeviceHub {
             request_id: request_id.clone(),
             device: device.to_string(),
         };
-        if let Err(e) = self.send(frame) {
+        if let Err(e) = self.send_to_device(device, frame) {
             self.lock_state().config_state_waiters.remove(&request_id);
             return Err(e);
         }
@@ -197,6 +209,7 @@ impl DeviceHub {
         timeout: Duration,
     ) -> Result<GatewayFrame, String> {
         self.supports_config_apply_v2(&req.device, req.block)?;
+        let device = req.device.clone();
         let request_id = id::next("CFGVAL");
         let frame = CoreFrame::ConfigValidate {
             request_id: request_id.clone(),
@@ -212,7 +225,7 @@ impl DeviceHub {
         let (tx, rx) = oneshot::channel();
         {
             let mut st = self.lock_state();
-            let gen = st.generation;
+            let gen = Self::device_generation(&st, &device);
             st.config_validate_waiters.insert(
                 request_id.clone(),
                 ConfigOneshotWaiter {
@@ -221,7 +234,7 @@ impl DeviceHub {
                 },
             );
         }
-        if let Err(e) = self.send(frame) {
+        if let Err(e) = self.send_to_device(&device, frame) {
             self.lock_state()
                 .config_validate_waiters
                 .remove(&request_id);
@@ -247,6 +260,7 @@ impl DeviceHub {
         req: ConfigApplyRequest,
     ) -> Result<mpsc::UnboundedReceiver<GatewayFrame>, String> {
         self.supports_config_apply_v2(&req.device, req.block)?;
+        let device = req.device.clone();
         let operation_id = req.operation_id.clone();
         let frame = CoreFrame::ConfigApply {
             device: req.device,
@@ -268,7 +282,7 @@ impl DeviceHub {
         let (tx, rx) = mpsc::unbounded_channel();
         {
             let mut st = self.lock_state();
-            let gen = st.generation;
+            let gen = Self::device_generation(&st, &device);
             st.config_apply_waiters.insert(
                 operation_id.clone(),
                 ConfigApplyWaiter {
@@ -277,7 +291,7 @@ impl DeviceHub {
                 },
             );
         }
-        if let Err(e) = self.send(frame) {
+        if let Err(e) = self.send_to_device(&device, frame) {
             self.lock_state().config_apply_waiters.remove(&operation_id);
             return Err(e);
         }
@@ -291,7 +305,7 @@ impl DeviceHub {
     pub(super) fn handle_config_state(
         &self,
         st: &mut HubState,
-        stale_generation: bool,
+        generation: u64,
         frame: GatewayFrame,
     ) {
         let GatewayFrame::ConfigState {
@@ -306,7 +320,7 @@ impl DeviceHub {
         else {
             return;
         };
-        if stale_generation {
+        if st.device_frame_stale(generation, device) {
             st.record(
                 "stale_event",
                 json!({ "device": device, "kind": "config_state" }),
@@ -337,8 +351,14 @@ impl DeviceHub {
             }),
         );
         if let Some(req_id) = request_id {
-            if let Some(waiter) = st.config_state_waiters.remove(req_id) {
-                let _ = waiter.sender.send(frame.clone());
+            if st
+                .config_state_waiters
+                .get(req_id)
+                .is_some_and(|w| w.generation == generation)
+            {
+                if let Some(waiter) = st.config_state_waiters.remove(req_id) {
+                    let _ = waiter.sender.send(frame.clone());
+                }
             }
         }
         self.emit_control(DeviceEvent::ConfigState {
@@ -353,7 +373,7 @@ impl DeviceHub {
     pub(super) fn handle_config_validated(
         &self,
         st: &mut HubState,
-        stale_generation: bool,
+        generation: u64,
         frame: GatewayFrame,
     ) {
         let GatewayFrame::ConfigValidated {
@@ -372,7 +392,7 @@ impl DeviceHub {
         else {
             return;
         };
-        if stale_generation {
+        if st.device_frame_stale(generation, device) {
             st.record(
                 "stale_event",
                 json!({ "device": device, "kind": "config_validated" }),
@@ -410,15 +430,21 @@ impl DeviceHub {
                 "state": state,
             }),
         );
-        if let Some(waiter) = st.config_validate_waiters.remove(request_id) {
-            let _ = waiter.sender.send(frame);
+        if st
+            .config_validate_waiters
+            .get(request_id)
+            .is_some_and(|w| w.generation == generation)
+        {
+            if let Some(waiter) = st.config_validate_waiters.remove(request_id) {
+                let _ = waiter.sender.send(frame);
+            }
         }
     }
 
     pub(super) fn handle_config_receipt(
         &self,
         st: &mut HubState,
-        stale_generation: bool,
+        generation: u64,
         frame: GatewayFrame,
     ) {
         let GatewayFrame::ConfigReceipt {
@@ -443,7 +469,7 @@ impl DeviceHub {
         else {
             return;
         };
-        if stale_generation {
+        if st.device_frame_stale(generation, device) {
             st.record(
                 "stale_event",
                 json!({ "device": device, "kind": "config_receipt" }),
@@ -484,11 +510,15 @@ impl DeviceHub {
                 "reason": reason,
             }),
         );
-        if let Some(waiter) = st.config_apply_waiters.get(operation_id) {
+        if let Some(waiter) = st
+            .config_apply_waiters
+            .get(operation_id)
+            .filter(|w| w.generation == generation)
+        {
             let _ = waiter.sender.send(frame.clone());
-        }
-        if state.is_terminal() {
-            st.config_apply_waiters.remove(operation_id);
+            if state.is_terminal() {
+                st.config_apply_waiters.remove(operation_id);
+            }
         }
         self.emit_control(DeviceEvent::ConfigReceipt {
             device: device.clone(),

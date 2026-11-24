@@ -101,7 +101,7 @@ pub enum OutboundPolicy {
         allow_loopback: bool,
     },
     /// News (`news`): allows public `http(s)` endpoints AND RFC1918 / ULA /
-    /// LAN hostnames (e.g. NAS RSSHub `http://192.168.1.10:1200`); rejects
+    /// LAN hostnames (e.g. NAS RSSHub `http://192.168.1.168:1200`); rejects
     /// link-local (`169.254.0.0/16`, `fe80::/10`), cloud metadata, CGNAT,
     /// userinfo, and loopback (unless `allow_loopback` is set for tests).
     PublicOrLan { allow_loopback: bool },
@@ -513,7 +513,7 @@ mod tests {
         assert!(validate_home_url_with("http://127.0.0.1:8123", true).is_ok());
         assert!(validate_home_url_with("http://[::1]:8123", true).is_ok());
 
-        assert!(validate_music_url("http://192.168.1.20:4533").is_ok());
+        assert!(validate_music_url("http://192.168.1.27:4533").is_ok());
         assert!(validate_music_url("http://nas.local:4533/music").is_ok());
         assert!(validate_music_url("https://music.lan").is_ok());
         assert_eq!(
@@ -583,7 +583,7 @@ mod tests {
         // News policy allows both public URLs and RFC1918/LAN feeds (e.g. NAS RSSHub),
         // while keeping link-local/metadata and non-test loopback blocked.
         assert!(validate_news_url("https://hnrss.org/frontpage", false).is_ok());
-        assert!(validate_news_url("http://192.168.1.10:1200/36kr/newsflashes", false).is_ok());
+        assert!(validate_news_url("http://192.168.1.168:1200/36kr/newsflashes", false).is_ok());
         assert!(validate_news_url("http://10.0.0.5:1200/rss", false).is_ok());
         assert!(validate_news_url("http://172.16.1.2:1200/rss", false).is_ok());
         assert!(validate_news_url("http://[fd00::1]:1200/rss", false).is_ok());

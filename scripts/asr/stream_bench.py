@@ -58,7 +58,7 @@ CORE = os.environ.get("HM_CORE", "http://192.168.1.73:8930")
 # --- credentials (never printed) -------------------------------------------------
 
 def env_file(key):
-    for path in ("/home/user/.hermes/.env", os.path.join(ROOT, "data", "env.local")):
+    for path in (os.path.expanduser("~/.hermes/.env"), os.path.join(ROOT, "data", "env.local")):
         if not os.path.exists(path):
             continue
         for line in open(path, encoding="utf-8", errors="replace"):
@@ -452,7 +452,7 @@ async def bench_async(real_only=False):
         sb = batch_transcribe(pcm, "https://api.siliconflow.cn/v1", sf_key, "FunAudioLLM/SenseVoiceSmall")
         rows.append({"provider": "sf-batch", "category": cat, "gt": gt,
                      "final": sb["final"], "final_ms": sb["final_ms"], "intent_ms": None})
-        ob = batch_transcribe(pcm, "http://192.168.1.20:9981/v1", om_key, "Qwen3-ASR-0.6B-4bit")
+        ob = batch_transcribe(pcm, "http://192.168.1.27:9981/v1", om_key, "Qwen3-ASR-0.6B-4bit")
         rows.append({"provider": "omlx-batch", "category": cat, "gt": gt,
                      "final": ob["final"], "final_ms": ob["final_ms"], "intent_ms": None})
         print(f"{key} volc:{vr['intent_ms']}/{vr['final_ms']} sf:{sb['final_ms']:.0f} "
@@ -486,7 +486,7 @@ async def bench_async(real_only=False):
             sb = batch_transcribe(pcm, "https://api.siliconflow.cn/v1", sf_key, "FunAudioLLM/SenseVoiceSmall")
             rows.append({"provider": "sf-batch", "category": "real", "gt": gt,
                          "final": sb["final"], "final_ms": sb["final_ms"], "intent_ms": None})
-            ob = batch_transcribe(pcm, "http://192.168.1.20:9981/v1", om_key, "Qwen3-ASR-0.6B-4bit")
+            ob = batch_transcribe(pcm, "http://192.168.1.27:9981/v1", om_key, "Qwen3-ASR-0.6B-4bit")
             rows.append({"provider": "omlx-batch", "category": "real", "gt": gt,
                          "final": ob["final"], "final_ms": ob["final_ms"], "intent_ms": None})
             print(f"  batch sf={sb['final']!r} omlx={ob['final']!r}")

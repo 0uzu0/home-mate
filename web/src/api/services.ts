@@ -514,82 +514,9 @@ export const discoverHome = (opts?: RequestOptions) =>
     { timeoutMs: 30000, ...opts },
   )
 
-// ── #21 Remote / Computer Socket ────────────────────────────────────────
-
-export type SocketSideEffect = 'Query' | 'Mutate'
-
-export interface RemoteCapabilitySpec {
-  name: string
-  description: string
-  side_effect: SocketSideEffect
-  parameters: Record<string, unknown>
-}
-
-export interface RemoteSocketStatus {
-  enabled: boolean
-  endpoint_url: string
-  service_name: string
-  timeout_ms: number
-  capabilities: RemoteCapabilitySpec[]
-  token_set: boolean
-  availability: string
-  state: 'ready' | 'unconfigured' | 'disabled' | 'hidden'
-  revision: string
-}
-
-export interface RemoteSocketPatch {
-  enabled?: boolean
-  endpoint_url?: string
-  service_name?: string
-  timeout_ms?: number
-  capabilities?: RemoteCapabilitySpec[]
-  token?: string
-  revision?: string
-}
-
-export interface RemoteSocketProbe {
-  ok: boolean
-  state: string
-  http_status?: number
-  latency_ms?: number
-  http_requests: number
-  detail?: string
-}
-
-export interface RemoteSocketDiscovery {
-  ok: boolean
-  error?: string
-  http_status?: number
-  capabilities: RemoteCapabilitySpec[]
-  http_requests: number
-}
-
-export const getRemoteSocket = (opts?: RequestOptions) =>
-  request<RemoteSocketStatus>('/api/v0/config/services/remote_socket', {}, opts)
-
-export const putRemoteSocket = (body: RemoteSocketPatch, opts?: RequestOptions) =>
-  request<RemoteSocketStatus>(
-    '/api/v0/config/services/remote_socket',
-    { method: 'PUT', body: JSON.stringify(body) },
-    { timeoutMs: 10000, ...opts },
-  )
-
-export const testRemoteSocket = (opts?: RequestOptions) =>
-  request<RemoteSocketProbe>(
-    '/api/v0/config/services/remote_socket/test',
-    { method: 'POST' },
-    { timeoutMs: 30000, ...opts },
-  )
-
-export const discoverRemoteSocket = (opts?: RequestOptions) =>
-  request<RemoteSocketDiscovery>(
-    '/api/v0/config/services/remote_socket/discover',
-    { method: 'POST' },
-    { timeoutMs: 20000, ...opts },
-  )
-
 // ── #22 Open Sockets (Declarative Socket Registry) ──────────────────────
 
+export type SocketSideEffect = 'Query' | 'Mutate'
 export type OpenSocketMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
 
 export interface OpenSocketStatus {
@@ -738,6 +665,69 @@ export const putLearningConfig = (patch: PersonalEndpointPatch, opts?: RequestOp
 export const testLearningConfig = (opts?: RequestOptions) =>
   request<PersonalEndpointProbe>(
     '/api/v0/config/services/learning/test',
+    { method: 'POST' },
+    { timeoutMs: 15000, ...opts },
+  )
+
+// ── Master Brain (#267) ─────────────────────────────────────────────────
+
+export type MasterBrainProtocol = 'hermes' | 'generic'
+
+export interface MasterBrainTaskRecord {
+  task_id: string
+  summary: string
+  device?: string
+  room?: string
+  status: string
+  last_tool?: string
+  pending_approval?: string
+  created_ms: number
+  updated_ms: number
+}
+
+export interface MasterBrainStatus {
+  enabled: boolean
+  protocol: MasterBrainProtocol
+  url: string
+  callback_url: string
+  timeout_ms: number
+  bearer_token_set: boolean
+  state: 'ready' | 'disabled' | 'unconfigured' | string
+  recent_tasks: MasterBrainTaskRecord[]
+}
+
+export interface MasterBrainPatch {
+  enabled: boolean
+  protocol?: MasterBrainProtocol
+  url: string
+  callback_url?: string
+  timeout_ms?: number
+  bearer_token?: string
+}
+
+export interface MasterBrainProbe {
+  ok: boolean
+  protocol?: MasterBrainProtocol
+  state: string
+  latency_ms?: number
+  code?: string
+  detail?: string
+  health?: Record<string, unknown>
+}
+
+export const getMasterBrainConfig = (opts?: RequestOptions) =>
+  request<MasterBrainStatus>('/api/v0/config/services/master_brain', {}, opts)
+
+export const putMasterBrainConfig = (patch: MasterBrainPatch, opts?: RequestOptions) =>
+  request<MasterBrainStatus>(
+    '/api/v0/config/services/master_brain',
+    { method: 'PUT', body: JSON.stringify(patch) },
+    opts,
+  )
+
+export const testMasterBrainConfig = (opts?: RequestOptions) =>
+  request<MasterBrainProbe>(
+    '/api/v0/config/services/master_brain/test',
     { method: 'POST' },
     { timeoutMs: 15000, ...opts },
   )

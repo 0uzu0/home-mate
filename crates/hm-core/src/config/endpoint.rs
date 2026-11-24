@@ -46,7 +46,7 @@ pub fn valid_public_endpoint(raw: &str, allow_loopback: bool) -> bool {
 }
 
 /// News feed URL check: allows public HTTP(S) and RFC1918/LAN addresses
-/// (e.g. `http://192.168.1.10:1200` NAS RSSHub) while rejecting link-local
+/// (e.g. `http://192.168.1.168:1200` NAS RSSHub) while rejecting link-local
 /// (`169.254.0.0/16`), cloud metadata, and loopback (unless `allow_loopback`).
 pub fn valid_news_endpoint(raw: &str, allow_loopback: bool) -> bool {
     let s = raw.trim();
@@ -217,7 +217,7 @@ mod tests {
 
         // News accepts RFC1918 LAN feeds (e.g. NAS RSSHub) while rejecting loopback by default.
         for lan_ok in [
-            "http://192.168.1.10:1200/36kr/newsflashes",
+            "http://192.168.1.168:1200/36kr/newsflashes",
             "http://10.0.0.5:1200/rss",
             "http://nas.local:1200/feed",
         ] {

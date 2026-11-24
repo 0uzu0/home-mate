@@ -53,6 +53,9 @@ fn v1_convert_supports_all_non_unit_families_and_emits_replace_for_collections()
     };
     assert!(has_replace("weather", "weather.places"));
     assert!(has_replace("open_sockets", "open_sockets"));
+    assert!(report.as_array().unwrap().iter().any(|entry| {
+        entry["pointer"] == "/remote_socket" && entry["action"] == "ignored_retired"
+    }));
     assert!(has_replace("mode", "mode.retreat_words"));
     for path in ["detail_words", "long_form_words"] {
         assert!(!has_replace("mode", &format!("mode.spoken.{path}")));

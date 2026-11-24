@@ -14,10 +14,10 @@ import HomeCard from '../components/tools/HomeCard.vue'
 import NewsCard from '../components/tools/NewsCard.vue'
 import SearchCard from '../components/tools/SearchCard.vue'
 import OpenApiCard from '../components/tools/OpenApiCard.vue'
-import RemoteSocketCard from '../components/tools/RemoteSocketCard.vue'
 import OpenSocketsCard from '../components/tools/OpenSocketsCard.vue'
 import StoryJokeCard from '../components/tools/StoryJokeCard.vue'
 import LearningCard from '../components/tools/LearningCard.vue'
+import MasterBrainCard from '../components/tools/MasterBrainCard.vue'
 </script>
 
 <template>
@@ -37,8 +37,8 @@ import LearningCard from '../components/tools/LearningCard.vue'
       <SearchCard />
       <StoryJokeCard />
       <LearningCard />
+      <MasterBrainCard />
       <OpenApiCard v-if="advancedMode" />
-      <RemoteSocketCard v-if="advancedMode" />
       <OpenSocketsCard v-if="advancedMode" />
     </div>
   </section>

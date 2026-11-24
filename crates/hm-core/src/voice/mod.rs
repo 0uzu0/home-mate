@@ -17,6 +17,7 @@
 //! receipts and generation/seq freshness live in the gateway hub; task
 //! validity stays in the TaskRegistry; the model never sees mode writes.
 
+mod announce;
 mod barge;
 #[cfg(test)]
 mod d1_tests;
@@ -40,6 +41,7 @@ mod tests;
 mod turn;
 #[cfg(test)]
 mod v2_tests;
+pub use announce::*;
 pub use barge::*;
 use mode::parse_first_json;
 pub use mode::VOLUME_CAP;
@@ -1221,6 +1223,8 @@ pub struct VoicePipeline {
     /// entry per reminder being spoken, so the 1 Hz sweep neither double-fires
     /// while the line is sounding nor hammers a TTS that is down.
     reminder_inflight: Mutex<HashMap<i64, u64>>,
+    /// Controlled downward proactive announcements (#267 Slice 1).
+    announces: Mutex<announce::AnnounceStore>,
     /// Diagnostic mic capture (2026-11-13): the post-AEC mono the CORE
     /// receives is byte-for-byte what the device-side spotter consumes (the
     /// gateway's own comment says so), so recording it here gives the honest
@@ -1443,6 +1447,7 @@ impl VoicePipeline {
             fleet: Mutex::new(None),
             silero,
             reminder_inflight: Mutex::new(HashMap::new()),
+            announces: Mutex::new(announce::AnnounceStore::default()),
             mic_capture: Mutex::new(None),
             wifi_provisioning: Mutex::new(std::collections::BTreeMap::new()),
             events_file,

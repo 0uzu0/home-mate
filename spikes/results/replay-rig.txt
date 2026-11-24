@@ -1,5 +1,0 @@
-Spike A replay (rig-core vs wire-mock fixtures, 2026-11-07)
-[glm-tool-normal] text=0 args=1 ends=1 errors=0 in 86.814166ms
-[glm-text-normal] text=14 args=0 ends=1 errors=0 in 101.195666ms
-[stall-body] outcome=error: TimeoutError: the streamed reply sent nothing for 2s after 2.007238253s
-[drop] wire-mock connection log: connected_ms=1794052116604 closed_ms=1794052116612 (8ms lifetime, close_reason=body-dropped)

@@ -133,11 +133,42 @@ impl OutboundReceiver {
 impl DeviceHub {
     // --- outbound API used by the pipeline and tools ---------------------------
 
-    pub(super) fn send(&self, frame: CoreFrame) -> Result<(), String> {
-        let tx = crate::lock_or_recover(&self.outbound, "hub.outbound").clone();
-        let Some(tx) = tx else {
+    fn resolve_device_outbound(
+        st: &HubState,
+        device: &str,
+    ) -> Result<(u64, OutboundSender), String> {
+        if let Some(&conn_id) = st.device_to_conn.get(device) {
+            if let Some(conn) = st.connections.get(&conn_id) {
+                return Ok((conn_id, conn.outbound.clone()));
+            }
+        }
+        if st.connections.is_empty() {
             return Err("no gateway connected".into());
-        };
+        }
+        if let Some(slot) = st.devices.get(device) {
+            if !slot.online {
+                return Err(format!("device '{device}' is offline"));
+            }
+            if let Some(conn) = st.connections.get(&slot.generation) {
+                return Ok((slot.generation, conn.outbound.clone()));
+            }
+            return Err(format!("no live gateway for device '{device}'"));
+        }
+        // Test-only fallback for unit tests that attach one synthetic outbound
+        // channel without registering a HelloDevice. Never runs in production
+        // or when any real gateway has registered devices.
+        #[cfg(test)]
+        if st.connections.len() == 1 {
+            if let Some((&conn_id, conn)) = st.connections.iter().next() {
+                if conn.devices.is_empty() {
+                    return Ok((conn_id, conn.outbound.clone()));
+                }
+            }
+        }
+        Err(format!("no live gateway for device '{device}'"))
+    }
+
+    fn send_via_outbound(&self, tx: &OutboundSender, frame: CoreFrame) -> Result<(), String> {
         match tx.send(frame) {
             Ok(()) => Ok(()),
             Err(OutboundSendError::Full(tier)) => {
@@ -156,6 +187,39 @@ impl DeviceHub {
             }
             Err(OutboundSendError::Closed) => Err("gateway connection closed".into()),
         }
+    }
+
+    pub(super) fn send_to_device(&self, device: &str, frame: CoreFrame) -> Result<(), String> {
+        let tx = {
+            let st = self.lock_state();
+            Self::resolve_device_outbound(&st, device)?.1
+        };
+        self.send_via_outbound(&tx, frame)
+    }
+
+    pub(super) fn send_to_play(&self, play_id: &str, frame: CoreFrame) -> Result<(), String> {
+        let tx = {
+            let st = self.lock_state();
+            if let Some(play) = st.active_plays.get(play_id) {
+                st.connections
+                    .get(&play.generation)
+                    .map(|c| c.outbound.clone())
+                    .ok_or_else(|| "gateway connection closed".to_string())?
+            } else if st.connections.is_empty() {
+                return Err("no gateway connected".into());
+            } else {
+                return Err(format!("no active gateway for play '{play_id}'"));
+            }
+        };
+        self.send_via_outbound(&tx, frame)
+    }
+
+    pub(super) fn device_generation(st: &HubState, device: &str) -> u64 {
+        st.device_to_conn
+            .get(device)
+            .copied()
+            .or_else(|| st.devices.get(device).map(|d| d.generation))
+            .unwrap_or(st.generation)
     }
 
     /// Submit a play; returns a ticket whose receipt resolves on the first
@@ -181,11 +245,14 @@ impl DeviceHub {
         let (tx, rx) = oneshot::channel();
         {
             let mut st = self.lock_state();
+            let gen_id = Self::device_generation(&st, device);
             st.pending_wifi.insert(device.to_string(), tx);
+            st.pending_wifi_gen.insert(device.to_string(), gen_id);
         }
-        if let Err(e) = self.send(CoreFrame::WifiConfig { ssid, psk }) {
+        if let Err(e) = self.send_to_device(device, CoreFrame::WifiConfig { ssid, psk }) {
             let mut st = self.lock_state();
             st.pending_wifi.remove(device);
+            st.pending_wifi_gen.remove(device);
             return Err(e);
         }
         Ok(rx)
@@ -220,7 +287,7 @@ impl DeviceHub {
                 "mute_request",
                 json!({ "device": device, "muted": muted, "task_id": task_id }),
             );
-            let generation = st.generation;
+            let generation = Self::device_generation(&st, device);
             st.pending.insert(
                 task_id.clone(),
                 PendingWaiter {
@@ -234,7 +301,7 @@ impl DeviceHub {
             device: device.to_string(),
             muted,
         };
-        if let Err(e) = self.send(frame) {
+        if let Err(e) = self.send_to_device(device, frame) {
             let mut st = self.lock_state();
             st.pending.remove(&task_id);
             return Err(e);
@@ -253,15 +320,18 @@ impl DeviceHub {
         orientation_rotation: u8,
         orientation_reverse: bool,
     ) -> Result<(), String> {
-        self.send(CoreFrame::LedConfig {
-            device: device.to_string(),
-            night_enabled,
-            night_start_minute,
-            night_end_minute,
-            night_brightness_pct,
-            orientation_rotation,
-            orientation_reverse,
-        })
+        self.send_to_device(
+            device,
+            CoreFrame::LedConfig {
+                device: device.to_string(),
+                night_enabled,
+                night_start_minute,
+                night_end_minute,
+                night_brightness_pct,
+                orientation_rotation,
+                orientation_reverse,
+            },
+        )
     }
 
     /// Update the media trim (dB, ≤0). Called on startup and on every
@@ -277,9 +347,9 @@ impl DeviceHub {
     pub fn play(&self, req: PlayRequest) -> Result<PlayTicket, String> {
         let play_id = id::next("P");
         let (tx, rx) = oneshot::channel();
-        {
+        let (generation, outbound) = {
             let mut st = self.lock_state();
-            let generation = st.generation;
+            let (generation, outbound) = Self::resolve_device_outbound(&st, &req.device)?;
             st.pending.insert(
                 play_id.clone(),
                 PendingWaiter {
@@ -295,12 +365,11 @@ impl DeviceHub {
                     generation,
                 },
             );
-        }
+            (generation, outbound)
+        };
+        let _ = generation;
         if let Some(wav) = req.audio {
             use base64::Engine;
-            // Media trim (2026-11-10): applied here so every media play
-            // path (asset probes, future real music) is covered by the
-            // same setting; voice stays untouched.
             let wav = if req.channel == "media" {
                 let db = self.media_trim_db();
                 if db < 0.0 {
@@ -338,7 +407,7 @@ impl DeviceHub {
                 text: req.text,
                 barge_in: Some("stop_current".into()),
             };
-            if let Err(e) = self.send(begin) {
+            if let Err(e) = self.send_via_outbound(&outbound, begin) {
                 cleanup();
                 return Err(e);
             }
@@ -350,14 +419,17 @@ impl DeviceHub {
                     seq: seq as u64,
                     audio_b64: base64::engine::general_purpose::STANDARD.encode(chunk),
                 };
-                if let Err(e) = self.send(frame) {
+                if let Err(e) = self.send_via_outbound(&outbound, frame) {
                     cleanup();
                     return Err(e);
                 }
             }
-            if let Err(e) = self.send(CoreFrame::PlayEnd {
-                task_id: play_id.clone(),
-            }) {
+            if let Err(e) = self.send_via_outbound(
+                &outbound,
+                CoreFrame::PlayEnd {
+                    task_id: play_id.clone(),
+                },
+            ) {
                 cleanup();
                 return Err(e);
             }
@@ -377,7 +449,7 @@ impl DeviceHub {
             simulated_ms: req.simulated_ms,
             barge_in: Some("stop_current".into()),
         };
-        if let Err(e) = self.send(frame) {
+        if let Err(e) = self.send_via_outbound(&outbound, frame) {
             let mut st = self.lock_state();
             st.pending.remove(&play_id);
             st.active_plays.remove(&play_id);
@@ -431,9 +503,9 @@ impl DeviceHub {
         }
         let play_id = id::next("P");
         let (tx, rx) = oneshot::channel();
-        {
+        let outbound = {
             let mut st = self.lock_state();
-            let generation = st.generation;
+            let (generation, outbound) = Self::resolve_device_outbound(&st, device)?;
             st.pending.insert(
                 play_id.clone(),
                 PendingWaiter {
@@ -449,7 +521,8 @@ impl DeviceHub {
                     generation,
                 },
             );
-        }
+            outbound
+        };
         let frame = CoreFrame::PlayBegin {
             task_id: play_id.clone(),
             device: device.to_string(),
@@ -463,7 +536,7 @@ impl DeviceHub {
             text,
             barge_in: Some("stop_current".into()),
         };
-        if let Err(e) = self.send(frame) {
+        if let Err(e) = self.send_via_outbound(&outbound, frame) {
             let mut st = self.lock_state();
             st.pending.remove(&play_id);
             st.active_plays.remove(&play_id);
@@ -480,19 +553,25 @@ impl DeviceHub {
     /// the seq (monotonic from 0, exactly +1 per chunk).
     pub fn play_chunk(&self, play_id: &str, seq: u64, pcm: &[u8]) -> Result<(), String> {
         use base64::Engine;
-        self.send(CoreFrame::PlayChunk {
-            task_id: play_id.to_string(),
-            seq,
-            audio_b64: base64::engine::general_purpose::STANDARD.encode(pcm),
-        })
+        self.send_to_play(
+            play_id,
+            CoreFrame::PlayChunk {
+                task_id: play_id.to_string(),
+                seq,
+                audio_b64: base64::engine::general_purpose::STANDARD.encode(pcm),
+            },
+        )
     }
 
     /// v0.3: close a stream (the last chunk was already sent). The device
     /// finishes per its EOS semantics and answers device_confirmed.
     pub fn play_end(&self, play_id: &str) -> Result<(), String> {
-        self.send(CoreFrame::PlayEnd {
-            task_id: play_id.to_string(),
-        })
+        self.send_to_play(
+            play_id,
+            CoreFrame::PlayEnd {
+                task_id: play_id.to_string(),
+            },
+        )
     }
 
     /// Send Stop for every active play on a device (any channel). Returns
@@ -592,15 +671,14 @@ impl DeviceHub {
     }
 
     pub fn stop(&self, play_id: &str) -> Result<(), String> {
-        self.state
-            .lock()
-            .unwrap()
-            .stop_sent
-            .insert(play_id.to_string());
-        self.send(CoreFrame::Stop {
-            task_id: play_id.into(),
-            flush: true,
-        })
+        self.lock_state().stop_sent.insert(play_id.to_string());
+        self.send_to_play(
+            play_id,
+            CoreFrame::Stop {
+                task_id: play_id.into(),
+                flush: true,
+            },
+        )
     }
 
     /// Register before enqueueing, atomically bound to the play's connection
@@ -613,19 +691,21 @@ impl DeviceHub {
             return StopSubmission::NoActivePlay;
         };
         let generation = play.generation;
-        if st.generation != generation {
-            return StopSubmission::SendFailed {
-                reason: format!(
-                    "stale_connection_generation:play={generation},current={}",
-                    st.generation
-                ),
-            };
-        }
-        // Lock order matches `mod.rs` (state -> outbound) to prevent inversion.
-        let Some(outbound) = crate::lock_or_recover(&self.outbound, "hub.outbound").clone() else {
-            return StopSubmission::SendFailed {
-                reason: "no gateway connected".into(),
-            };
+        let outbound = match st.connections.get(&generation) {
+            Some(conn) => conn.outbound.clone(),
+            None if st.connections.is_empty() => {
+                return StopSubmission::SendFailed {
+                    reason: "no gateway connected".into(),
+                };
+            }
+            None => {
+                return StopSubmission::SendFailed {
+                    reason: format!(
+                        "stale_connection_generation:play={generation},current={}",
+                        st.generation
+                    ),
+                };
+            }
         };
         let stop_id = id::next("STOP");
         st.stop_sent.insert(play_id.to_string());
@@ -704,9 +784,9 @@ impl DeviceHub {
             .or_else(|| st.pending.get(play_id).map(|w| w.generation));
         let stale = match origin {
             Some(g) => g != generation,
-            // No live record: either an unknown id on the CURRENT generation
+            // No live record: either an unknown id on a LIVE connection
             // (harmless late fact) or one this hub retired (cross-generation).
-            None => st.retired_plays.contains(play_id) || st.generation != generation,
+            None => st.retired_plays.contains(play_id) || !st.conn_is_live(generation),
         };
         if stale {
             st.record(
@@ -733,14 +813,17 @@ impl DeviceHub {
         threshold: Option<f32>,
         score: Option<f32>,
     ) -> Result<(), String> {
-        self.send(CoreFrame::KwsDeploy {
-            device: device.into(),
-            keywords: keywords.into(),
-            retreat_words: retreat_words.to_vec(),
-            intents_hash: intents_hash.into(),
-            threshold,
-            score,
-        })
+        self.send_to_device(
+            device,
+            CoreFrame::KwsDeploy {
+                device: device.into(),
+                keywords: keywords.into(),
+                retreat_words: retreat_words.to_vec(),
+                intents_hash: intents_hash.into(),
+                threshold,
+                score,
+            },
+        )
     }
 
     /// M6c-2: hand the output tone to one device. The gateway clamps and
@@ -751,75 +834,101 @@ impl DeviceHub {
         curve: &str,
         bands: &[(f32, f32, f32)],
     ) -> Result<(), String> {
-        self.send(CoreFrame::AudioEq {
-            device: device.into(),
-            curve: curve.into(),
-            bands: bands
-                .iter()
-                .map(|&(freq, gain_db, q)| EqBand { freq, gain_db, q })
-                .collect(),
-        })
+        self.send_to_device(
+            device,
+            CoreFrame::AudioEq {
+                device: device.into(),
+                curve: curve.into(),
+                bands: bands
+                    .iter()
+                    .map(|&(freq, gain_db, q)| EqBand { freq, gain_db, q })
+                    .collect(),
+            },
+        )
     }
 
     pub fn volume_set(&self, device: &str, value: f64) -> Result<String, String> {
         let play_id = id::next("P");
-        // The v0.2 volume_receipt carries no device; remember which device
-        // this task asked, so the receipt can update that device's last-known
-        // volume (and a failure does not leave a stale mapping).
-        self.state
-            .lock()
-            .unwrap()
-            .volume_pending
-            .insert(play_id.clone(), device.to_string());
-        if let Err(e) = self.send(CoreFrame::VolumeSet {
-            task_id: play_id.clone(),
-            device: device.into(),
-            value,
-            unit: "linear".into(),
-        }) {
-            self.lock_state().volume_pending.remove(&play_id);
+        {
+            let mut st = self.lock_state();
+            let gen_id = Self::device_generation(&st, device);
+            st.volume_pending
+                .insert(play_id.clone(), device.to_string());
+            st.volume_pending_gen.insert(play_id.clone(), gen_id);
+        }
+        if let Err(e) = self.send_to_device(
+            device,
+            CoreFrame::VolumeSet {
+                task_id: play_id.clone(),
+                device: device.into(),
+                value,
+                unit: "linear".into(),
+            },
+        ) {
+            let mut st = self.lock_state();
+            st.volume_pending.remove(&play_id);
+            st.volume_pending_gen.remove(&play_id);
             return Err(e);
         }
         Ok(play_id)
     }
 
     pub fn mode_set(&self, device: &str, requested: &str) -> Result<(), String> {
-        self.send(CoreFrame::ModeSet {
-            device: device.into(),
-            duplex_requested: requested.into(),
-        })
+        self.send_to_device(
+            device,
+            CoreFrame::ModeSet {
+                device: device.into(),
+                duplex_requested: requested.into(),
+            },
+        )
     }
 
     /// v0.2: request a device mic session (start/stop, continuous mode).
     pub fn mic_session(&self, device: &str, action: &str) -> Result<(), String> {
-        self.send(CoreFrame::MicSession {
-            device: device.into(),
-            action: action.into(),
-            mode: Some("continuous".into()),
-        })
+        self.send_to_device(
+            device,
+            CoreFrame::MicSession {
+                device: device.into(),
+                action: action.into(),
+                mode: Some("continuous".into()),
+            },
+        )
     }
 
     /// v0.2 (G4): project the assistant interaction state for a device
     /// (LED presentation mapping lives in the gateway). Fire-and-forget on
     /// purpose: presentation must never back-pressure interaction semantics.
     pub fn assistant_state(&self, device: &str, state: &str) -> Result<(), String> {
-        self.send(CoreFrame::AssistantState {
-            device: device.into(),
-            state: state.into(),
-        })
+        self.send_to_device(
+            device,
+            CoreFrame::AssistantState {
+                device: device.into(),
+                state: state.into(),
+            },
+        )
     }
 
-    /// A device with audio_out capability, currently online (v0: first by
-    /// stable id — single-room, one device in practice).
+    /// A device with audio_out capability, currently online: prefers the local
+    /// loopback speaker gateway over remote LAN/Android clients, then stable_id.
     pub fn primary_audio_out(&self) -> Option<HelloDevice> {
         let st = self.lock_state();
-        let mut devs: Vec<&DeviceSlot> = st
+        let mut devs: Vec<(bool, &DeviceSlot)> = st
             .devices
             .values()
             .filter(|d| d.online && d.descriptor.capabilities.iter().any(|c| c == "audio_out"))
+            .map(|d| {
+                let is_loopback = st
+                    .connections
+                    .get(&d.generation)
+                    .is_some_and(HubState::conn_is_loopback);
+                (is_loopback, d)
+            })
             .collect();
-        devs.sort_by(|a, b| a.descriptor.stable_id.cmp(&b.descriptor.stable_id));
-        devs.first().map(|d| d.descriptor.clone())
+        devs.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.descriptor.stable_id.cmp(&b.1.descriptor.stable_id))
+        });
+        devs.first().map(|(_, d)| d.descriptor.clone())
     }
 
     /// Every online device with audio_out, sorted — the tone is a device
@@ -844,16 +953,34 @@ impl DeviceHub {
     }
 
     pub fn connected(&self) -> bool {
-        self.lock_state().connected_gateway.is_some()
+        !self.lock_state().connections.is_empty()
     }
 
     pub fn snapshot(&self) -> serde_json::Value {
         let st = self.lock_state();
         let devices: Vec<serde_json::Value> = {
-            let mut v: Vec<&DeviceSlot> = st.devices.values().collect();
-            v.sort_by(|a, b| a.descriptor.stable_id.cmp(&b.descriptor.stable_id));
-            v.into_iter()
+            let mut v: Vec<(bool, &DeviceSlot)> = st
+                .devices
+                .values()
                 .map(|d| {
+                    let is_loopback = st
+                        .connections
+                        .get(&d.generation)
+                        .is_some_and(HubState::conn_is_loopback);
+                    (is_loopback, d)
+                })
+                .collect();
+            v.sort_by(|a, b| {
+                b.0.cmp(&a.0)
+                    .then_with(|| a.1.descriptor.stable_id.cmp(&b.1.descriptor.stable_id))
+            });
+            v.into_iter()
+                .map(|(is_loopback, d)| {
+                    let conn_live = st.conn_is_live(d.generation)
+                        && st
+                            .device_to_conn
+                            .get(&d.descriptor.stable_id)
+                            .is_none_or(|&owner| owner == d.generation);
                     json!({
                         "stable_id": d.descriptor.stable_id,
                         "model": d.descriptor.model,
@@ -862,6 +989,7 @@ impl DeviceHub {
                         "audio_profile": d.descriptor.audio_profile,
                         "wifi_ssid": d.descriptor.wifi_ssid,
                         "online": d.online,
+                        "loopback": is_loopback,
                         "generation": d.generation,
                         "last_seq": d.last_seq,
                         "volume": d.volume,
@@ -883,7 +1011,7 @@ impl DeviceHub {
                         "echo_health_reason": d.echo_health_reason,
                         "northbound": super::northbound::NorthboundRecord::snapshot(
                             d.northbound.as_ref(), d.generation,
-                            d.online && st.connected_gateway.is_some() && d.generation == st.generation),
+                            d.online && conn_live),
                         "gateway_boot_id": d.gateway_boot_id,
                         "state_revision": d.state_revision,
                         "capability_fingerprint": d.capability_fingerprint,
@@ -892,12 +1020,39 @@ impl DeviceHub {
                 })
                 .collect()
         };
-        let (control_queued, play_queued) = crate::lock_or_recover(&self.outbound, "hub.outbound")
-            .as_ref()
-            .map(|tx| (tx.queued_control(), tx.queued_play()))
-            .unwrap_or((0, 0));
+        let mut conns: Vec<(&u64, &ConnSlot)> = st.connections.iter().collect();
+        conns.sort_by_key(|(&gen_id, _)| gen_id);
+        let connections_json: Vec<serde_json::Value> = conns
+            .iter()
+            .map(|(&gen_id, c)| {
+                let mut devs: Vec<&str> = c.devices.iter().map(String::as_str).collect();
+                devs.sort();
+                json!({
+                    "generation": gen_id,
+                    "gateway": c.gateway,
+                    "gateway_version": c.gateway_version,
+                    "protocol_operating": c.protocol_operating,
+                    "peer_addr": c.peer_addr.map(|p| p.to_string()),
+                    "authenticated": c.authenticated,
+                    "devices": devs,
+                })
+            })
+            .collect();
+        let (control_queued, play_queued) =
+            st.connections
+                .values()
+                .fold((0usize, 0usize), |(c, p), conn| {
+                    (
+                        c + conn.outbound.queued_control(),
+                        p + conn.outbound.queued_play(),
+                    )
+                });
         json!({
-            "connected": st.connected_gateway.is_some(),
+            "connected": !st.connections.is_empty(),
+            "multi_gateway": true,
+            "voice_gateway_open": self.voice_gateway_open(),
+            "connection_count": st.connections.len(),
+            "connections": connections_json,
             "gateway": st.connected_gateway,
             // v1 mechanism: negotiated link facts + the last link-level
             // error the peer REPORTED (cleared by the next good handshake).

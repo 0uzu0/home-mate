@@ -1071,6 +1071,7 @@ async fn gateway_disconnect_emits_device_left_first_and_cleans_voice_state() {
         }],
         aec_tail_ms: None,
         profile_version: None,
+        auth_token: None,
     };
     let mut line = serde_json::to_string(&hello).unwrap();
     line.push('\n');
@@ -1483,6 +1484,7 @@ async fn media_takeover_wake_ack_preserves_followup_across_play_finished() {
         }],
         aec_tail_ms: None,
         profile_version: None,
+        auth_token: None,
     };
     let mut line = serde_json::to_string(&hello).unwrap();
     line.push('\n');

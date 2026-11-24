@@ -68,14 +68,6 @@ pub(super) fn capture(
             config.news().ok().map(serde_json::to_value).transpose()?,
         ),
         (
-            Block::RemoteSocket,
-            ConfigDelivery::remote_socket_snapshot(&store)
-                .ok()
-                .filter(|snapshot| snapshot.verified)
-                .map(|snapshot| serde_json::to_value(snapshot.config))
-                .transpose()?,
-        ),
-        (
             Block::OpenSockets,
             open_sockets
                 .and_then(|provider| provider.effective(&store, None))

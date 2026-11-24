@@ -44,7 +44,7 @@ export default {
   releaseInstallActivateTitle: '安装并切换到新发布？',
   releaseInstallActivateMessage: '会先校验签名与哈希，然后重启固件和核心；正在播的内容与会话会中断。健康确认失败会自动回上一版。继续吗？',
   releaseInstallUrl: '包地址',
-  releaseInstallUrlPlaceholder: 'http://192.168.1.20:8000/home-mate-release-<ver>.tar',
+  releaseInstallUrlPlaceholder: 'http://192.168.1.10:8000/home-mate-release-<ver>.tar',
   releaseLast: '上一次操作',
   releaseNoRun: '还没有发布操作记录',
   releaseCriteria: '健康确认项',

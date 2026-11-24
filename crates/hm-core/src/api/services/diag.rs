@@ -915,7 +915,7 @@ mod tests {
 
     #[test]
     fn release_package_validation_accepts_lan_url_and_releases_path() {
-        assert!(validate_release_package("http://192.168.1.20:18981/hm-0.1.0.tar").is_ok());
+        assert!(validate_release_package("http://192.168.1.27:18981/hm-0.1.0.tar").is_ok());
         assert!(validate_release_package("https://releases.example.com/hm-0.1.0.tar").is_ok());
         assert!(validate_release_package("/data/hm/releases/hm-0.1.0.tar").is_ok());
     }
@@ -928,7 +928,7 @@ mod tests {
         assert!(validate_release_package("/data/hm/releases/../etc/passwd").is_err());
         assert!(validate_release_package("/tmp/evil.tar").is_err());
         assert!(validate_release_package("/data/hm/releases/").is_err());
-        assert!(validate_release_package("http://192.168.1.20:18981/a\nb.tar").is_err());
+        assert!(validate_release_package("http://192.168.1.27:18981/a\nb.tar").is_err());
         assert!(validate_release_package("file:///data/hm/releases/a.tar").is_err());
     }
 

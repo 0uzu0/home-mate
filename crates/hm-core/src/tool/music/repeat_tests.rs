@@ -66,6 +66,7 @@ async fn connect_mock_gateway(hub: &Arc<DeviceHub>, dev: &str) -> tokio::task::J
         }],
         aec_tail_ms: None,
         profile_version: None,
+        auth_token: None,
     };
     let mut line = serde_json::to_string(&hello).unwrap();
     line.push('\n');
@@ -489,6 +490,7 @@ async fn connect_mock_gateway_with_play_finished(
         }],
         aec_tail_ms: None,
         profile_version: None,
+        auth_token: None,
     };
     let mut line = serde_json::to_string(&hello).unwrap();
     line.push('\n');

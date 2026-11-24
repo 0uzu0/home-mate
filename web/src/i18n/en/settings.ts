@@ -148,4 +148,10 @@ export default {
   authRotateDone: 'Rotated. The new token is below and is shown once.',
   authClearLocal: 'Forget on this browser',
   authClearDone: 'Removed from this browser; the next request will ask again.',
+  authCoreId: 'Core ID',
+  authLanExemptTitle: 'Private-LAN passwordless access (Smart Displays / 86 Panels / App)',
+  authLanExemptHint:
+    'Off by default. When enabled, private-LAN (RFC1918) and Tailscale (100.64.0.0/10) clients may use the :8932 voice gateway and everyday :8930 read/chat/media/mode APIs without entering a token. High-risk endpoints (OTA, auth, vault/config export, Master Brain & provider credentials) still strictly require the admin Bearer token. Public IPs are never exempt.',
+  authLanExemptEnabled: 'Private-LAN exemption enabled (high-risk endpoints remain Bearer-gated)',
+  authLanExemptDisabled: 'Private-LAN exemption disabled (all non-loopback requests require token)',
 } as const

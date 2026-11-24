@@ -9,7 +9,7 @@ export default {
   cfgIdentitySettings: 'Node identity settings',
   cfgProtectedAudio: 'Measured acoustics, KWS, VAD, media trim and EQ',
   cfgProtectedHardware: 'Wake words, reflex vocabulary, LEDs and physical orientation',
-  cfgProtectedTools: 'Voice interaction, tool registries and remote socket',
+  cfgProtectedTools: 'Voice interaction and tool registries',
   cfgProtectedData: 'Fleet enrollment, credentials, personal memory and learning data',
 
   cfgDot2dTitle: 'dot2-d persona package', cfgDot2dReview: 'Review dot2-d persona package', cfgDot2dDownload: 'Download persona-only JSON',
@@ -42,8 +42,6 @@ export default {
   cfgVoiceWordList: 'Voice words (JSON)', cfgVoiceReplaceWords: 'Replace word list', cfgVoiceListInvalid: 'Enter a JSON array of voice phrases.',
   cfgOpenSocketsReplace: 'Replace socket list', cfgOpenSocketsContracts: 'Socket contracts (JSON)', cfgOpenSocketsInvalid: 'Enter a JSON array of socket contracts.',
   cfgOpenSocketsPublication: 'Socket registry publication',
-  cfgRemoteSocketReplaceCatalog: 'Replace capability list', cfgRemoteSocketCapabilities: 'Capability list (JSON)', cfgRemoteSocketCatalogInvalid: 'Enter a JSON array of remote socket capabilities.',
-  cfgRemoteSocketPublication: 'Remote socket publication',
   cfgOpenApiReplaceCatalog: 'Replace operation list', cfgOpenApiOperations: 'Operation list (JSON)', cfgOpenApiCatalogInvalid: 'Enter a JSON array of OpenAPI operations.',
   cfgReplaceMusicConnection: 'Replace connection', cfgDisableMusicConnection: 'Disable connection',
   cfgSet: 'Set value', cfgClear: 'Remove this layer’s override', cfgPreview: 'Preview target diff', cfgCommit: 'Submit reviewed changes', cfgRetryCommit: 'Retry the same submission',

@@ -27,7 +27,7 @@ const MARK =
     class="brand-logo"
     viewBox="0 0 590 152"
     role="img"
-    aria-label="Home Mate · 小瑞"
+    aria-label="Home Mate · 小伴"
   >
     <g transform="translate(18 18) scale(1.22)">
       <path class="brand-logo__mark" fill-rule="evenodd" :d="MARK" />

@@ -17,7 +17,6 @@ const BLOCKS: &[&str] = &[
     "search",
     "openapi",
     "mode",
-    "remote_socket",
     "open_sockets",
     "reflex",
     "node",
@@ -35,7 +34,6 @@ pub(super) const PUBLISHED_BLOCKS: &[&str] = &[
     "search",
     "openapi",
     "mode",
-    "remote_socket",
     "open_sockets",
     "reflex",
     "node",
@@ -74,7 +72,6 @@ fn binding_available(store: &Store, c: &Connection, name: &str) -> Result<bool> 
         crate::config::MUSIC_LIBRARY_SECRET
             | crate::config::MUSIC_ONLINE_SECRET
             | crate::config::OPENAPI_TOKEN_SECRET
-            | crate::tool::remote_socket::REMOTE_SOCKET_SECRET_KEY
     ) {
         return store
             .secret_get_on(c, name)
@@ -570,8 +567,6 @@ impl ConfigDelivery {
             for block in package.blocks.iter().filter_map(|block| DiscoveryBlock::named(&block.name)) {
                 if matches!(block, DiscoveryBlock::OpenApi) {
                     super::openapi::review_layers(&tx, &self.store, &layers, &after)?;
-                } else if matches!(block, DiscoveryBlock::RemoteSocket) {
-                    super::remote_socket::review_layers(&tx, &self.store, &layers, &after)?;
                 } else if matches!(block, DiscoveryBlock::OpenSockets) {
                     let desired = super::open_sockets::canonical(value_tree(&after, block.key()))?;
                     super::open_sockets::validate_namespace(&desired, competing_sockets.as_deref().unwrap_or_default())?;
@@ -690,8 +685,6 @@ impl ConfigDelivery {
             for block in package.blocks.iter().filter_map(|block| DiscoveryBlock::named(&block.name)) {
                 if matches!(block, DiscoveryBlock::OpenApi) {
                     super::openapi::review_layers(&tx, &self.store, &next_layers, &after_fields)?;
-                } else if matches!(block, DiscoveryBlock::RemoteSocket) {
-                    super::remote_socket::review_layers(&tx, &self.store, &next_layers, &after_fields)?;
                 } else if matches!(block, DiscoveryBlock::OpenSockets) {
                     if self.open_sockets.is_none() {
                         return Err(DeliveryError::conflict("OPEN_SOCKETS_RUNTIME_UNAVAILABLE", "reviewed sockets require the actual Registry").at(block.key()));
@@ -752,7 +745,6 @@ impl ConfigDelivery {
                     "search",
                     "openapi",
                     "mode",
-                    "remote_socket",
                     "open_sockets",
                     "reflex",
                     "node",

@@ -146,4 +146,10 @@ export default {
   authRotateDone: '已轮换。新令牌如下，只显示一次。',
   authClearLocal: '清除本机凭证',
   authClearDone: '已从这台浏览器移除；下一次请求会要求重新配对。',
+  authCoreId: 'Core 指纹',
+  authLanExemptTitle: '局域网免密接入（智能屏 / 86 面板 / 家庭 App）',
+  authLanExemptHint:
+    '默认关闭。开启后，仅对内网（RFC1918）与 Tailscale（100.64.0.0/10）客户端免除 :8932 语音网关及 :8930 日常只读/对话/媒体/模式接口的令牌校验；OTA 升级、安全鉴权、密钥/配置导出与主脑凭证等高危管理接口仍严格要求管理员令牌。公网 IP 永不豁免。',
+  authLanExemptEnabled: '已开启局域网免密接入（高危接口仍受令牌保护）',
+  authLanExemptDisabled: '已关闭局域网免密接入（全部非回环请求需令牌）',
 } as const

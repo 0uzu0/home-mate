@@ -133,6 +133,7 @@ async fn wire2_handshake_config_waiters_and_link_drop_retirement() {
         }],
         aec_tail_ms: None,
         profile_version: None,
+        auth_token: None,
     };
     wr.write_all(serde_json::to_string(&hello).unwrap().as_bytes())
         .await
@@ -345,6 +346,7 @@ async fn legacy_wire0_hello_receives_hello_ack_with_protocol_zero() {
         }],
         aec_tail_ms: None,
         profile_version: None,
+        auth_token: None,
     };
     wr.write_all(serde_json::to_string(&hello).unwrap().as_bytes())
         .await

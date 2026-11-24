@@ -14,4 +14,4 @@ opt-level = "s"
 [workspace.package]
 edition = "2021"
 version = "0.0.1"
-license-file = "NOT-LICENSED"
+license-file = "LICENSE"

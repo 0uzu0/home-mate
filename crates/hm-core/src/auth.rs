@@ -32,10 +32,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub const TOKEN_PREFIX: &str = "hm1_";
 const CONFIG_KEY: &str = "api_tokens";
+const CORE_ID_KEY: &str = "core_id";
+const LAN_GATEWAY_EXEMPT_KEY: &str = "auth.lan_gateway_exempt";
 /// Sliding window and threshold for per-source failed bearer auth throttling.
 pub const AUTH_FAIL_WINDOW_MS: u64 = 60_000;
 pub const AUTH_FAIL_THRESHOLD: usize = 20;
@@ -82,6 +85,14 @@ impl std::fmt::Display for AuthError {
 
 pub struct AuthStore {
     store: Arc<Store>,
+    /// Stable, non-secret instance fingerprint generated once on first boot
+    /// and persisted in `config_kv["core_id"]` so multi-homed clients collapse
+    /// LAN / Tailscale / relay endpoints into one logical Core (#274).
+    core_id: String,
+    /// Persistent Option 1A LAN auth exemption toggle (default `false` /
+    /// fail-closed). Only ever applies to RFC1918 + Tailscale `100.64.0.0/10`
+    /// peers on TCP `:8932` and everyday `:8930` read/chat/media/mode routes.
+    lan_gateway_exempt: AtomicBool,
     /// Serializes read-modify-write of the list (rotation vs `last_used`).
     write: Mutex<()>,
     /// Per-source-IP sliding window of failed auth timestamps (ms).
@@ -90,11 +101,40 @@ pub struct AuthStore {
 
 impl AuthStore {
     pub fn new(store: Arc<Store>) -> Arc<Self> {
+        let core_id = ensure_core_id(&store);
+        let lan_exempt = store
+            .config_get(LAN_GATEWAY_EXEMPT_KEY)
+            .ok()
+            .flatten()
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
         Arc::new(Self {
             store,
+            core_id,
+            lan_gateway_exempt: AtomicBool::new(lan_exempt),
             write: Mutex::new(()),
             failures: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Stable, non-secret Core instance identifier (e.g. `hmcore_<16 hex>`).
+    pub fn core_id(&self) -> &str {
+        &self.core_id
+    }
+
+    /// Option 1A LAN auth exemption flag (default `false` / fail-closed).
+    pub fn lan_gateway_exempt(&self) -> bool {
+        self.lan_gateway_exempt.load(Ordering::Acquire)
+    }
+
+    /// Persist and apply Option 1A LAN auth exemption toggle.
+    pub fn set_lan_gateway_exempt(&self, enabled: bool) -> Result<bool, AuthError> {
+        let _guard = crate::lock_or_recover(&self.write, "auth.write");
+        let raw = if enabled { "true" } else { "false" };
+        self.store
+            .config_set(LAN_GATEWAY_EXEMPT_KEY, raw)
+            .map_err(|e| AuthError::Store(e.to_string()))?;
+        self.lan_gateway_exempt.store(enabled, Ordering::Release);
+        Ok(enabled)
     }
 
     /// Check whether `ip` has exceeded [`AUTH_FAIL_THRESHOLD`] failures within
@@ -299,6 +339,28 @@ fn new_entry(token: &str, label: &str) -> TokenEntry {
     }
 }
 
+/// Read or generate-once a stable non-secret Core fingerprint persisted in
+/// SQLite `config_kv["core_id"]`.
+fn ensure_core_id(store: &Store) -> String {
+    if let Ok(Some(existing)) = store.config_get(CORE_ID_KEY) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    let mut bytes = [0u8; 8];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        use std::io::Read;
+        let _ = f.read_exact(&mut bytes);
+    }
+    if bytes == [0u8; 8] {
+        bytes = crate::id::now_ms().to_be_bytes();
+    }
+    let generated = format!("hmcore_{}", hex(&bytes));
+    let _ = store.config_set(CORE_ID_KEY, &generated);
+    generated
+}
+
 /// 32 bytes from the kernel CSPRNG, base64url (no padding) after `hm1_`.
 fn fresh_token() -> String {
     use base64::Engine;
@@ -464,5 +526,36 @@ mod tests {
             );
             current = rotated;
         }
+    }
+
+    #[test]
+    fn core_id_and_lan_gateway_exempt_persist_in_store() {
+        let s = store();
+        let auth1 = AuthStore::new(s.clone());
+        let id1 = auth1.core_id().to_string();
+        assert!(
+            id1.starts_with("hmcore_") && id1.len() == 23,
+            "core_id={id1}"
+        );
+        assert!(
+            !auth1.lan_gateway_exempt(),
+            "must default to false (fail-closed)"
+        );
+
+        // Reloading AuthStore against the same SQLite store keeps the exact core_id.
+        let auth2 = AuthStore::new(s.clone());
+        assert_eq!(auth2.core_id(), id1);
+        assert!(!auth2.lan_gateway_exempt());
+
+        // Toggle lan_gateway_exempt on and verify persistence across reload.
+        assert!(auth2.set_lan_gateway_exempt(true).unwrap());
+        assert!(auth2.lan_gateway_exempt());
+        let auth3 = AuthStore::new(s.clone());
+        assert_eq!(auth3.core_id(), id1);
+        assert!(auth3.lan_gateway_exempt());
+
+        // Toggle off again.
+        assert!(!auth3.set_lan_gateway_exempt(false).unwrap());
+        assert!(!AuthStore::new(s).lan_gateway_exempt());
     }
 }

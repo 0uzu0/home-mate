@@ -1,9 +1,9 @@
 services:
   hm-core:
-    image: ghcr.io/yes999zc/home-mate:latest
     build:
       context: .
       dockerfile: Dockerfile
+    image: home-mate/hm-core:latest
     container_name: home-mate-core
     restart: unless-stopped
     ports:

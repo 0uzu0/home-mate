@@ -1121,6 +1121,7 @@ impl VoicePipeline {
         }
         crate::lock_or_recover(&self.log, "voice.log").clear();
         crate::lock_or_recover(&self.reminder_inflight, "voice.reminder_inflight").clear();
+        crate::lock_or_recover(&self.announces, "voice.announces").clear();
         *crate::lock_or_recover(&self.last_arbitration, "voice.last_arbitration") = None;
         *crate::lock_or_recover(&self.last_cue_synth, "voice.last_cue_synth") = None;
         crate::lock_or_recover(&self.foreign_cues, "voice.foreign_cues").clear();
@@ -1699,6 +1700,7 @@ impl VoicePipeline {
         snap["kws_threshold"] = json!(settings.kws_threshold);
         snap["kws_score"] = json!(settings.kws_score);
         snap["cue_readiness"] = self.cue_readiness_for(&settings);
+        snap["announce_queue"] = self.announce_queue_summary();
         snap
     }
 }

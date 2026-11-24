@@ -354,3 +354,224 @@ async fn repeated_invalid_bearer_tokens_trigger_429_without_affecting_loopback()
         assert_eq!(status, 200, "loopback must never be rate-limited");
     }
 }
+
+async fn spawn_with_peer(peer: &'static str) -> App {
+    let dir = std::env::temp_dir().join(format!(
+        "hm-auth-peer-{}-{}",
+        std::process::id(),
+        hm_core::id::now_ms()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let state = AppState::with_overrides(
+        store,
+        dir.clone(),
+        MockInject::default(),
+        None,
+        None,
+        None,
+        None,
+    );
+    let peer_addr: SocketAddr = peer.parse().unwrap();
+    let app = router(state.clone()).layer(axum::middleware::from_fn(
+        move |mut req: axum::extract::Request, next: axum::middleware::Next| async move {
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo(peer_addr));
+            next.run(req).await
+        },
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
+    App {
+        state,
+        base: format!("http://127.0.0.1:{port}"),
+        _dir: dir,
+    }
+}
+
+#[tokio::test]
+async fn option_1a_lan_gateway_exempt_allows_private_everyday_routes_and_gates_public_and_high_risk(
+) {
+    let lan_app = spawn_with_peer("192.168.1.50:54321").await;
+    let (_, body) = post(&lan_app.base, "/api/v0/auth/provision", None).await;
+    let token = body["token"].as_str().unwrap().to_string();
+
+    // 1. Default fail-closed: core_id & lan_gateway_exempt=false advertised on /api/v0/auth;
+    //    private LAN peer gets 401 on /api/v0/status before opt-in.
+    let (code, _, auth_body) = get(&lan_app.base, "/api/v0/auth", None).await;
+    assert_eq!(code, 200);
+    let core_id = auth_body["core_id"].as_str().unwrap().to_string();
+    assert!(core_id.starts_with("hmcore_"));
+    assert_eq!(auth_body["lan_gateway_exempt"], false);
+    assert!(auth_body.get("tokens").is_none());
+
+    let (code, _, _) = get(&lan_app.base, "/api/v0/status", None).await;
+    assert_eq!(code, 401, "fail-closed by default on private LAN");
+
+    // 2. Toggling lan_gateway_exempt requires admin Bearer token.
+    let client = reqwest::Client::new();
+    let resp = client
+        .put(format!("{}/api/v0/auth/lan-exempt", lan_app.base))
+        .json(&serde_json::json!({ "lan_gateway_exempt": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 401);
+
+    let resp = client
+        .put(format!("{}/api/v0/auth/lan-exempt", lan_app.base))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&serde_json::json!({ "lan_gateway_exempt": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let toggled: Value = resp.json().await.unwrap();
+    assert_eq!(toggled["lan_gateway_exempt"], true);
+    assert_eq!(toggled["core_id"], core_id);
+
+    // /api/v0/auth reflects lan_gateway_exempt=true immediately, and config_history records the change.
+    let (code, _, auth_body2) = get(&lan_app.base, "/api/v0/auth", None).await;
+    assert_eq!(code, 200);
+    assert_eq!(auth_body2["lan_gateway_exempt"], true);
+    assert_eq!(auth_body2["core_id"], core_id);
+
+    let (code, _, hist_body) = get(&lan_app.base, "/api/v0/config/history", Some(&token)).await;
+    assert_eq!(code, 200);
+    let has_auth_entry = hist_body["history"].as_array().is_some_and(|arr| {
+        arr.iter().any(|e| {
+            e["scope"] == "auth"
+                && e["summary"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("lan_gateway_exempt") && s.contains("true"))
+        })
+    });
+    assert!(
+        has_auth_entry,
+        "config_history must record lan_gateway_exempt toggle, got {hist_body}"
+    );
+
+    // 3. Everyday read/mode/chat/media routes succeed from RFC1918 192.168.1.50 without token.
+    let (code, _, status_body) = get(&lan_app.base, "/api/v0/status", None).await;
+    assert_eq!(code, 200);
+    assert_eq!(status_body["core_id"], core_id);
+    assert_eq!(status_body["auth"]["lan_gateway_exempt"], true);
+
+    for path in [
+        "/api/v0/mode",
+        "/api/v0/devices",
+        "/api/v0/fleet",
+        "/api/v0/device-meta",
+    ] {
+        let (code, _, _) = get(&lan_app.base, path, None).await;
+        assert_eq!(code, 200, "everyday route {path} should be LAN-exempt");
+    }
+    // Parameterized device conversation route also bypasses 401 (returns 404 only because
+    // no session exists yet for dot2-d in the empty test DB).
+    let (code, _, _) = get(&lan_app.base, "/api/v0/devices/dot2-d/conversation", None).await;
+    assert_eq!(
+        code, 404,
+        "everyday route /api/v0/devices/dot2-d/conversation should bypass 401 auth gate"
+    );
+
+    // Presenting a WRONG token or non-Bearer Authorization header from private LAN still returns 401.
+    let wrong = format!("hm1_{}", "Z".repeat(43));
+    let (code, _, _) = get(&lan_app.base, "/api/v0/status", Some(&wrong)).await;
+    assert_eq!(code, 401, "invalid presented bearer token must still fail");
+    let non_bearer_resp = client
+        .get(format!("{}/api/v0/status", lan_app.base))
+        .header("Authorization", "Basic dXNlcjpwYXNz")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        non_bearer_resp.status().as_u16(),
+        401,
+        "non-Bearer Authorization header must NOT bypass auth via lan_gateway_exempt"
+    );
+
+    // 4. High-risk admin/security/OTA/vault/credential routes stay STRICTLY 401 even when exempt!
+    for (method, path) in [
+        ("PUT", "/api/v0/auth/lan-exempt"),
+        ("POST", "/api/v0/auth/rotate"),
+        ("GET", "/api/v0/release"),
+        ("POST", "/api/v0/release/install"),
+        ("GET", "/api/v0/firmware"),
+        ("GET", "/api/v0/config/services"),
+        ("GET", "/api/v0/config/services/master_brain"),
+        ("GET", "/api/v0/config/export"),
+        ("POST", "/api/v0/config/import"),
+        ("POST", "/api/v0/system/restart"),
+        ("POST", "/api/v0/system/factory-reset"),
+        ("POST", "/api/v0/devices/dot2-d/wifi"),
+        ("POST", "/api/v0/reflex/deploy"),
+        ("PUT", "/api/v0/prompts"),
+    ] {
+        let req = match method {
+            "GET" => client.get(format!("{}{path}", lan_app.base)),
+            "POST" => client
+                .post(format!("{}{path}", lan_app.base))
+                .json(&serde_json::json!({})),
+            "PUT" => client
+                .put(format!("{}{path}", lan_app.base))
+                .json(&serde_json::json!({})),
+            _ => unreachable!(),
+        };
+        let resp = req.send().await.unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            401,
+            "high-risk {method} {path} must stay strictly Bearer-gated even with lan_gateway_exempt=true"
+        );
+    }
+
+    // 5. Tailscale CGNAT (100.64.0.0/10) is also private-LAN exempt for everyday routes,
+    //    and strictly 401 on high-risk routes.
+    let ts_app = spawn_with_peer("100.64.10.20:54321").await;
+    let (_, ts_body) = post(&ts_app.base, "/api/v0/auth/provision", None).await;
+    let ts_tok = ts_body["token"].as_str().unwrap().to_string();
+    client
+        .put(format!("{}/api/v0/auth/lan-exempt", ts_app.base))
+        .header("Authorization", format!("Bearer {ts_tok}"))
+        .json(&serde_json::json!({ "lan_gateway_exempt": true }))
+        .send()
+        .await
+        .unwrap();
+    let (code, _, _) = get(&ts_app.base, "/api/v0/status", None).await;
+    assert_eq!(
+        code, 200,
+        "Tailscale CGNAT peer should be LAN-exempt on /status"
+    );
+    let (code, _, _) = get(&ts_app.base, "/api/v0/config/export", None).await;
+    assert_eq!(
+        code, 401,
+        "Tailscale CGNAT peer must still be 401 on /config/export"
+    );
+
+    // 6. Public IP (203.0.113.9) is NEVER exempt even when lan_gateway_exempt=true!
+    let pub_app = spawn_with_peer("203.0.113.9:54321").await;
+    let (_, pub_body) = post(&pub_app.base, "/api/v0/auth/provision", None).await;
+    let pub_tok = pub_body["token"].as_str().unwrap().to_string();
+    client
+        .put(format!("{}/api/v0/auth/lan-exempt", pub_app.base))
+        .header("Authorization", format!("Bearer {pub_tok}"))
+        .json(&serde_json::json!({ "lan_gateway_exempt": true }))
+        .send()
+        .await
+        .unwrap();
+    for path in ["/api/v0/status", "/api/v0/mode", "/api/v0/devices"] {
+        let (code, _, _) = get(&pub_app.base, path, None).await;
+        assert_eq!(
+            code, 401,
+            "public IP must NEVER be exempt on {path} even with lan_gateway_exempt=true"
+        );
+    }
+}

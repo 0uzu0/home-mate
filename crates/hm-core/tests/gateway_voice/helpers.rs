@@ -289,6 +289,7 @@ pub async fn connect_fake_gateway(port: u16) -> Arc<FakeGateway> {
         }],
         aec_tail_ms: None,
         profile_version: None,
+        auth_token: None,
     };
     let _line = serde_json::to_string(&hello).unwrap();
     gw.send(&hello).await;
@@ -648,6 +649,7 @@ pub async fn connect_gateway_audio_in_caps(port: u16, extra: Vec<&str>) -> Arc<F
         }],
         aec_tail_ms: None,
         profile_version: None,
+        auth_token: None,
     };
     gw.send(&hello).await;
     let tx2 = gw.tx.clone();

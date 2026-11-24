@@ -50,7 +50,6 @@ pub const BINDINGS: &[&str] = &[
     "openapi.token",
     "search.api_key",
     "shared_memory_token",
-    "remote_socket.token",
 ];
 
 pub fn fields() -> Vec<FieldDescriptor> {
@@ -215,20 +214,6 @@ pub fn fields() -> Vec<FieldDescriptor> {
     ] {
         add(paths(prefix, names), kind, "family_or_node", true, owner);
     }
-    for (names, kind) in [
-        ("enabled", "boolean"),
-        ("endpoint_url service_name", "string"),
-        ("timeout_ms", "integer"),
-        ("capabilities", "array"),
-    ] {
-        add(
-            paths("remote_socket", names),
-            kind,
-            "node",
-            true,
-            "tool::remote_socket::RemoteSocketConfig",
-        );
-    }
     for (names, kind, scope) in [
         ("assistant_name persona_prompt", "string", "family_or_node"),
         ("system_prompt_override", "string", "node"),
@@ -359,9 +344,6 @@ pub fn fields() -> Vec<FieldDescriptor> {
         ("mode", "keyword_interrupt barge_in", "boolean"),
         ("mode", "barge_protect_ms", "number"),
         ("privacy", "idle_asr_enabled", "boolean"),
-        ("remote_socket.capabilities[]", "name description", "string"),
-        ("remote_socket.capabilities[]", "side_effect", "string"),
-        ("remote_socket.capabilities[]", "parameters", "object"),
         ("open_sockets[]", "name service description endpoint_url method auth_header default_subject default_action", "string"),
         ("open_sockets[]", "effect", "string"),
         ("open_sockets[]", "parameters", "object"),
@@ -564,7 +546,6 @@ pub fn fields() -> Vec<FieldDescriptor> {
                         | "openapi.operations[].params"
                         | "reflex.words"
                         | "audio_eq.bands"
-                        | "remote_socket.capabilities"
                         | "open_sockets"
                         | "fleet.nodes"
                 ) {
@@ -596,14 +577,7 @@ pub fn fields() -> Vec<FieldDescriptor> {
                     "persona.agent_md.content" | "open_sockets"
                 )
                 || [
-                    "weather.",
-                    "home.",
-                    "music.",
-                    "news.",
-                    "search.",
-                    "openapi.",
-                    "mode.",
-                    "remote_socket.",
+                    "weather.", "home.", "music.", "news.", "search.", "openapi.", "mode.",
                 ]
                 .iter()
                 .any(|prefix| field.path.starts_with(prefix)))
@@ -709,10 +683,6 @@ fn enrich_descriptor(field: &mut FieldDescriptor) {
             max_items: Some(crate::tool::open_socket::MAX_OPEN_SOCKETS),
             ..Bounds::default()
         }),
-        "remote_socket.capabilities" => Some(Bounds {
-            max_items: Some(crate::tool::remote_socket::MAX_REMOTE_CAPABILITIES),
-            ..Bounds::default()
-        }),
         "openapi.operations" => Some(Bounds {
             max_items: Some(crate::config::MAX_OPENAPI_OPERATIONS),
             ..Default::default()
@@ -742,7 +712,6 @@ fn enrich_descriptor(field: &mut FieldDescriptor) {
         "home.timeout_ms" | "news.timeout_ms" | "search.timeout_ms" | "openapi.timeout_ms" => {
             Some(num_bounds(Some(500.0), Some(15_000.0)))
         }
-        "remote_socket.timeout_ms" => Some(num_bounds(Some(500.0), Some(30_000.0))),
         "open_sockets[].timeout_ms" => Some(num_bounds(Some(500.0), Some(30_000.0))),
         "home.retries" | "openapi.retries" => Some(num_bounds(Some(0.0), Some(3.0))),
         "news.max_sources" => Some(num_bounds(
@@ -843,8 +812,6 @@ fn enrich_descriptor(field: &mut FieldDescriptor) {
             Some("config::DeviceLedConfig")
         } else if p == "node.wake.phrases" {
             Some("config::WakeConfig")
-        } else if p.starts_with("remote_socket.") {
-            Some("tool::remote_socket::RemoteSocketConfig")
         } else if p.starts_with("open_sockets") {
             Some("tool::open_socket::OpenSocketContract")
         } else if p.starts_with("fleet.") {

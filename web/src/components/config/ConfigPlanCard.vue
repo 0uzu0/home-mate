@@ -101,7 +101,7 @@ function readerState(state: string): string {
   return labels[state as keyof typeof labels] ?? t('cfgReaderUnknown')
 }
 function publicationLabel(block: ConfigPublication['block']): string {
-  const labels = { persona: 'cfgPublication', services: 'cfgServicesPublication', weather: 'cfgWeatherPublication', home: 'cfgHomePublication', music: 'cfgMusicPublication', openapi: 'cfgOpenApiPublication', remote_socket: 'cfgRemoteSocketPublication', open_sockets: 'cfgOpenSocketsPublication', mode: 'cfgVoicePublication', news: 'cfgNewsPublication', search: 'cfgSearchPublication', node: 'cfgNodePublication', device_led_configs: 'cfgDeviceLedPublication' } as const
+  const labels = { persona: 'cfgPublication', services: 'cfgServicesPublication', weather: 'cfgWeatherPublication', home: 'cfgHomePublication', music: 'cfgMusicPublication', openapi: 'cfgOpenApiPublication', open_sockets: 'cfgOpenSocketsPublication', mode: 'cfgVoicePublication', news: 'cfgNewsPublication', search: 'cfgSearchPublication', node: 'cfgNodePublication', device_led_configs: 'cfgDeviceLedPublication' } as const
   return labels[block as keyof typeof labels] ? t(labels[block as keyof typeof labels]) : block
 }
 function isNumeric(field: ConfigField): boolean {
@@ -130,7 +130,6 @@ function catalogueLabels(path: string) {
   if (['mode.retreat_words', 'mode.stop_intents.stop_words', 'mode.stop_intents.continue_words'].includes(path)) {
     return { label: 'cfgVoiceWordList', action: 'cfgVoiceReplaceWords', invalid: 'cfgVoiceListInvalid' } as const
   }
-  if (path === 'remote_socket.capabilities') return { label: 'cfgRemoteSocketCapabilities', action: 'cfgRemoteSocketReplaceCatalog', invalid: 'cfgRemoteSocketCatalogInvalid' } as const
 }
 function layerDisplay(value: ConfigValue, explicitNull = false): string {
   if (explicitNull) return display(null)

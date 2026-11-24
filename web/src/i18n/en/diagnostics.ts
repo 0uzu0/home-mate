@@ -44,7 +44,7 @@ export default {
   releaseInstallActivateTitle: 'Install and switch to the new release?',
   releaseInstallActivateMessage: 'Signature and hashes are verified first, then firmware and core restart; anything playing and the conversation will be interrupted. A failed health check rolls back automatically. Continue?',
   releaseInstallUrl: 'Package URL',
-  releaseInstallUrlPlaceholder: 'http://192.168.1.20:8000/home-mate-release-<ver>.tar',
+  releaseInstallUrlPlaceholder: 'http://192.168.1.10:8000/home-mate-release-<ver>.tar',
   releaseLast: 'Last operation',
   releaseNoRun: 'No release operation recorded yet',
   releaseCriteria: 'Health criteria',

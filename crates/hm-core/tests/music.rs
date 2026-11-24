@@ -103,7 +103,7 @@ async fn mu2_mu3_write_read_back_and_probe() {
         .json(&json!({
             "enabled": true,
             "prefer_local": true,
-            "library": { "endpoint": fake.base, "user": "bakey", "secret": common::LIB_SECRET },
+            "library": { "endpoint": fake.base, "user": "demo", "secret": common::LIB_SECRET },
             "online": { "endpoint": fake.base, "secret": common::ONLINE_TOKEN },
         }))
         .send()
@@ -123,7 +123,7 @@ async fn mu2_mu3_write_read_back_and_probe() {
         !raw.contains(common::ONLINE_TOKEN),
         "the online token must never be echoed"
     );
-    assert_eq!(put["library"]["user"], "bakey");
+    assert_eq!(put["library"]["user"], "demo");
 
     let get: Value = client
         .get(format!("{base}/api/v0/config/services/music"))
@@ -168,7 +168,7 @@ async fn mu2_mu3_write_read_back_and_probe() {
         .put(format!("{base}/api/v0/config/services/music"))
         .json(&json!({
             "enabled": true,
-            "library": { "endpoint": fake.base, "user": "bakey", "secret": "wrong" },
+            "library": { "endpoint": fake.base, "user": "demo", "secret": "wrong" },
         }))
         .send()
         .await
@@ -320,7 +320,7 @@ async fn mu7_secrets_never_reach_logs_history_or_trace() {
         .json(&json!({
             "enabled": true,
             "prefer_local": true,
-            "library": { "endpoint": fake.base, "user": "bakey", "secret": common::LIB_SECRET },
+            "library": { "endpoint": fake.base, "user": "demo", "secret": common::LIB_SECRET },
             "online": { "endpoint": fake.base, "secret": common::ONLINE_TOKEN },
         }))
         .send()
@@ -505,7 +505,7 @@ async fn reviewed_music_publication_and_rollback_switch_the_actual_providers() {
         |package: &Value| post("/api/v1/config/preflight").json(&json!({"package":package}));
     let mut incomplete = v2.clone();
     incomplete["blocks"][0]["operations"] = json!([
-        {"action":"replace","path":"music.library","value":{"user":"bakey"}}
+        {"action":"replace","path":"music.library","value":{"user":"demo"}}
     ]);
     let rejected = preflight_v2(&incomplete).send().await.unwrap();
     assert_eq!(rejected.status(), 400);
@@ -563,7 +563,7 @@ async fn reviewed_music_publication_and_rollback_switch_the_actual_providers() {
         .iter()
         .find(|row| row["path"] == "music.library")
         .unwrap();
-    assert_eq!(library["after"]["user"], "bakey");
+    assert_eq!(library["after"]["user"], "demo");
     assert_eq!(library["after"]["endpoint"], candidate.base);
     assert!(plan["migration_report"]
         .as_array()
@@ -708,20 +708,20 @@ async fn direct_music_credentials_config_and_history_commit_together() {
     let save = |revision: Value, library: &str, online: &str| {
         put().json(&json!({
             "enabled": true,
-            "library": {"endpoint": fixture.base, "user":"bakey", "secret":library},
+            "library": {"endpoint": fixture.base, "user":"demo", "secret":library},
             "online": {"endpoint": fixture.base, "secret":online},
             "revision": revision,
         }))
     };
     let initial = api_response(put().json(&json!({
         "enabled": true,
-        "library": {"endpoint":fixture.base, "user":"bakey", "secret":common::LIB_SECRET},
+        "library": {"endpoint":fixture.base, "user":"demo", "secret":common::LIB_SECRET},
         "online": {"endpoint":fixture.base, "user":"catalog", "secret":common::ONLINE_TOKEN}
     })))
     .await;
     let older_client = api_response(put().json(&json!({
         "enabled":true,
-        "library":{"endpoint":fixture.base,"user":"bakey"},
+        "library":{"endpoint":fixture.base,"user":"demo"},
         "online":{"endpoint":fixture.base},
         "revision":initial["revision"]
     })))

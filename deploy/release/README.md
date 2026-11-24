@@ -100,7 +100,7 @@ console deployment uses the same channel):
 ```sh
 # on the Mac, in a directory holding hm-release:
 python3 -m http.server 8111
-# on the device (serial /dev/cu.usbmodem31101, root shell):
+# on the device (serial /dev/cu.usbmodem<port>, root shell):
 busybox wget -O /data/hm/bin/hm-release http://<mac-ip>:8111/hm-release
 chmod 755 /data/hm/bin/hm-release
 /data/hm/bin/hm-release version          # prints its version + the compiled-in key fingerprint

@@ -23,9 +23,6 @@ RUN cargo build --release --locked -p hm-core
 # Stage 3: Minimal Production Runtime Image for NAS / Home Server
 # =============================================================================
 FROM debian:bookworm-slim
-LABEL org.opencontainers.image.source="https://github.com/yes999zc/home-mate" \
-      org.opencontainers.image.description="Home Mate (XiaoRui) — Sovereign local-first AI voice runtime & Vue 3 console (hm-core)" \
-      org.opencontainers.image.licenses="AGPL-3.0-only"
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl tzdata \
     && rm -rf /var/lib/apt/lists/*

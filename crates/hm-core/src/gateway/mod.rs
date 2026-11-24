@@ -65,10 +65,29 @@ pub struct PlayRequest {
     pub simulated_ms: Option<u64>,
 }
 
+struct ConnSlot {
+    gateway: String,
+    gateway_version: Option<String>,
+    protocol_operating: u32,
+    peer_addr: Option<std::net::SocketAddr>,
+    authenticated: bool,
+    devices: std::collections::HashSet<String>,
+    outbound: outbound::OutboundSender,
+    /// Dropping this sender wakes a superseded connection even while its writer
+    /// is blocked in `write_all` and its reader remains open.
+    retirement: Option<oneshot::Sender<()>>,
+}
+
 struct HubState {
+    /// Monotonic connection generation allocator (1, 2, ...). Each live gateway
+    /// connection owns a unique `conn_id = generation` entry in `connections`.
     generation: u64,
-    /// Dropping the prior sender retires both old transport directions.
-    connection_retirement: Option<oneshot::Sender<()>>,
+    /// #271: Connection-scoped live gateway slots (`conn_id -> ConnSlot`).
+    /// Multiple distinct gateways (e.g. local loopback speaker + LAN phone)
+    /// coexist concurrently without superseding each other.
+    connections: HashMap<u64, ConnSlot>,
+    /// #271: Active device ownership (`device_id -> owning conn_id`).
+    device_to_conn: HashMap<String, u64>,
     connected_gateway: Option<String>,
     /// v1 mechanism: the machine-readable gateway/firmware package version
     /// from the live hello (empty for an older gateway), the negotiated
@@ -87,12 +106,14 @@ struct HubState {
     pending: HashMap<String, PendingWaiter>,
     /// Per-device waiters for WifiState replies (v0.2.3 wifi change).
     pending_wifi: HashMap<String, oneshot::Sender<DeviceEvent>>,
+    pending_wifi_gen: HashMap<String, u64>,
     config_state_waiters: HashMap<String, config::ConfigOneshotWaiter>,
     config_validate_waiters: HashMap<String, config::ConfigOneshotWaiter>,
     config_apply_waiters: HashMap<String, config::ConfigApplyWaiter>,
     /// volume task_id → device, so an asynchronous `volume_receipt` can be
     /// attributed even though the v0.2 frame carries no device field.
     volume_pending: HashMap<String, String>,
+    volume_pending_gen: HashMap<String, u64>,
     /// Every play submitted on a live connection, any channel — the hub is
     /// the single registry of in-flight plays so stops can reach media
     /// (tool-submitted) plays as well as voice plays. Removed on terminal
@@ -172,6 +193,114 @@ impl HubState {
             self.ring.pop_front();
         }
     }
+
+    fn conn_is_live(&self, generation: u64) -> bool {
+        if self.connections.is_empty() {
+            self.generation == generation
+        } else {
+            self.connections.contains_key(&generation)
+        }
+    }
+
+    fn device_frame_stale(&self, generation: u64, device: &str) -> bool {
+        if !self.conn_is_live(generation) {
+            return true;
+        }
+        if let Some(&owner) = self.device_to_conn.get(device) {
+            return owner != generation;
+        }
+        if !self.connections.is_empty() {
+            if let Some(slot) = self.devices.get(device) {
+                return slot.generation != generation;
+            }
+        }
+        false
+    }
+
+    fn conn_is_loopback(conn: &ConnSlot) -> bool {
+        conn.peer_addr.is_some_and(|p| p.ip().is_loopback())
+    }
+
+    /// Trust hierarchy for multi-gateway device_id supersession (Phase 3 P0-1):
+    /// 1. A non-loopback connection must NEVER supersede a loopback speaker gateway.
+    /// 2. An unauthenticated connection (e.g. `lan_gateway_exempt`) must NEVER
+    ///    supersede an authenticated connection.
+    fn conn_can_supersede(new_is_loopback: bool, new_authenticated: bool, old: &ConnSlot) -> bool {
+        if Self::conn_is_loopback(old) && !new_is_loopback {
+            return false;
+        }
+        if old.authenticated && !new_authenticated {
+            return false;
+        }
+        true
+    }
+
+    fn refresh_summary_fields(&mut self) {
+        if let Some((_, best)) = self
+            .connections
+            .iter()
+            .max_by_key(|(&gen_id, conn)| (Self::conn_is_loopback(conn), gen_id))
+        {
+            self.connected_gateway = Some(best.gateway.clone());
+            self.connected_gateway_version = best.gateway_version.clone();
+            self.protocol_operating = Some(best.protocol_operating);
+        } else {
+            self.connected_gateway = None;
+            self.connected_gateway_version = None;
+            self.protocol_operating = None;
+        }
+    }
+
+    fn cleanup_connection_resources(&mut self, generation: u64) {
+        let retiring: Vec<String> = self
+            .active_plays
+            .iter()
+            .filter(|(_, p)| p.generation == generation)
+            .map(|(id, _)| id.clone())
+            .chain(
+                self.pending
+                    .iter()
+                    .filter(|(_, w)| w.generation == generation)
+                    .map(|(id, _)| id.clone()),
+            )
+            .collect();
+        for id in retiring {
+            DeviceHub::resolve_stop_waiters(self, &id, StopOutcome::unknown("connection_retired"));
+            self.stop_sent.remove(&id);
+            self.retired_plays.insert(id);
+        }
+        if self.retired_plays.len() > 64 {
+            self.retired_plays.clear();
+        }
+        self.pending.retain(|_, w| w.generation != generation);
+        self.config_state_waiters
+            .retain(|_, w| w.generation != generation);
+        self.config_validate_waiters
+            .retain(|_, w| w.generation != generation);
+        self.config_apply_waiters
+            .retain(|_, w| w.generation != generation);
+        let stale_vol: Vec<String> = self
+            .volume_pending_gen
+            .iter()
+            .filter(|(_, &g)| g == generation)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in stale_vol {
+            self.volume_pending.remove(&k);
+            self.volume_pending_gen.remove(&k);
+        }
+        let stale_wifi: Vec<String> = self
+            .pending_wifi_gen
+            .iter()
+            .filter(|(_, &g)| g == generation)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in stale_wifi {
+            self.pending_wifi.remove(&k);
+            self.pending_wifi_gen.remove(&k);
+        }
+        self.active_plays.retain(|_, p| p.generation != generation);
+    }
 }
 
 /// Record a device-reported volume. The receipt is the truth (a requested
@@ -181,9 +310,10 @@ impl HubState {
 /// success (R2-BM6 audit — a failed receipt used to update `volume` anyway,
 /// which the management tool could then render as 「已调到」).
 /// Old v0.2 frames carry no device field: a `vol:boot:`/`vol:dev:` receipt is
-/// attributed only when the hub knows exactly one device; an API task is
-/// attributed through `volume_pending`. Returns the device when attribution
-/// succeeded AND the stage confirmed it.
+/// attributed when the owning connection (or the hub) knows exactly one device;
+/// an API task is attributed through `volume_pending`. Returns the device when
+/// attribution succeeded AND the stage confirmed it.
+#[cfg(test)]
 fn record_volume(
     st: &mut HubState,
     task_id: &str,
@@ -192,36 +322,80 @@ fn record_volume(
     frame_seq: u64,
     hint: Option<&str>,
 ) -> Option<String> {
+    record_volume_on(st, None, task_id, effective, stage, frame_seq, hint)
+}
+
+fn record_volume_on(
+    st: &mut HubState,
+    generation: Option<u64>,
+    task_id: &str,
+    effective: f64,
+    stage: &str,
+    frame_seq: u64,
+    hint: Option<&str>,
+) -> Option<String> {
+    if let Some(gen_id) = generation {
+        if !st.conn_is_live(gen_id) {
+            return None;
+        }
+    }
+    let pending_matches = match (generation, st.volume_pending_gen.get(task_id)) {
+        (Some(gen_id), Some(&owner_gen)) => owner_gen == gen_id,
+        _ => true,
+    };
     let terminal = matches!(stage, "failed" | "unknown");
     if !effective.is_finite() || !(0.0..=1.0).contains(&effective) {
-        // A terminal OR malformed receipt ends the attempt; keeping the
-        // pending entry would leave a stale attribution for the next frame.
-        st.volume_pending.remove(task_id);
-        return None;
-    }
-    if stage != "device_confirmed" {
-        if terminal {
+        if pending_matches {
             st.volume_pending.remove(task_id);
+            st.volume_pending_gen.remove(task_id);
         }
         return None;
     }
-    // R2 maintenance (2026-11-13): a receipt that NAMES its device is
-    // self-attributing — that is what makes two devices' physical volume keys
-    // each update their own snapshot. The hint is only honoured for a device
-    // this link knows; a bogus name must not create a phantom entry.
+    if stage != "device_confirmed" {
+        if terminal && pending_matches {
+            st.volume_pending.remove(task_id);
+            st.volume_pending_gen.remove(task_id);
+        }
+        return None;
+    }
     let hinted = hint
-        .filter(|d| st.devices.contains_key(*d))
+        .filter(|d| {
+            st.devices.contains_key(*d)
+                && generation.is_none_or(|gen_id| !st.device_frame_stale(gen_id, d))
+        })
         .map(str::to_string);
     let device = hinted
-        .or_else(|| st.volume_pending.remove(task_id))
+        .or_else(|| {
+            if !pending_matches {
+                return None;
+            }
+            st.volume_pending_gen.remove(task_id);
+            st.volume_pending.remove(task_id)
+        })
         .or_else(|| {
             let device_fact = task_id.starts_with("vol:boot:") || task_id.starts_with("vol:dev:");
-            if device_fact && st.devices.len() == 1 {
+            if !device_fact {
+                return None;
+            }
+            if let Some(gen_id) = generation {
+                if let Some(conn) = st.connections.get(&gen_id) {
+                    if conn.devices.len() == 1 {
+                        return conn.devices.iter().next().cloned();
+                    }
+                    return None;
+                }
+            }
+            if st.devices.len() == 1 {
                 st.devices.keys().next().cloned()
             } else {
                 None
             }
         })?;
+    if let Some(gen_id) = generation {
+        if st.device_frame_stale(gen_id, &device) {
+            return None;
+        }
+    }
     if let Some(slot) = st.devices.get_mut(&device) {
         slot.volume = Some(effective);
         slot.volume_at_ms = Some(id::now_ms());
@@ -275,8 +449,10 @@ pub struct DeviceHub {
     /// Lossless fallback buffer for critical control events (`Wake`, `Keyword`,
     /// `LocalExitFlushed`, `Button`, `PlayFinished`) when `pump_control_events` lags.
     critical_events: Mutex<VecDeque<QueuedDeviceEvent>>,
-    /// Bounded two-tier outbound frame channel of the live connection (latest wins).
-    outbound: Mutex<Option<outbound::OutboundSender>>,
+    /// Household Bearer token store for authenticating non-loopback LAN gateways (#271).
+    auth: Mutex<Option<Arc<crate::auth::AuthStore>>>,
+    /// True when the gateway listener is bound to a non-loopback interface.
+    voice_gateway_open: std::sync::atomic::AtomicBool,
     pub bind_addr: Mutex<String>,
     /// Media-channel output trim in dB (0 = off). Applied to the WAV payload
     /// of every media play at submit time; voice plays are never trimmed.
@@ -294,7 +470,8 @@ impl DeviceHub {
             transport_tasks: Default::default(),
             state: Mutex::new(HubState {
                 generation: 0,
-                connection_retirement: None,
+                connections: HashMap::new(),
+                device_to_conn: HashMap::new(),
                 connected_gateway: None,
                 connected_gateway_version: None,
                 protocol_operating: None,
@@ -302,10 +479,12 @@ impl DeviceHub {
                 devices: HashMap::new(),
                 pending: HashMap::new(),
                 pending_wifi: HashMap::new(),
+                pending_wifi_gen: HashMap::new(),
                 config_state_waiters: HashMap::new(),
                 config_validate_waiters: HashMap::new(),
                 config_apply_waiters: HashMap::new(),
                 volume_pending: HashMap::new(),
+                volume_pending_gen: HashMap::new(),
                 frame_seq: 0,
                 active_plays: HashMap::new(),
                 stop_waiters: HashMap::new(),
@@ -319,27 +498,78 @@ impl DeviceHub {
             pump_audio_events: pump_audio_tx,
             pump_seq: std::sync::atomic::AtomicU64::new(0),
             critical_events: Mutex::new(VecDeque::new()),
-            outbound: Mutex::new(None),
+            auth: Mutex::new(None),
+            voice_gateway_open: std::sync::atomic::AtomicBool::new(false),
             bind_addr: Mutex::new(String::new()),
             media_trim_db: Mutex::new(crate::voice::default_media_trim_db()),
         })
+    }
+
+    pub fn attach_auth(&self, auth: Arc<crate::auth::AuthStore>) {
+        *crate::lock_or_recover(&self.auth, "hub.auth") = Some(auth);
+    }
+
+    fn auth_store(&self) -> Option<Arc<crate::auth::AuthStore>> {
+        crate::lock_or_recover(&self.auth, "hub.auth").clone()
+    }
+
+    pub fn set_voice_gateway_open(&self, open: bool) {
+        self.voice_gateway_open
+            .store(open, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn voice_gateway_open(&self) -> bool {
+        self.voice_gateway_open
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn attach_test_outbound(&self, generation: u64, tx: outbound::OutboundSender) {
+        let mut st = self.lock_state();
+        if st.generation < generation {
+            st.generation = generation;
+        }
+        st.connections.insert(
+            generation,
+            ConnSlot {
+                gateway: "test-gw".into(),
+                gateway_version: None,
+                protocol_operating: crate::DEVICE_PROTOCOL_VERSION,
+                peer_addr: None,
+                authenticated: true,
+                devices: std::collections::HashSet::new(),
+                outbound: tx,
+                retirement: None,
+            },
+        );
+        st.refresh_summary_fields();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn detach_test_outbounds(&self) {
+        let mut st = self.lock_state();
+        st.connections.clear();
+        st.device_to_conn.clear();
+        st.refresh_summary_fields();
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, HubState> {
         crate::lock_or_recover(&self.state, "hub.state")
     }
 
-    /// Accept loop. One gateway connection at a time is the v0 shape (a new
-    /// connection supersedes the previous one and bumps the generation).
+    /// Accept loop (#271: concurrent multi-gateway connections). Each incoming
+    /// gateway connection runs independently; supersession is strictly
+    /// per-device so a phone/display gateway never disconnects a local speaker.
     pub async fn listen(self: &Arc<Self>, addr: std::net::SocketAddr) -> std::io::Result<()> {
         let listener = TcpListener::bind(addr).await?;
         *crate::lock_or_recover(&self.bind_addr, "hub.bind_addr") = addr.to_string();
-        tracing::info!(%addr, "gateway listener up");
+        self.set_voice_gateway_open(!addr.ip().is_loopback());
+        tracing::info!(%addr, voice_gateway_open = !addr.ip().is_loopback(), "gateway listener up");
         loop {
             let (stream, peer) = listener.accept().await?;
             let hub = self.clone();
             tokio::spawn(async move {
-                if let Err(e) = hub.serve_connection(stream).await {
+                if let Err(e) = hub.serve_connection_with_peer(stream, Some(peer)).await {
                     tracing::warn!(%peer, error = %e, "gateway connection ended with error");
                 }
             });
@@ -464,9 +694,51 @@ impl DeviceHub {
         .join();
     }
 
+    #[cfg(test)]
     pub(crate) async fn serve_connection(
         self: Arc<Self>,
         stream: TcpStream,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let peer_addr = stream.peer_addr().ok();
+        self.serve_connection_with_peer(stream, peer_addr).await
+    }
+
+    /// Public connection entry that allows integration tests to exercise
+    /// non-loopback peer authentication deterministically over loopback TCP.
+    pub async fn serve_connection_from(
+        self: Arc<Self>,
+        stream: TcpStream,
+        peer_addr: Option<std::net::SocketAddr>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.serve_connection_with_peer(stream, peer_addr).await
+    }
+
+    async fn send_hello_reject(
+        wr: &mut tokio::net::tcp::OwnedWriteHalf,
+        reason: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let reject = CoreFrame::HelloReject {
+            protocol: crate::DEVICE_PROTOCOL_VERSION,
+            min_protocol: crate::DEVICE_PROTOCOL_MIN_VERSION,
+            core_version: crate::CORE_VERSION.to_string(),
+            reason: reason.to_string(),
+        };
+        let line = serde_json::to_string(&reject)?;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(REJECT_WRITE_TIMEOUT_MS),
+            async {
+                let _ = wr.write_all(line.as_bytes()).await;
+                let _ = wr.write_all(b"\n").await;
+            },
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn serve_connection_with_peer(
+        self: Arc<Self>,
+        stream: TcpStream,
+        peer_addr: Option<std::net::SocketAddr>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let _connection_task =
             transport_metrics::LiveTask::enter(&self.transport_tasks.connections);
@@ -489,6 +761,7 @@ impl DeviceHub {
         let gateway_version: Option<String>;
         let operating: u32;
         let announced: Vec<HelloDevice>;
+        let hello_auth_token: Option<String>;
         let hello_aec_tail_ms: Option<u32>;
         let hello_aec_enabled: Option<bool>;
         let hello_aec_tail_samples: Option<u32>;
@@ -507,6 +780,7 @@ impl DeviceHub {
                 devices,
                 aec_tail_ms,
                 profile_version,
+                auth_token,
             } => {
                 let mine = (
                     crate::DEVICE_PROTOCOL_MIN_VERSION,
@@ -519,9 +793,6 @@ impl DeviceHub {
                     peer,
                     &supported_versions,
                 ) else {
-                    // v1 mechanism: say WHY before closing, over the handshake
-                    // socket itself (the writer task does not exist yet). A
-                    // bounded write — a stuck peer must not park this task.
                     let reason = protocol_no_intersection_reason(mine, peer);
                     {
                         let mut st = self.lock_state();
@@ -532,25 +803,9 @@ impl DeviceHub {
                         st.record("handshake_rejected", json!({ "reason": reason }));
                     }
                     tracing::warn!(%gateway, reason, "refused gateway hello");
-                    let reject = CoreFrame::HelloReject {
-                        protocol: crate::DEVICE_PROTOCOL_VERSION,
-                        min_protocol: crate::DEVICE_PROTOCOL_MIN_VERSION,
-                        core_version: crate::CORE_VERSION.to_string(),
-                        reason: reason.clone(),
-                    };
-                    let line = serde_json::to_string(&reject)?;
-                    let _ = tokio::time::timeout(
-                        std::time::Duration::from_millis(REJECT_WRITE_TIMEOUT_MS),
-                        async {
-                            let _ = wr.write_all(line.as_bytes()).await;
-                            let _ = wr.write_all(b"\n").await;
-                        },
-                    )
-                    .await;
+                    Self::send_hello_reject(&mut wr, &reason).await?;
                     return Err(format!("protocol rejected: {reason}").into());
                 };
-                // A gateway must announce DISTINCT ids ... (moved into the
-                // same reject path: the duplicate now also gets a reason).
                 if let Err(reason) = ensure_unique_device_ids(&devices) {
                     {
                         let mut st = self.lock_state();
@@ -559,27 +814,14 @@ impl DeviceHub {
                         st.record("handshake_rejected", json!({ "reason": reason }));
                     }
                     tracing::warn!(%gateway, reason, "refused gateway hello");
-                    let reject = CoreFrame::HelloReject {
-                        protocol: crate::DEVICE_PROTOCOL_VERSION,
-                        min_protocol: crate::DEVICE_PROTOCOL_MIN_VERSION,
-                        core_version: crate::CORE_VERSION.to_string(),
-                        reason: reason.clone(),
-                    };
-                    let line = serde_json::to_string(&reject)?;
-                    let _ = tokio::time::timeout(
-                        std::time::Duration::from_millis(REJECT_WRITE_TIMEOUT_MS),
-                        async {
-                            let _ = wr.write_all(line.as_bytes()).await;
-                            let _ = wr.write_all(b"\n").await;
-                        },
-                    )
-                    .await;
+                    Self::send_hello_reject(&mut wr, &reason).await?;
                     return Err(format!("protocol rejected: {reason}").into());
                 }
                 gateway_name = gateway;
                 gateway_version = (!version.is_empty()).then_some(version);
                 operating = v;
                 announced = devices;
+                hello_auth_token = auth_token;
                 hello_aec_tail_ms = aec_tail_ms.or_else(|| {
                     hello_extra
                         .pointer("/aec/tail_ms")
@@ -619,90 +861,268 @@ impl DeviceHub {
             f => return Err(format!("expected hello, got {f:?}").into()),
         }
 
-        // v1 mechanism: remember the negotiated link facts and clear the
-        // previous rejection — the link is healthy NOW; last_link_error only
-        // ever describes the handshake before this one.
-        {
-            let mut st = self.lock_state();
-            st.connected_gateway_version = gateway_version.clone();
-            st.protocol_operating = Some(operating);
-            st.last_link_error = None;
-        }
+        // #271: Authenticate non-loopback peers against the Core's household
+        // Bearer token store when paired. Loopback (127.0.0.1 / ::1) remains
+        // zero-config trusted for local speaker gateways. Never log auth_token.
+        let is_loopback = peer_addr.is_some_and(|a| a.ip().is_loopback());
+        let authenticated = if is_loopback {
+            true
+        } else if let Some(auth) = self.auth_store() {
+            if auth.configured() {
+                if let Some(peer_ip) = peer_addr.map(|a| a.ip()) {
+                    if auth.is_rate_limited(peer_ip).is_some() {
+                        {
+                            let mut st = self.lock_state();
+                            st.record(
+                                "handshake_rejected",
+                                json!({ "reason": "unauthorized", "rate_limited": true, "peer": peer_addr.map(|p| p.to_string()) }),
+                            );
+                        }
+                        tracing::warn!(%gateway_name, ?peer_addr, "rejected rate-limited LAN gateway hello");
+                        Self::send_hello_reject(&mut wr, "unauthorized").await?;
+                        return Err("unauthorized".into());
+                    }
+                }
+                let presented = hello_auth_token
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let lan_exempt_peer = presented.is_none()
+                    && auth.lan_gateway_exempt()
+                    && peer_addr.is_some_and(|a| crate::net::is_private_lan_ip(a.ip()));
+                if lan_exempt_peer {
+                    tracing::info!(
+                        %gateway_name,
+                        ?peer_addr,
+                        "accepted private-LAN gateway hello via lan_gateway_exempt"
+                    );
+                    false
+                } else {
+                    match presented.and_then(|tok| auth.verify(tok)) {
+                        Some(token_id) => {
+                            auth.touch(&token_id);
+                            if let Some(peer_ip) = peer_addr.map(|a| a.ip()) {
+                                auth.clear_auth_failures(peer_ip);
+                            }
+                            true
+                        }
+                        None => {
+                            if let Some(peer_ip) = peer_addr.map(|a| a.ip()) {
+                                auth.record_auth_failure(peer_ip);
+                            }
+                            {
+                                let mut st = self.lock_state();
+                                st.record(
+                                    "handshake_rejected",
+                                    json!({ "reason": "unauthorized", "peer": peer_addr.map(|p| p.to_string()) }),
+                                );
+                            }
+                            tracing::warn!(%gateway_name, ?peer_addr, "rejected unauthorized LAN gateway hello");
+                            Self::send_hello_reject(&mut wr, "unauthorized").await?;
+                            return Err("unauthorized".into());
+                        }
+                    }
+                }
+            } else if self.voice_gateway_open() {
+                // Unpaired dev/NAS Core with opt-in LAN listener open.
+                false
+            } else {
+                {
+                    let mut st = self.lock_state();
+                    st.record(
+                        "handshake_rejected",
+                        json!({ "reason": "unauthorized", "peer": peer_addr.map(|p| p.to_string()) }),
+                    );
+                }
+                tracing::warn!(%gateway_name, ?peer_addr, "rejected non-loopback gateway hello while LAN gateway closed");
+                Self::send_hello_reject(&mut wr, "unauthorized").await?;
+                return Err("unauthorized".into());
+            }
+        } else if self.voice_gateway_open() {
+            false
+        } else {
+            Self::send_hello_reject(&mut wr, "unauthorized").await?;
+            return Err("unauthorized".into());
+        };
 
         let (retirement_tx, retirement_rx) = oneshot::channel::<()>();
-        let (generation, superseded) = {
+        let admit = {
             let mut st = self.lock_state();
+            st.last_link_error = None;
             st.generation += 1;
             let gen = st.generation;
-            // Supersession actively wakes the old connection even while its
-            // writer is blocked in write_all and its reader remains open.
-            st.connection_retirement.replace(retirement_tx);
-            // These command maps belong to the replaced current connection;
-            // clear before any new-generation command can be submitted.
-            st.volume_pending.clear();
-            st.pending_wifi.clear();
-            st.config_state_waiters.clear();
-            st.config_validate_waiters.clear();
-            st.config_apply_waiters.clear();
-            let superseded = crate::lock_or_recover(&self.outbound, "hub.outbound")
-                .replace(tx.clone())
-                .is_some();
-            // Re-register announced devices on this generation.
-            for d in &announced {
-                let previous_northbound = st
-                    .devices
-                    .get(&d.stable_id)
-                    .and_then(|s| s.northbound.clone());
-                st.devices.insert(
-                    d.stable_id.clone(),
-                    DeviceSlot {
-                        descriptor: d.clone(),
-                        generation: gen,
-                        last_seq: 0,
-                        online: true,
-                        volume: None,
-                        volume_at_ms: None,
-                        volume_seq: 0,
-                        aec_enabled: hello_aec_enabled,
-                        aec_tail_ms: hello_aec_tail_ms,
-                        aec_tail_samples: hello_aec_tail_samples,
-                        aec_sample_rate: hello_aec_sample_rate,
-                        aec_provenance: hello_aec_provenance.clone(),
-                        profile_version: hello_profile_version.clone(),
-                        echo_health: None,
-                        echo_degraded_ms: None,
-                        echo_health_reason: None,
-                        northbound: previous_northbound,
-                        gateway_boot_id: None,
-                        state_revision: None,
-                        capability_fingerprint: None,
-                        config_blocks: HashMap::new(),
-                    },
-                );
+
+            // #271: Per-device supersession only. Retire a prior connection if
+            // it owned any overlapping device_id (same gateway/device
+            // reconnecting), while never touching sibling connections that own
+            // distinct device_ids.
+            let announced_ids: std::collections::HashSet<&str> =
+                announced.iter().map(|d| d.stable_id.as_str()).collect();
+            let mut to_retire: Vec<u64> = Vec::new();
+            let mut dropped_devices: Vec<String> = Vec::new();
+            let mut reserved_device: Option<String> = None;
+            if announced.is_empty() {
+                for (&old_gen, conn) in &st.connections {
+                    if conn.devices.is_empty() && conn.gateway == gateway_name {
+                        if HubState::conn_can_supersede(is_loopback, authenticated, conn) {
+                            to_retire.push(old_gen);
+                        }
+                    }
+                }
+            } else {
+                for d in &announced {
+                    if let Some(&old_gen) = st.device_to_conn.get(&d.stable_id) {
+                        if old_gen != gen {
+                            if let Some(old_conn) = st.connections.get(&old_gen) {
+                                if !HubState::conn_can_supersede(
+                                    is_loopback,
+                                    authenticated,
+                                    old_conn,
+                                ) {
+                                    reserved_device = Some(d.stable_id.clone());
+                                    break;
+                                }
+                            }
+                            if !to_retire.contains(&old_gen) {
+                                to_retire.push(old_gen);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(reserved_id) = reserved_device {
                 st.record(
-                    "device_joined",
+                    "handshake_rejected",
                     json!({
-                        "device": d.stable_id,
-                        "generation": gen,
-                        "aec_tail_ms": hello_aec_tail_ms,
-                        "profile_version": hello_profile_version,
+                        "reason": "device_id_reserved",
+                        "device": reserved_id,
+                        "peer": peer_addr.map(|p| p.to_string()),
                     }),
                 );
+                Err(reserved_id)
+            } else {
+                for &old_gen in &to_retire {
+                    if let Some(mut old_conn) = st.connections.remove(&old_gen) {
+                        // Explicitly drop the retirement sender so the old
+                        // connection wakes immediately even if blocked in write_all.
+                        drop(old_conn.retirement.take());
+                        for old_dev in old_conn.devices {
+                            if !announced_ids.contains(old_dev.as_str())
+                                && st.device_to_conn.get(&old_dev) == Some(&old_gen)
+                            {
+                                st.device_to_conn.remove(&old_dev);
+                                if let Some(slot) = st.devices.get_mut(&old_dev) {
+                                    if slot.generation == old_gen {
+                                        slot.online = false;
+                                    }
+                                }
+                                st.record(
+                                    "device_left",
+                                    json!({ "device": old_dev, "generation": old_gen }),
+                                );
+                                dropped_devices.push(old_dev);
+                            }
+                        }
+                    }
+                    st.cleanup_connection_resources(old_gen);
+                }
+
+                let mut owned_devices = std::collections::HashSet::new();
+                for d in &announced {
+                    owned_devices.insert(d.stable_id.clone());
+                    st.device_to_conn.insert(d.stable_id.clone(), gen);
+                    let previous_northbound = st
+                        .devices
+                        .get(&d.stable_id)
+                        .and_then(|s| s.northbound.clone());
+                    st.devices.insert(
+                        d.stable_id.clone(),
+                        DeviceSlot {
+                            descriptor: d.clone(),
+                            generation: gen,
+                            last_seq: 0,
+                            online: true,
+                            volume: None,
+                            volume_at_ms: None,
+                            volume_seq: 0,
+                            aec_enabled: hello_aec_enabled,
+                            aec_tail_ms: hello_aec_tail_ms,
+                            aec_tail_samples: hello_aec_tail_samples,
+                            aec_sample_rate: hello_aec_sample_rate,
+                            aec_provenance: hello_aec_provenance.clone(),
+                            profile_version: hello_profile_version.clone(),
+                            echo_health: None,
+                            echo_degraded_ms: None,
+                            echo_health_reason: None,
+                            northbound: previous_northbound,
+                            gateway_boot_id: None,
+                            state_revision: None,
+                            capability_fingerprint: None,
+                            config_blocks: HashMap::new(),
+                        },
+                    );
+                    st.record(
+                        "device_joined",
+                        json!({
+                            "device": d.stable_id,
+                            "generation": gen,
+                            "aec_tail_ms": hello_aec_tail_ms,
+                            "profile_version": hello_profile_version,
+                        }),
+                    );
+                }
+                st.connections.insert(
+                    gen,
+                    ConnSlot {
+                        gateway: gateway_name.clone(),
+                        gateway_version: gateway_version.clone(),
+                        protocol_operating: operating,
+                        peer_addr,
+                        authenticated,
+                        devices: owned_devices,
+                        outbound: tx.clone(),
+                        retirement: Some(retirement_tx),
+                    },
+                );
+                st.refresh_summary_fields();
+                let active_connections = st.connections.len();
+                st.record(
+                    "gateway_connected",
+                    json!({
+                        "gateway": gateway_name,
+                        "gateway_version": gateway_version,
+                        "protocol_operating": operating,
+                        "generation": gen,
+                        "peer": peer_addr.map(|p| p.to_string()),
+                        "authenticated": authenticated,
+                        "active_connections": active_connections,
+                    }),
+                );
+                Ok((gen, to_retire, dropped_devices))
             }
-            st.connected_gateway = Some(gateway_name.clone());
-            st.record(
-                "gateway_connected",
-                json!({
-                    "gateway": gateway_name,
-                    "gateway_version": gateway_version,
-                    "protocol_operating": operating,
-                    "generation": gen,
-                }),
-            );
-            (gen, superseded)
         };
-        if superseded {
-            tracing::warn!("new gateway connection supersedes a previous one");
+        let (generation, superseded_conns, dropped_devices) = match admit {
+            Ok(admitted) => admitted,
+            Err(reserved_id) => {
+                tracing::warn!(
+                    %gateway_name,
+                    ?peer_addr,
+                    device = %reserved_id,
+                    "rejected gateway hello attempting to hijack reserved device_id"
+                );
+                Self::send_hello_reject(&mut wr, "device_id_reserved").await?;
+                return Err("device_id_reserved".into());
+            }
+        };
+        if !superseded_conns.is_empty() {
+            tracing::warn!(
+                ?superseded_conns,
+                generation,
+                "gateway connection superseded prior connection(s) owning the same device"
+            );
+        }
+        for dev in dropped_devices {
+            self.emit_control(DeviceEvent::DeviceLeft { device: dev });
         }
         self.emit_control(DeviceEvent::GatewayConnected {
             gateway: gateway_name.clone(),
@@ -802,86 +1222,40 @@ impl DeviceHub {
     }
 
     fn retire_connection(&self, generation: u64) {
-        {
-            let mut st = self.lock_state();
-            let current = st.generation == generation;
-            if current {
-                st.connection_retirement = None;
-                st.connected_gateway = None;
-                st.connected_gateway_version = None;
-                st.protocol_operating = None;
-                let left: Vec<String> = st
-                    .devices
-                    .iter()
-                    .filter(|(_, d)| d.generation == generation)
-                    .map(|(id, _)| id.clone())
-                    .collect();
-                for id in &left {
-                    if let Some(dev) = st.devices.get_mut(id) {
-                        dev.online = false;
-                    }
-                    st.record("device_left", json!({ "device": id }));
-                    self.emit_control(DeviceEvent::DeviceLeft { device: id.clone() });
+        let mut st = self.lock_state();
+        let was_live = st.connections.remove(&generation).is_some();
+        // #271: Only mark offline and release devices still owned by THIS
+        // connection. Sibling connections and devices already handed off to a
+        // superseding connection remain untouched.
+        let left: Vec<String> = st
+            .device_to_conn
+            .iter()
+            .filter(|(_, &owner)| owner == generation)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &left {
+            st.device_to_conn.remove(id);
+            if let Some(dev) = st.devices.get_mut(id) {
+                if dev.generation == generation {
+                    dev.online = false;
                 }
-                *crate::lock_or_recover(&self.outbound, "hub.outbound") = None;
-                st.record("gateway_disconnected", json!({ "generation": generation }));
-            } else {
-                st.record(
-                    "gateway_connection_superseded_teardown",
-                    json!({ "generation": generation }),
-                );
             }
-            // M6a: remember which plays this generation owned BEFORE the
-            // retain drops them. A receipt for one of these that arrives on a
-            // later connection is stale evidence (the gateway clears its own
-            // audio state on link-down), and it must not settle a waiter or
-            // drive an event.
-            let retiring: Vec<String> = st
-                .active_plays
-                .iter()
-                .filter(|(_, p)| p.generation == generation)
-                .map(|(id, _)| id.clone())
-                .chain(
-                    st.pending
-                        .iter()
-                        .filter(|(_, w)| w.generation == generation)
-                        .map(|(id, _)| id.clone()),
-                )
-                .collect();
-            for id in retiring {
-                Self::resolve_stop_waiters(
-                    &mut st,
-                    &id,
-                    StopOutcome::unknown("connection_retired"),
-                );
-                st.stop_sent.remove(&id);
-                st.retired_plays.insert(id);
-            }
-            if st.retired_plays.len() > 64 {
-                st.retired_plays.clear();
-            }
-            st.pending.retain(|_, w| w.generation != generation);
-            st.config_state_waiters
-                .retain(|_, w| w.generation != generation);
-            st.config_validate_waiters
-                .retain(|_, w| w.generation != generation);
-            st.config_apply_waiters
-                .retain(|_, w| w.generation != generation);
-            if current {
-                st.volume_pending.clear();
-                st.pending_wifi.clear();
-            }
-            st.active_plays.retain(|_, p| p.generation != generation);
-            // R1j/P0-a: a dead link can never confirm a flush. Release the
-            // bounded waiters now instead of making every answer wait out
-            // its timeout.
-            if current {
-                st.stop_waiters.clear();
-                st.stop_sent.clear();
-            }
-            if current {
-                self.emit_control(DeviceEvent::GatewayDisconnected { generation });
-            }
+            st.record(
+                "device_left",
+                json!({ "device": id, "generation": generation }),
+            );
+            self.emit_control(DeviceEvent::DeviceLeft { device: id.clone() });
+        }
+        st.cleanup_connection_resources(generation);
+        st.refresh_summary_fields();
+        if was_live {
+            st.record("gateway_disconnected", json!({ "generation": generation }));
+            self.emit_control(DeviceEvent::GatewayDisconnected { generation });
+        } else {
+            st.record(
+                "gateway_connection_superseded_teardown",
+                json!({ "generation": generation }),
+            );
         }
     }
 
@@ -899,8 +1273,8 @@ impl DeviceHub {
             generation,
             inbound_seq: frame_seq,
         };
-        // Events from a superseded connection generation: record only.
-        let stale_generation = st.generation != generation;
+        // Events from a retired/superseded connection generation: record only.
+        let stale_generation = !st.conn_is_live(generation);
         match frame {
             GatewayFrame::Hello { .. } => {
                 st.record("late_hello", json!({ "generation": generation }));
@@ -939,7 +1313,7 @@ impl DeviceHub {
                     origin,
                     transport: Some(transport),
                 };
-                if stale_generation || !seq_fresh(&mut st, &device, seq) {
+                if st.device_frame_stale(generation, &device) || !seq_fresh(&mut st, &device, seq) {
                     st.record(
                         "stale_event",
                         json!({ "device": device, "seq": seq, "kind": "wake" }),
@@ -969,7 +1343,7 @@ impl DeviceHub {
                     origin,
                     transport: Some(transport),
                 };
-                if stale_generation || !seq_fresh(&mut st, &device, seq) {
+                if st.device_frame_stale(generation, &device) || !seq_fresh(&mut st, &device, seq) {
                     st.record(
                         "stale_event",
                         json!({ "device": device, "seq": seq, "kind": "utterance" }),
@@ -992,7 +1366,7 @@ impl DeviceHub {
                 seq,
                 action,
             } => {
-                if stale_generation || !seq_fresh(&mut st, &device, seq) {
+                if st.device_frame_stale(generation, &device) || !seq_fresh(&mut st, &device, seq) {
                     st.record(
                         "stale_event",
                         json!({ "device": device, "seq": seq, "kind": "button" }),
@@ -1018,7 +1392,7 @@ impl DeviceHub {
                 source,
                 task_id,
             } => {
-                if stale_generation || !seq_fresh(&mut st, &device, seq) {
+                if st.device_frame_stale(generation, &device) || !seq_fresh(&mut st, &device, seq) {
                     st.record(
                         "stale_event",
                         json!({ "device": device, "seq": seq, "kind": "mute_state" }),
@@ -1179,8 +1553,20 @@ impl DeviceHub {
                 stage,
                 device,
             } => {
-                let device = record_volume(
+                if stale_generation
+                    || device
+                        .as_deref()
+                        .is_some_and(|d| st.device_frame_stale(generation, d))
+                {
+                    st.record(
+                        "stale_event",
+                        json!({ "device": device, "play_id": play_id, "kind": "volume_receipt" }),
+                    );
+                    return;
+                }
+                let device = record_volume_on(
                     &mut st,
+                    Some(generation),
                     &play_id,
                     effective,
                     &stage,
@@ -1241,19 +1627,26 @@ impl DeviceHub {
                 });
             }
             f @ GatewayFrame::ConfigState { .. } => {
-                self.handle_config_state(&mut st, stale_generation, f);
+                self.handle_config_state(&mut st, generation, f);
             }
             f @ GatewayFrame::ConfigValidated { .. } => {
-                self.handle_config_validated(&mut st, stale_generation, f);
+                self.handle_config_validated(&mut st, generation, f);
             }
             f @ GatewayFrame::ConfigReceipt { .. } => {
-                self.handle_config_receipt(&mut st, stale_generation, f);
+                self.handle_config_receipt(&mut st, generation, f);
             }
             GatewayFrame::ModeReport {
                 device,
                 duplex,
                 aec,
             } => {
+                if st.device_frame_stale(generation, &device) {
+                    st.record(
+                        "stale_event",
+                        json!({ "device": device, "kind": "mode_report" }),
+                    );
+                    return;
+                }
                 st.record(
                     "mode_report",
                     json!({ "device": device, "duplex": duplex, "aec": aec }),
@@ -1272,6 +1665,13 @@ impl DeviceHub {
                 state,
                 detail,
             } => {
+                if st.device_frame_stale(generation, &device) {
+                    st.record(
+                        "stale_event",
+                        json!({ "device": device, "kind": "wifi_state" }),
+                    );
+                    return;
+                }
                 // handle_frame runs under the hub state lock — reuse the
                 // `st` guard; re-locking here deadlocks the same thread
                 // (std Mutex is not reentrant; caught by wifi_wedge_repro).
@@ -1282,9 +1682,16 @@ impl DeviceHub {
                     state,
                     detail,
                 };
-                let waiter = st.pending_wifi.remove(ev_device(&ev));
-                if let Some(tx) = waiter {
-                    let _ = tx.send(ev.clone());
+                let dev_key = ev_device(&ev).to_string();
+                let waiter_matches = st
+                    .pending_wifi_gen
+                    .get(&dev_key)
+                    .is_none_or(|&owner| owner == generation);
+                if waiter_matches {
+                    st.pending_wifi_gen.remove(&dev_key);
+                    if let Some(tx) = st.pending_wifi.remove(&dev_key) {
+                        let _ = tx.send(ev.clone());
+                    }
                 }
                 self.emit_control(ev);
             }
@@ -1361,7 +1768,7 @@ impl DeviceHub {
                 // Steady-cadence frames (dot2-d ≈ 12.5/s): seq-check yes, ring
                 // NO — recording every chunk would flush the diagnostic ring
                 // in seconds. Loss shows up as a seq gap recorded here.
-                if stale_generation {
+                if st.device_frame_stale(generation, &device) {
                     st.record(
                         "stale_event",
                         json!({ "device": device, "seq": seq, "kind": "audio_chunk" }),
@@ -1457,7 +1864,7 @@ impl DeviceHub {
                 channels,
                 detail,
             } => {
-                if stale_generation {
+                if st.device_frame_stale(generation, &device) {
                     st.record(
                         "stale_event",
                         json!({ "device": device, "kind": "mic_report" }),
@@ -1485,13 +1892,62 @@ impl DeviceHub {
                     );
                     return;
                 }
-                // v0.2 online governance: upsert the slot (introducing via
-                // descriptor when present), flip `online`, and surface a
-                // DeviceStatus event. The gateway connection itself is NOT
-                // touched — a southbound device drop is device state.
-                let generation = st.generation;
+                // v0.2 online governance + #271 multi-gateway ownership:
+                // use THIS connection's `generation` (never global `st.generation`).
                 match descriptor {
                     Some(desc) if desc.stable_id == device => {
+                        if let Some(&old_gen) = st.device_to_conn.get(&device) {
+                            if old_gen != generation {
+                                // Only a live re-registration (`online == true`)
+                                // may take ownership from a different live
+                                // connection; a non-owner reporting `online == false`
+                                // is rejected as stale.
+                                if !online {
+                                    st.record(
+                                        "stale_event",
+                                        json!({ "device": device, "kind": "device_status_non_owner_offline" }),
+                                    );
+                                    return;
+                                }
+                                let (new_loopback, new_auth) = st
+                                    .connections
+                                    .get(&generation)
+                                    .map(|c| (HubState::conn_is_loopback(c), c.authenticated))
+                                    .unwrap_or((false, false));
+                                if let Some(old_conn) = st.connections.get(&old_gen) {
+                                    if !HubState::conn_can_supersede(
+                                        new_loopback,
+                                        new_auth,
+                                        old_conn,
+                                    ) {
+                                        st.record(
+                                            "stale_event",
+                                            json!({ "device": device, "kind": "device_status_reserved" }),
+                                        );
+                                        return;
+                                    }
+                                }
+                                let retire_old = st
+                                    .connections
+                                    .get_mut(&old_gen)
+                                    .map(|old_conn| {
+                                        old_conn.devices.remove(&device);
+                                        old_conn.devices.is_empty()
+                                    })
+                                    .unwrap_or(false);
+                                if retire_old {
+                                    if let Some(mut old_conn) = st.connections.remove(&old_gen) {
+                                        drop(old_conn.retirement.take());
+                                    }
+                                    st.cleanup_connection_resources(old_gen);
+                                    st.refresh_summary_fields();
+                                }
+                            }
+                        }
+                        if let Some(conn) = st.connections.get_mut(&generation) {
+                            conn.devices.insert(device.clone());
+                            st.device_to_conn.insert(device.clone(), generation);
+                        }
                         let slot = st.devices.entry(device.clone()).or_insert(DeviceSlot {
                             descriptor: desc.clone(),
                             generation,
@@ -1515,13 +1971,6 @@ impl DeviceHub {
                             capability_fingerprint: None,
                             config_blocks: HashMap::new(),
                         });
-                        // A descriptor arriving on a NEWER connection than
-                        // the slot's starts a fresh seq epoch: gateways that
-                        // re-introduce via device_status (adapter restarts,
-                        // the on-device form announces an empty hello) begin
-                        // their seq space at 0 — keeping the old watermark
-                        // would drop every frame as stale (caught live on
-                        // the speaker-resident adapter, 2026-11-08).
                         if slot.generation != generation {
                             slot.generation = generation;
                             slot.last_seq = 0;
@@ -1596,7 +2045,7 @@ impl DeviceHub {
                     origin,
                     transport: Some(transport),
                 };
-                if stale_generation {
+                if st.device_frame_stale(generation, &device) {
                     st.record(
                         "stale_event",
                         json!({ "device": device, "kind": "keyword" }),
@@ -1669,7 +2118,7 @@ impl DeviceHub {
                 threshold,
                 score,
             } => {
-                if stale_generation {
+                if st.device_frame_stale(generation, &device) {
                     st.record(
                         "stale_event",
                         json!({ "device": device, "kind": "kws_report" }),
@@ -1715,6 +2164,13 @@ impl DeviceHub {
                 threshold,
                 score,
             } => {
+                if st.device_frame_stale(generation, &device) {
+                    st.record(
+                        "stale_event",
+                        json!({ "device": device, "kind": "kws_deploy_receipt" }),
+                    );
+                    return;
+                }
                 st.record(
                     "kws_deploy_receipt",
                     json!({ "device": device, "accepted": accepted, "hash": hash,
@@ -1745,7 +2201,7 @@ impl DeviceHub {
                 channels,
                 detail,
             } => {
-                if stale_generation {
+                if st.device_frame_stale(generation, &device) {
                     st.record(
                         "stale_event",
                         json!({ "device": device, "kind": "local_exit_flushed" }),
@@ -1779,7 +2235,7 @@ impl DeviceHub {
                 ahead_ms,
                 ts,
             } => {
-                if stale_generation {
+                if st.device_frame_stale(generation, &device) {
                     st.record(
                         "stale_event",
                         json!({ "device": device, "kind": "stopped_locally" }),
@@ -1819,7 +2275,7 @@ impl DeviceHub {
                 residual_db,
                 ref_locked,
             } => {
-                if stale_generation {
+                if st.device_frame_stale(generation, &device) {
                     st.record(
                         "stale_event",
                         json!({ "device": device, "kind": "barge_in" }),
@@ -1880,7 +2336,7 @@ impl DeviceHub {
                 degraded_ms,
                 reason,
             } => {
-                if stale_generation {
+                if st.device_frame_stale(generation, &device) {
                     return;
                 }
                 let health_norm = if health.trim().is_empty() {
@@ -1927,7 +2383,7 @@ impl DeviceHub {
                 echo_health,
                 profile_version,
             } => {
-                if stale_generation {
+                if st.device_frame_stale(generation, &device) {
                     return;
                 }
                 let echo_health = echo_health.filter(|s| !s.trim().is_empty());
@@ -2034,7 +2490,7 @@ mod phase5_tests {
     fn real_wav_playback_streams_play_begin_chunk_end_and_never_whole_wav_play() {
         let hub = DeviceHub::new();
         let (tx, mut rx) = outbound::outbound_channel();
-        *crate::lock_or_recover(&hub.outbound, "hub.outbound") = Some(tx);
+        hub.attach_test_outbound(1, tx);
 
         // Build a valid 16kHz mono WAV with 20,000 bytes of PCM (>1 chunk).
         let pcm = vec![0x2Au8; 20_000];
@@ -2099,7 +2555,7 @@ mod phase5_tests {
     fn led_config_frame_serializes_and_sends_via_hub() {
         let hub = DeviceHub::new();
         let (tx, mut rx) = outbound::outbound_channel();
-        *crate::lock_or_recover(&hub.outbound, "hub.outbound") = Some(tx);
+        hub.attach_test_outbound(1, tx);
 
         hub.send_led_config("dot2-d", true, 1320, 420, 25, 3, true)
             .unwrap();

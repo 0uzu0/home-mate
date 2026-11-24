@@ -62,9 +62,6 @@ pub struct AppState {
     pub openapi: Arc<crate::tool::openapi::OpenApiRuntime>,
     /// #22 Declarative Open Socket Registry: dynamic HTTP tool contracts.
     pub open_sockets: Arc<crate::tool::open_socket::OpenSocketRuntime>,
-    /// #21 Remote Computer Socket Client: calls an external process/HTTP
-    /// service implementing the Home Mate tool contract (no local shell).
-    pub remote_socket: Arc<crate::tool::remote_socket::RemoteSocketRuntime>,
     /// General web information search (M2.5): registered, unconfigured until
     /// a household stores an endpoint and a key — zero HTTP before that.
     pub search: Arc<crate::tool::search::SearchRuntime>,
@@ -72,6 +69,8 @@ pub struct AppState {
     pub personal_media: crate::tool::personal_media::PersonalMediaRuntime,
     /// Phase C: NAS `learning-svc` (#119-#123) runtime.
     pub learning: crate::tool::learning::LearningRuntime,
+    /// #267: provider-agnostic Master Brain async delegation runtime.
+    pub master_brain: Arc<crate::tool::master_brain::MasterBrainRuntime>,
     /// R2-BM6: `system.volume` / `system.duplex` reach the same pipeline the
     /// console's volume/mode endpoints use.
     pub management: Arc<crate::tool::management::ManagementRuntime>,
@@ -199,6 +198,7 @@ impl AppState {
         let tasks = Arc::new(TaskRegistry::new(store.clone()));
         let traces = Arc::new(TraceRecorder::new(store.clone()));
         let hub = crate::gateway::DeviceHub::new();
+        hub.attach_auth(auth.clone());
 
         // Music (R1e): a real, user-configured service. Its events join the
         // voice event ring below, so the console and the acceptance tools see
@@ -211,9 +211,9 @@ impl AppState {
             crate::tool::personal_media::PersonalMediaRuntime::new(store.clone(), hub.clone())
                 .with_music(music.clone());
         let learning = crate::tool::learning::LearningRuntime::new(store.clone());
+        let master_brain = crate::tool::master_brain::MasterBrainRuntime::new(store.clone());
         let openapi = crate::tool::openapi::OpenApiRuntime::new(store.clone());
         let open_sockets = crate::tool::open_socket::OpenSocketRuntime::new(store.clone());
-        let remote_socket = crate::tool::remote_socket::RemoteSocketRuntime::new(store.clone());
         let search = crate::tool::search::SearchRuntime::new(store.clone());
         // R2-BM6: management tools share the live VoicePipeline; the Weak
         // handle is attached right after `voice.start()`.
@@ -330,10 +330,22 @@ impl AppState {
             learning.clone(),
         )))
         .expect("valid unique tool registration");
-        reg.add_provider(Arc::new(crate::tool::remote_socket::RemoteSocketProvider(
-            remote_socket.clone(),
+        reg.register(Arc::new(crate::tool::master_brain::BrainDelegateTool::new(
+            master_brain.clone(),
         )))
-        .expect("valid unique remote socket registration");
+        .expect("valid unique tool registration");
+        reg.register(Arc::new(crate::tool::master_brain::BrainStatusTool::new(
+            master_brain.clone(),
+        )))
+        .expect("valid unique tool registration");
+        reg.register(Arc::new(crate::tool::master_brain::BrainSteerTool::new(
+            master_brain.clone(),
+        )))
+        .expect("valid unique tool registration");
+        reg.register(Arc::new(crate::tool::master_brain::BrainCancelTool::new(
+            master_brain.clone(),
+        )))
+        .expect("valid unique tool registration");
         if let Err(error) = reg.attach_provider_for_repair(open_sockets.clone()) {
             tracing::error!(%error, "persisted tool catalog invalid; management repair remains available");
         }
@@ -409,6 +421,7 @@ impl AppState {
         // R2-BM6: now that the pipeline exists, let the management tools reach
         // it. Same methods as the console: no second implementation.
         management.attach_voice(&voice);
+        master_brain.attach_voice(&voice);
         // M3: the two runtimes point at each other (weak). The resolver needs
         // the program bookmarks; the wake path needs to PAUSE media instead of
         // discarding it.
@@ -468,6 +481,7 @@ impl AppState {
             config,
             personal_media,
             learning,
+            master_brain,
             registry,
             hub,
             voice,
@@ -477,7 +491,6 @@ impl AppState {
             news,
             openapi,
             open_sockets,
-            remote_socket,
             search,
             management,
             memory: memory.clone(),
@@ -546,6 +559,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v0/auth", get(auth_status))
         .route("/api/v0/auth/provision", post(auth_provision))
         .route("/api/v0/auth/rotate", post(auth_rotate))
+        .route("/api/v0/auth/lan-exempt", put(auth_lan_exempt_put))
         .route("/api/v0/chat", post(chat))
         .route("/api/v0/session/cancel", post(cancel))
         .route("/api/v0/session/{id}/messages", get(session_messages))
@@ -623,6 +637,22 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(config_learning_test),
         )
         .route(
+            "/api/v0/config/services/master_brain",
+            get(config_master_brain_get).put(config_master_brain_put),
+        )
+        .route(
+            "/api/v0/config/services/master_brain/test",
+            post(config_master_brain_test),
+        )
+        .route(
+            "/api/v0/config/master-brain",
+            get(config_master_brain_get).put(config_master_brain_put),
+        )
+        .route(
+            "/api/v0/config/master-brain/test",
+            post(config_master_brain_test),
+        )
+        .route(
             "/api/v0/config/services/search",
             get(config_search_get).put(config_search_put),
         )
@@ -651,18 +681,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v0/config/sockets/{name}",
             put(config_sockets_put).delete(config_sockets_delete),
-        )
-        .route(
-            "/api/v0/config/services/remote_socket",
-            get(config_remote_socket_get).put(config_remote_socket_put),
-        )
-        .route(
-            "/api/v0/config/services/remote_socket/test",
-            post(config_remote_socket_test),
-        )
-        .route(
-            "/api/v0/config/services/remote_socket/discover",
-            post(config_remote_socket_discover),
         )
         .route("/api/v0/reminders", get(reminders_get).post(reminders_add))
         .route("/api/v0/reminders/{id}", delete(reminder_delete))
@@ -782,6 +800,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v0/mode/{device}", put(mode_put))
         .route("/api/v0/voice/log", get(voice_log))
         .route("/api/v0/voice/events", get(voice_events))
+        .route(
+            "/api/v0/voice/announce",
+            get(voice_announce_get).post(voice_announce_post),
+        )
         .route("/api/v0/diagnostics", get(diagnostics_get))
         .route(
             "/api/v0/diagnostics/self_check",
@@ -991,6 +1013,17 @@ async fn require_bearer(
             return too_many_requests(retry_after);
         }
     }
+    if !req
+        .headers()
+        .contains_key(axum::http::header::AUTHORIZATION)
+        && state.auth.lan_gateway_exempt()
+        && peer
+            .map(|p| crate::net::is_private_lan_ip(p.ip()))
+            .unwrap_or(false)
+        && is_lan_exempt_everyday_route(req.method(), &path)
+    {
+        return next.run(req).await;
+    }
     match crate::auth::verify_in(&entries, presented) {
         Some(id) => {
             if let Some(ip) = peer.map(|p| p.ip()) {
@@ -1034,6 +1067,51 @@ fn is_legacy_loopback_release_route(method: &axum::http::Method, path: &str) -> 
     )
 }
 
+/// Option 1A (`lan_gateway_exempt`) strict allowlist of everyday household
+/// read/chat/media/mode endpoints for private-LAN / Tailscale peers (#274).
+///
+/// Fail-closed by construction: all high-risk admin/security/OTA/firmware/
+/// vault/config/credential/system/reflex/Wi-Fi routes are excluded and ALWAYS
+/// require an admin Bearer token even when `lan_gateway_exempt = true`.
+pub(crate) fn is_lan_exempt_everyday_route(method: &axum::http::Method, path: &str) -> bool {
+    let clean_seg = |s: &str| !s.is_empty() && s != "." && s != ".." && !s.contains('/');
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    match (method.as_str(), segs.as_slice()) {
+        // Everyday read endpoints
+        (
+            "GET",
+            ["api", "v0", "status"]
+            | ["api", "v0", "mode"]
+            | ["api", "v0", "devices"]
+            | ["api", "v0", "device-meta"]
+            | ["api", "v0", "fleet"]
+            | ["api", "v0", "tasks"]
+            | ["api", "v0", "reminders"]
+            | ["api", "v0", "memories"]
+            | ["api", "v0", "voice", "log"]
+            | ["api", "v0", "voice", "events"],
+        ) => true,
+        ("GET", ["api", "v0", "devices", id, "conversation"]) if clean_seg(id) => true,
+        ("GET", ["api", "v0", "session", id, "messages"]) if clean_seg(id) => true,
+        // Everyday chat, voice session, playback & volume controls
+        (
+            "POST",
+            ["api", "v0", "chat"]
+            | ["api", "v0", "session", "cancel"]
+            | ["api", "v0", "session", "close"]
+            | ["api", "v0", "voice", "announce"],
+        ) => true,
+        ("POST", ["api", "v0", "devices", id, "stop" | "volume"]) if clean_seg(id) => true,
+        ("POST", ["api", "v0", "devices", id, "program", "pause" | "resume"]) if clean_seg(id) => {
+            true
+        }
+        // Everyday mode & mute toggles
+        ("PUT", ["api", "v0", "mode", dev]) if clean_seg(dev) => true,
+        ("PUT", ["api", "v0", "devices", id, "mute"]) if clean_seg(id) => true,
+        _ => false,
+    }
+}
+
 // --- M9: auth endpoints (bootstrap + rotation) --------------------------------
 
 /// Open: the console needs to know whether this device was ever paired before
@@ -1057,10 +1135,16 @@ async fn auth_status(
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::trim)
         .unwrap_or("");
+    let core_id = state.auth.core_id();
+    let lan_gateway_exempt = state.auth.lan_gateway_exempt();
+    let voice_gateway_open = state.hub.voice_gateway_open();
     match state.auth.entries() {
         Ok(None) => Json(json!({
             "configured": false,
             "corrupt": false,
+            "core_id": core_id,
+            "lan_gateway_exempt": lan_gateway_exempt,
+            "voice_gateway_open": voice_gateway_open,
             "tokens": [],
             "loopback_trusted": true,
         }))
@@ -1075,6 +1159,9 @@ async fn auth_status(
                 return Json(json!({
                     "configured": true,
                     "corrupt": false,
+                    "core_id": core_id,
+                    "lan_gateway_exempt": lan_gateway_exempt,
+                    "voice_gateway_open": voice_gateway_open,
                 }))
                 .into_response();
             }
@@ -1095,6 +1182,9 @@ async fn auth_status(
                     Json(json!({
                         "configured": true,
                         "corrupt": false,
+                        "core_id": core_id,
+                        "lan_gateway_exempt": lan_gateway_exempt,
+                        "voice_gateway_open": voice_gateway_open,
                     }))
                     .into_response()
                 }
@@ -1106,6 +1196,9 @@ async fn auth_status(
                     Json(json!({
                         "configured": true,
                         "corrupt": false,
+                        "core_id": core_id,
+                        "lan_gateway_exempt": lan_gateway_exempt,
+                        "voice_gateway_open": voice_gateway_open,
                         "tokens": list.iter().map(|e| json!({
                             "id": e.id,
                             "label": e.label,
@@ -1121,6 +1214,9 @@ async fn auth_status(
         Err(_) => Json(json!({
             "configured": true,
             "corrupt": true,
+            "core_id": core_id,
+            "lan_gateway_exempt": lan_gateway_exempt,
+            "voice_gateway_open": voice_gateway_open,
         }))
         .into_response(),
     }
@@ -1147,6 +1243,45 @@ async fn auth_provision(
                 "detail": "use POST /api/v0/auth/rotate with the current token",
             })),
         )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct LanExemptBody {
+    lan_gateway_exempt: bool,
+}
+
+/// Authenticated (strict admin Bearer token required even when LAN exemption is
+/// enabled): toggle Option 1A private-LAN exemption for `:8932` voice gateway
+/// and everyday `:8930` read/chat/media/mode APIs.
+async fn auth_lan_exempt_put(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<LanExemptBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match state.auth.set_lan_gateway_exempt(body.lan_gateway_exempt) {
+        Ok(applied) => {
+            let summary = format!("lan_gateway_exempt -> {applied}");
+            let payload = json!({ "lan_gateway_exempt": applied }).to_string();
+            let _ = state.store.with(|c| {
+                c.execute(
+                    "INSERT INTO config_history (ts_ms, actor, scope, summary, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![crate::id::now_ms() as i64, "console", "auth", summary, payload],
+                )?;
+                Ok(())
+            });
+            tracing::info!(
+                lan_gateway_exempt = applied,
+                "auth: updated Option 1A private-LAN exemption"
+            );
+            Ok(Json(json!({
+                "lan_gateway_exempt": applied,
+                "core_id": state.auth.core_id(),
+            })))
+        }
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e.to_string() })),

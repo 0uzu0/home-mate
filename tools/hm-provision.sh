@@ -100,13 +100,7 @@ done
 [ -n "$SERIAL" ] || { echo "hm-provision: --serial is required (emOS has no adbd; the USB console is the only channel)" >&2; exit 2; }
 
 HERE=$(cd "$(dirname "$0")/.." && pwd)
-if [ -f "$HERE/tools/serial_cmd.py" ]; then
-    SERIAL_TOOL="$HERE/tools/serial_cmd.py"
-elif [ -f "$HERE/../home-mate-gateway-dot2/tools/serial_cmd.py" ]; then
-    SERIAL_TOOL="$HERE/../home-mate-gateway-dot2/tools/serial_cmd.py"
-else
-    SERIAL_TOOL="$HERE/../home-mate-device-gateway-b/tools/serial_cmd.py"
-fi
+SERIAL_TOOL="$HERE/../home-mate-device-gateway-b/tools/serial_cmd.py"
 if [ -z "$TOKEN_FILE" ] && [ -f "$HOME/.home-mate/$DEVICE_ID.token" ]; then
     TOKEN_FILE="$HOME/.home-mate/$DEVICE_ID.token"
 fi
@@ -482,7 +476,7 @@ else
     SEED_NAME=$(basename "$SEED")
     SEED_SHA=$(shasum -a 256 "$SEED" | awk '{print $1}')
     log "  seed $SEED_NAME sha256 $SEED_SHA"
-    MAC_IP=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || python3 -c 'import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.connect(("8.8.8.8",80)); print(s.getsockname()[0])' 2>/dev/null || echo "")
+    MAC_IP=$(ipconfig getifaddr en0 2>/dev/null || echo "")
     [ -n "$MAC_IP" ] || fail "cannot determine the Mac's LAN address (en0)"
     if mutate "serve $SEED_NAME on a verified port and wget it to /data/bootstrap.tgz (sha256 $SEED_SHA)"; then
         serve_dir /tmp/hm-provision-http.pid "$(dirname "$SEED")" "$SERVE_PORT" "$SEED_NAME" \
@@ -581,7 +575,7 @@ step "release install --activate (design §2.2 step 7)"
 if [ "$ALREADY_ACTIVE" = "1" ]; then
     log "  already active: $ACTIVE_VER — no install, no activation (a re-run must not re-serialize the node)"
 else
-    MAC_IP=${MAC_IP:-$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || python3 -c 'import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.connect(("8.8.8.8",80)); print(s.getsockname()[0])' 2>/dev/null || echo "")}
+    MAC_IP=${MAC_IP:-$(ipconfig getifaddr en0 2>/dev/null || echo "")}
     [ -n "$MAC_IP" ] || fail "cannot determine the Mac's LAN address (en0)"
     if mutate "serve $REL_NAME and run hm-release install --package … --activate"; then
         serve_dir /tmp/hm-provision-http2.pid "$(dirname "$RELEASE")" "$(( SERVE_PORT + 1 ))" "$REL_NAME" \

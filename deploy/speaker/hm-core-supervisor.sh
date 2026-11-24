@@ -33,10 +33,17 @@ SUP_KEEP=32768
 MIN_RUNTIME=15
 MAX_ATTEMPTS=3
 
-# LAN console access: emOS INPUT policy is DROP; allow 8930 from the home
-# subnet (idempotent — re-inserted on every supervisor start).
-iptables -C INPUT -p tcp --dport 8930 -s 192.168.1.0/24 -j ACCEPT 2>/dev/null || \
-    iptables -I INPUT -p tcp --dport 8930 -s 192.168.1.0/24 -j ACCEPT 2>/dev/null
+# LAN console, multi-gateway (:8932, Bearer-authenticated for non-loopback)
+# and UDP discovery (:8933): emOS INPUT policy is DROP; allow private RFC1918
+# and Tailscale subnets idempotently on every supervisor start.
+for CIDR in 192.168.0.0/16 10.0.0.0/8 172.16.0.0/12 100.64.0.0/10; do
+    iptables -C INPUT -p tcp --dport 8930 -s "$CIDR" -j ACCEPT 2>/dev/null || \
+        iptables -I INPUT -p tcp --dport 8930 -s "$CIDR" -j ACCEPT 2>/dev/null
+    iptables -C INPUT -p tcp --dport 8932 -s "$CIDR" -j ACCEPT 2>/dev/null || \
+        iptables -I INPUT -p tcp --dport 8932 -s "$CIDR" -j ACCEPT 2>/dev/null
+    iptables -C INPUT -p udp --dport 8933 -s "$CIDR" -j ACCEPT 2>/dev/null || \
+        iptables -I INPUT -p udp --dport 8933 -s "$CIDR" -j ACCEPT 2>/dev/null
+done
 
 sup_log() {
     if [ -f "$SUP_LOG" ]; then
@@ -73,9 +80,11 @@ TRIM_PID=$!
 CHILD=0
 trap 'sup_log "term signalled — core supervisor exiting"; kill $CHILD $TRIM_PID 2>/dev/null; wait $CHILD 2>/dev/null; exit 0' TERM INT
 
-# Speaker runtime env: loopback gateway link (firmware dials 127.0.0.1:8932),
-# LAN-facing console, DoH resolver (this network's router does not answer the
-# speaker's DNS), HTTP-Date clock bootstrap for cold boots.
+# Speaker runtime env: loopback gateway link (firmware dials 127.0.0.1:8932;
+# paired LAN Cores auto-promote :8932 to 0.0.0.0 for Bearer-authenticated
+# multi-gateway clients unless HM_GATEWAY_LOCK_LOOPBACK=1), LAN-facing console,
+# DoH resolver (this network's router does not answer the speaker's DNS),
+# HTTP-Date clock bootstrap for cold boots.
 export HM_DATA_DIR=$DIR/data
 export HM_BIND=0.0.0.0:8930
 export HM_GATEWAY_BIND=127.0.0.1:8932

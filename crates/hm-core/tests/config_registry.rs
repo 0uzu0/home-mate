@@ -72,10 +72,6 @@ async fn management_state_exposes_native_field_shapes_and_preserves_apply_limits
         field("unit_acoustic_profiles.*.mic_calibrated")["kind"],
         "boolean"
     );
-    assert_eq!(
-        field("remote_socket.capabilities[].side_effect")["kind"],
-        "string"
-    );
     assert_eq!(field("mode.followup_credits")["kind"], "integer");
     assert_eq!(field("mode.followup_credits")["nullable"], true);
     assert_eq!(field("mode.system_prompt_override")["nullable"], true);
@@ -107,7 +103,7 @@ async fn management_state_exposes_native_field_shapes_and_preserves_apply_limits
             .iter()
             .filter(|field| field["supported"] == true)
             .count(),
-        128
+        123
     );
     for field in fields.iter().filter(|field| field["supported"] == false) {
         assert_eq!(field["purposes"], serde_json::json!([]));

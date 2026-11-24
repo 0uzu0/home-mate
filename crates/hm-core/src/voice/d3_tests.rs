@@ -284,6 +284,7 @@ async fn speak_program_interrupted_by_stop_epoch_clears_live_program() {
         }],
         aec_tail_ms: None,
         profile_version: None,
+        auth_token: None,
     };
     let mut line = serde_json::to_string(&hello).unwrap();
     line.push('\n');

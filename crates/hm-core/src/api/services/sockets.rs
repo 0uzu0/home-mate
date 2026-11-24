@@ -2,7 +2,6 @@ use super::reset_device_history_if_capabilities_changed;
 use super::service_fingerprint;
 use crate::api::*;
 use crate::tool::open_socket::{HttpMethod, OpenSocketContract};
-use crate::tool::remote_socket::{RemoteCapabilitySpec, RemoteSocketConfig};
 use crate::tool::SideEffect;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -194,84 +193,4 @@ fn remove_open_socket(
     }
     reset_device_history_if_capabilities_changed(state, tools_before);
     Ok(Json(json!({ "removed": true, "name": name })))
-}
-
-// --- #21 Remote / Computer Socket -------------------------------------------
-
-pub(in crate::api) async fn config_remote_socket_get(
-    State(state): State<Arc<AppState>>,
-) -> Json<Value> {
-    Json(state.remote_socket.status_json())
-}
-
-#[derive(Deserialize)]
-pub(in crate::api) struct RemoteSocketBody {
-    #[serde(default)]
-    pub enabled: Option<bool>,
-    #[serde(default)]
-    pub endpoint_url: Option<String>,
-    #[serde(default)]
-    pub service_name: Option<String>,
-    #[serde(default)]
-    pub timeout_ms: Option<u64>,
-    #[serde(default)]
-    pub capabilities: Option<Vec<RemoteCapabilitySpec>>,
-    /// Write-only: absent keeps, "" clears.
-    #[serde(default)]
-    pub token: Option<String>,
-    #[serde(default)]
-    pub revision: Option<String>,
-}
-
-pub(in crate::api) async fn config_remote_socket_put(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<RemoteSocketBody>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let fail = |error: crate::config_delivery::DeliveryError| {
-        (
-            StatusCode::from_u16(error.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-            Json(json!({"error": error.detail, "code": error.code, "pointer": error.pointer})),
-        )
-    };
-    let baseline = state.remote_socket.snapshot().map_err(fail)?;
-    let tools_before = service_fingerprint(&state);
-    let mut cfg: RemoteSocketConfig = baseline.config;
-    if let Some(v) = body.enabled {
-        cfg.enabled = v;
-    }
-    if let Some(url) = body.endpoint_url {
-        cfg.endpoint_url = url;
-    }
-    if let Some(name) = body.service_name {
-        cfg.service_name = name;
-    }
-    if let Some(ms) = body.timeout_ms {
-        cfg.timeout_ms = ms;
-    }
-    if let Some(caps) = body.capabilities {
-        cfg.capabilities = caps;
-    }
-    let res = state
-        .remote_socket
-        .save_expected(
-            cfg,
-            body.token.as_deref(),
-            "console",
-            Some(body.revision.as_deref().unwrap_or(&baseline.revision)),
-        )
-        .map_err(fail)?;
-    reset_device_history_if_capabilities_changed(&state, tools_before);
-    Ok(Json(res))
-}
-
-pub(in crate::api) async fn config_remote_socket_test(
-    State(state): State<Arc<AppState>>,
-) -> Json<Value> {
-    Json(state.remote_socket.probe().await)
-}
-
-pub(in crate::api) async fn config_remote_socket_discover(
-    State(state): State<Arc<AppState>>,
-) -> Json<Value> {
-    Json(state.remote_socket.discover().await)
 }

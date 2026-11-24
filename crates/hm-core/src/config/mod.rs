@@ -14,6 +14,7 @@
 mod audio;
 mod endpoint;
 mod home;
+mod master_brain;
 mod music;
 mod news;
 mod openapi;
@@ -34,6 +35,10 @@ pub use endpoint::{
 pub use home::{
     home_domain_supported, EntitySource, HomeBackend, HomeConfig, HomeEntity, DEFAULT_HOME_RETRIES,
     DEFAULT_HOME_TIMEOUT_MS, HOME_KEY, HOME_SET_DOMAINS, HOME_TOKEN_SECRET,
+};
+pub use master_brain::{
+    MasterBrainConfig, MasterBrainProtocol, DEFAULT_MASTER_BRAIN_TIMEOUT_MS, MASTER_BRAIN_KEY,
+    MASTER_BRAIN_TOKEN_SECRET,
 };
 pub(crate) use music::MAX_MUSIC_CONNECTION_FIELD;
 pub use music::{
@@ -86,7 +91,7 @@ pub const CONFIG_KEY: &str = "services";
 /// They are credentials for THIS node's wiring, not household configuration —
 /// exporting them would spread one node's access around the household, and
 /// importing them would silently point a device at a peer it cannot reach.
-pub const CONFIG_SECRETS: [&str; 10] = [
+pub const CONFIG_SECRETS: [&str; 11] = [
     "llm.api_key",
     "llm_fallback.api_key",
     "asr.api_key",
@@ -97,6 +102,7 @@ pub const CONFIG_SECRETS: [&str; 10] = [
     "home.token",
     "openapi.token",
     "search.api_key",
+    MASTER_BRAIN_TOKEN_SECRET,
 ];
 
 /// FNV-1a 64 (hex) — the same hash the gateway reports, so "did the device
@@ -346,6 +352,7 @@ impl ConfigService {
         push("home.token", "");
         push("openapi.token", "");
         push("search.api_key", "");
+        push(MASTER_BRAIN_TOKEN_SECRET, "");
         debug_assert_eq!(out.len(), CONFIG_SECRETS.len());
         Ok(out)
     }
@@ -550,6 +557,62 @@ impl ConfigService {
             actor,
             key,
             &format!("{key} endpoint updated (enabled={})", cfg.enabled),
+            &payload,
+        );
+        Ok((cfg, has_token))
+    }
+
+    pub fn master_brain(&self) -> Result<MasterBrainConfig> {
+        let raw = self.store.config_get(MASTER_BRAIN_KEY)?;
+        Ok(raw
+            .and_then(|s| serde_json::from_str::<MasterBrainConfig>(&s).ok())
+            .unwrap_or_default()
+            .normalized())
+    }
+
+    pub fn master_brain_token(&self) -> Result<Option<String>> {
+        self.store.secret_get(MASTER_BRAIN_TOKEN_SECRET)
+    }
+
+    pub fn save_master_brain(
+        &self,
+        cfg: MasterBrainConfig,
+        token: Option<&str>,
+        actor: &str,
+    ) -> std::result::Result<(MasterBrainConfig, bool), ConfigError> {
+        let cfg = cfg.normalized();
+        cfg.validate(self.store.allows_loopback_public())?;
+        let json = serde_json::to_string(&cfg).map_err(ConfigError::Json)?;
+        self.store
+            .config_set(MASTER_BRAIN_KEY, &json)
+            .map_err(ConfigError::Store)?;
+        if let Some(tok) = token {
+            let trimmed = tok.trim();
+            if trimmed.is_empty() {
+                self.store
+                    .secret_delete(MASTER_BRAIN_TOKEN_SECRET)
+                    .map_err(ConfigError::Store)?;
+            } else {
+                self.store
+                    .secret_set(MASTER_BRAIN_TOKEN_SECRET, trimmed)
+                    .map_err(ConfigError::Store)?;
+            }
+        }
+        let has_token = self
+            .store
+            .secret_get(MASTER_BRAIN_TOKEN_SECRET)
+            .map_err(ConfigError::Store)?
+            .is_some();
+        let payload = serde_json::to_value(&cfg).map_err(ConfigError::Json)?;
+        let _ = append_history(
+            &self.store,
+            actor,
+            MASTER_BRAIN_KEY,
+            &format!(
+                "master_brain updated (enabled={}, protocol={})",
+                cfg.enabled,
+                cfg.protocol.as_str()
+            ),
             &payload,
         );
         Ok((cfg, has_token))

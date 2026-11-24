@@ -126,6 +126,7 @@ async fn connect_mock_gateway(
         }],
         aec_tail_ms: None,
         profile_version: None,
+        auth_token: None,
     };
     wr.write_all(serde_json::to_string(&hello).unwrap().as_bytes())
         .await

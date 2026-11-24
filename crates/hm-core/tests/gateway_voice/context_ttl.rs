@@ -464,7 +464,7 @@ async fn context_ttl_first_speech_then_kws_is_current_but_dispatched_old_asr_is_
         .unwrap();
     assert_ne!(current.ticket(), old.ticket());
     release
-        .send(Ok("FIRST_WAKE_CURRENT_SENTINEL".into()))
+        .send(Ok("你好高达 FIRST_WAKE_CURRENT_SENTINEL".into()))
         .unwrap();
     finish_answer(&state, &gw).await;
     assert!(prompt(&llm, 0).contains("FIRST_WAKE_CURRENT_SENTINEL"));

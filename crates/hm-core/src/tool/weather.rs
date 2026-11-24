@@ -1459,8 +1459,8 @@ mod tests {
         let place = WeatherPlace {
             alias: "沈阳".into(),
             name: "沈阳市".into(),
-            latitude: 41.7922,
-            longitude: 123.4328,
+            latitude: 39.9042,
+            longitude: 116.4074,
             timezone: "Asia/Shanghai".into(),
             city_code: String::new(),
         };
@@ -1472,12 +1472,12 @@ mod tests {
         assert!(provider_url("met_no", "", &place, 3, None)
             .unwrap()
             .starts_with(
-            "https://api.met.no/weatherapi/locationforecast/2.0/compact?lat=41.7922&lon=123.4328"
+            "https://api.met.no/weatherapi/locationforecast/2.0/compact?lat=39.9042&lon=116.4074"
         ));
         assert!(
             provider_url("wttr_in", "https://weather.example.com", &place, 3, None)
                 .unwrap()
-                .starts_with("https://weather.example.com/41.7922,123.4328?format=j1")
+                .starts_with("https://weather.example.com/39.9042,116.4074?format=j1")
         );
     }
 }

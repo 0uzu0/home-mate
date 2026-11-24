@@ -29,5 +29,5 @@ secret.key
 spikes/*/target/
 
 # Test-runtime data dir (wake-ack synth artifacts etc.)
-crates/hm-core/data-test/
+crates/hm-core/data-test*/
 __pycache__/

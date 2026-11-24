@@ -770,7 +770,6 @@ pub fn strip_node_local(doc: &mut Value) {
     if let Some(obj) = doc.as_object_mut() {
         for key in [
             "unit_acoustic_profiles",
-            "remote_socket",
             "open_sockets",
             "open_sockets_source_node",
             "device_led_configs",

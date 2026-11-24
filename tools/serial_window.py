@@ -7,7 +7,7 @@ helper has a HARD deadline: it sends the commands, reads until the window
 closes, prints what it saw and exits.
 
 Usage:
-  python3 tools/serial_window.py /dev/cu.usbmodem31101 4 "echo hello"
+  python3 tools/serial_window.py /dev/cu.usbmodem<port> 4 "echo hello"
   python3 tools/serial_window.py PORT 8 --cmd "cmd1" --cmd "cmd2"
   python3 tools/serial_window.py PORT 3            # just read the log
 

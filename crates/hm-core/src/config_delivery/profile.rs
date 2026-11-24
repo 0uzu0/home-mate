@@ -97,7 +97,7 @@ pub(super) fn generate(delivery: &ConfigDelivery, principal: &str) -> Result<Val
         "preserved":["services","credentials","custom_wake","unit_acoustics","voice_interaction","led","personal_and_learning_data"],
         "wake_policy":{"action":"preserve","recommended_default":"你好小智","gateway_effective_state":"not_verified"},
         "unavailable":[
-            {"issue":108,"paths":["mode.*","privacy.idle_asr_enabled","device_led_configs.*","open_sockets","remote_socket"]},
+            {"issue":108,"paths":["mode.*","privacy.idle_asr_enabled","device_led_configs.*","open_sockets"]},
             {"issue":109,"paths":["fleet.distribution","full_configuration_delivery"]},
             {"issue":111,"paths":["complete_dot2d_luna_profile"]},
             {"issue":112,"paths":["node.wake","reflex.words","mode.kws_threshold","mode.kws_score","gateway.loaded_wake_evidence"]},

@@ -109,6 +109,65 @@ pub fn gateway_allow_lan_from_env() -> bool {
         .unwrap_or(false)
 }
 
+/// Read `HM_GATEWAY_LOCK_LOOPBACK` from the environment (`"1"` or `"true"`, case-insensitive).
+/// When enabled, keeps `:8932` strictly on loopback even on a paired LAN speaker.
+pub fn gateway_lock_loopback_from_env() -> bool {
+    std::env::var("HM_GATEWAY_LOCK_LOOPBACK")
+        .ok()
+        .map(|v| {
+            let trimmed = v.trim();
+            trimmed == "1" || trimmed.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false)
+}
+
+/// Resolve the effective device-gateway TCP bind address (#271 speaker OTA).
+///
+/// Legacy speaker supervisors (`deploy/speaker/hm-core-supervisor.sh`) export
+/// `HM_GATEWAY_BIND=127.0.0.1:8932` outside OTA packages. On an already-paired
+/// LAN speaker (`!http_bind.ip().is_loopback() && auth_configured`), promote a
+/// default loopback `:8932` bind to `0.0.0.0:8932` unless
+/// `HM_GATEWAY_LOCK_LOOPBACK=1` is set, so authenticated mobile/display clients
+/// can connect alongside the local loopback speaker gateway immediately after a
+/// signed OTA upgrade (no USB serial edit required).
+///
+/// Unpaired Cores remain fail-closed on loopback unless `HM_GATEWAY_ALLOW_LAN=1`.
+pub fn resolve_gateway_bind(
+    http_bind: std::net::SocketAddr,
+    env_gateway_bind: Option<std::net::SocketAddr>,
+    allow_lan_env: bool,
+    lock_loopback_env: bool,
+    auth_configured: bool,
+) -> Result<std::net::SocketAddr, String> {
+    let default_port = 8932u16;
+    let can_promote_paired_lan =
+        !lock_loopback_env && !http_bind.ip().is_loopback() && auth_configured;
+
+    let addr = match env_gateway_bind {
+        Some(explicit) => {
+            if can_promote_paired_lan
+                && explicit.ip().is_loopback()
+                && explicit.port() == default_port
+            {
+                std::net::SocketAddr::from(([0, 0, 0, 0], explicit.port()))
+            } else {
+                explicit
+            }
+        }
+        None => {
+            if !lock_loopback_env && (allow_lan_env || can_promote_paired_lan) {
+                std::net::SocketAddr::from(([0, 0, 0, 0], default_port))
+            } else {
+                std::net::SocketAddr::from(([127, 0, 0, 1], default_port))
+            }
+        }
+    };
+
+    let effective_allow_lan = !lock_loopback_env && (allow_lan_env || auth_configured);
+    ensure_gateway_bind_with_policy(addr, effective_allow_lan)?;
+    Ok(addr)
+}
+
 /// Refuse a hello that announces the same stable id twice. Every per-device
 /// map in the core is keyed by that id, so a duplicate would alias two
 /// speakers onto one state instead of failing loudly.

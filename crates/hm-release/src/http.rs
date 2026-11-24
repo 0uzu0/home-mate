@@ -244,10 +244,10 @@ mod tests {
 
     #[test]
     fn urls_parse_with_and_without_port() {
-        let a = parse_url("http://192.168.1.20:8000/pkg.tar").unwrap();
+        let a = parse_url("http://192.168.1.27:8000/pkg.tar").unwrap();
         assert_eq!(
             (a.host.as_str(), a.port, a.path.as_str()),
-            ("192.168.1.20", 8000, "/pkg.tar")
+            ("192.168.1.27", 8000, "/pkg.tar")
         );
         let b = parse_url("http://127.0.0.1/api/v0/status").unwrap();
         assert_eq!(

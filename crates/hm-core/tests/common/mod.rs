@@ -125,7 +125,7 @@ pub async fn spawn_fake_music() -> FakeMusic {
             .trim_end_matches(".view")
             .to_string();
         // Real Subsonic auth: t == md5(secret + s), and the user matches.
-        let ok_auth = q.get("u").map(|u| u == "bakey").unwrap_or(false)
+        let ok_auth = q.get("u").map(|u| u == "demo").unwrap_or(false)
             && match (q.get("t"), q.get("s")) {
                 (Some(t), Some(salt)) => {
                     use md5::{Digest, Md5};
@@ -306,7 +306,7 @@ pub fn configure_music(
         prefer_local,
         library: library.then(|| hm_core::config::MusicConnection {
             endpoint: fake.base.clone(),
-            user: "bakey".into(),
+            user: "demo".into(),
         }),
         online: online.then(|| hm_core::config::MusicConnection {
             endpoint: fake.base.clone(),
@@ -398,6 +398,7 @@ pub async fn spawn_fake_device_custom(
         }],
         aec_tail_ms: None,
         profile_version: None,
+        auth_token: None,
     };
     let send = |frame: GatewayFrame| {
         let wr = wr.clone();

@@ -450,7 +450,35 @@ async fn the_kws_chain_records_sent_installed_and_loaded_hashes() {
     assert_eq!(d["intents_hash_matches"], json!(true));
     assert_eq!(d["local_exits"], json!(0));
 
-    // A local exit fact is recorded, and it creates no session of its own.
+    // A7 (#116 / PR #257): a local exit fact while idle (not owning any session
+    // or playback) is ignored and creates no session of its own.
+    gw.send(&GatewayFrame::LocalExitFlushed {
+        device: "dot2-d".into(),
+        keyword: "停止播放".into(),
+        ts: hm_core::id::now_ms(),
+        latency_ms: 84,
+        channels: vec!["voice".into(), "music".into()],
+        detail: None,
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let snap = state.voice.mode_snapshot();
+    let d = &snap["devices"][0]["reflex"]["deploy"];
+    assert_eq!(d["local_exits"], json!(0));
+    assert_eq!(
+        snap["devices"][0]["session"]["state"], "idle",
+        "a device-side flush while idle must not create a session"
+    );
+
+    // Once dot2-d owns an active session, LocalExitFlushed IS recorded cleanly.
+    gw.send(&GatewayFrame::Wake {
+        device: "dot2-d".into(),
+        origin: Default::default(),
+        ts: hm_core::id::now_ms(),
+        seq: 5,
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(80)).await;
     gw.send(&GatewayFrame::LocalExitFlushed {
         device: "dot2-d".into(),
         keyword: "停止播放".into(),
@@ -465,10 +493,7 @@ async fn the_kws_chain_records_sent_installed_and_loaded_hashes() {
     let d = &snap["devices"][0]["reflex"]["deploy"];
     assert_eq!(d["local_exits"], json!(1));
     assert_eq!(d["last_local_exit"]["latency_ms"], json!(84));
-    assert_eq!(
-        snap["devices"][0]["session"]["state"], "idle",
-        "a device-side flush is a fact, not a session decision"
-    );
+    assert_eq!(d["last_local_exit"]["channels"], json!(["voice", "music"]));
 
     // …but an empty loaded_hash is NOT a load proof.
     gw.send(&GatewayFrame::KwsReport {

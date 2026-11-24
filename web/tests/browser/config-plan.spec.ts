@@ -241,55 +241,6 @@ test('Voice policy review publishes runtime values with an explicit unlimited ch
   await noPageOverflow(page)
 })
 
-test('Remote socket node policy publishes, reads back and rolls back in the console', async ({ page, app }) => {
-  const card = app.card(page)
-  const socket = '/api/v0/config/services/remote_socket'
-  const baseline = await app.api(socket)
-  const name = await row(card, page, 'remote_socket.service_name')
-  const catalogue = await row(card, page, 'remote_socket.capabilities')
-  await name.getByLabel(app.labels.cfgDesired, { exact: true }).fill('Console fixture')
-  await catalogue.getByLabel(app.labels.cfgRemoteSocketCapabilities, { exact: true })
-    .fill(JSON.stringify([{ name: 'room.status', description: 'Status' }]))
-  await card.getByLabel(app.labels.cfgReason, { exact: true }).fill('Reviewed node socket update')
-
-  const preview = page.waitForResponse(endpoint('/api/v1/config/preflight'))
-  await card.getByRole('button', { name: app.labels.cfgPreview, exact: true }).click()
-  const plan = await (await preview).json()
-  expect(plan.diff).toEqual(expect.arrayContaining([
-    expect.objectContaining({ path: 'remote_socket.service_name', after: 'Console fixture' }),
-    expect.objectContaining({ path: 'remote_socket.capabilities', action: 'replace' }),
-  ]))
-  expect(await app.api(socket)).toEqual(baseline)
-  const receipt = await submit(app, page)
-
-  const observe = async (id: string) => {
-    const path = '/api/v1/config/applications/' + id + '/readback'
-    await expect.poll(async () => (await app.api(path))
-      .publications.find((value: any) => value.block === 'remote_socket')?.state).toBe('applied')
-    await card.getByRole('button', { name: app.labels.cfgReadbackRefresh, exact: true }).click()
-    await expect(card.getByText(app.labels.cfgRemoteSocketPublication + ': ' + app.labels.cfgPublicationApplied))
-      .toBeVisible()
-    const readback = await app.api(path)
-    expect(readback.fields.map((field: any) => field.state)).toEqual(['core_readback_verified', 'core_readback_verified'])
-  }
-
-  await observe(receipt.application_id)
-  const active = await app.api(socket)
-  expect(active.service_name).toBe('Console fixture')
-  expect(active.capabilities.map((item: any) => item.name)).toEqual(['room.status'])
-  await app.reload(page)
-  await history(app, page, receipt.application_id)
-  await expect(card.getByRole('button', { name: app.labels.cfgRollbackPreview, exact: true })).toBeEnabled()
-  const rollback = page.waitForResponse(endpoint('/api/v1/config/applications/' + receipt.application_id + '/rollback-preflight'))
-  await card.getByRole('button', { name: app.labels.cfgRollbackPreview, exact: true }).click()
-  expect((await (await rollback).json()).plan_id).toBeTruthy()
-  await observe((await submit(app, page)).application_id)
-  expect(await app.api(socket)).toMatchObject({
-    service_name: baseline.service_name, capabilities: baseline.capabilities, token_set: baseline.token_set,
-  })
-  await noPageOverflow(page)
-})
-
 test('Open sockets replace a node registry and roll back through the console', async ({ page, app }) => {
   const card = app.card(page)
   const route = '/api/v0/config/sockets'

@@ -140,6 +140,7 @@ impl VoicePipeline {
                 ticker.push_all_assistant_states();
                 ticker.follow_window_tone_sweep();
                 ticker.reminder_sweep();
+                ticker.announce_sweep();
             }
         });
     }

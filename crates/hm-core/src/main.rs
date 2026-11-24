@@ -253,27 +253,73 @@ async fn main() {
 
     let _config_worker = hm_core::config_delivery::ConfigApplyCoordinator::start_for_app(&state);
 
-    // Device-gateway listener. The gateway dials in; default 127.0.0.1:8932.
-    // A non-loopback bind is refused by default (embedded speaker mode) unless
-    // HM_GATEWAY_ALLOW_LAN=1 is explicitly enabled for Docker/NAS deployments.
-    let gateway_bind: SocketAddr = std::env::var("HM_GATEWAY_BIND")
-        .unwrap_or_else(|_| "127.0.0.1:8932".into())
-        .parse()
-        .expect("HM_GATEWAY_BIND must be host:port");
+    // Device-gateway listener (#271: concurrent multi-gateway + Bearer auth on
+    // non-loopback peers). Paired LAN speakers (`!bind.ip().is_loopback() &&
+    // state.auth.configured()`) automatically promote legacy `127.0.0.1:8932`
+    // supervisor binds to `0.0.0.0:8932` unless `HM_GATEWAY_LOCK_LOOPBACK=1`,
+    // allowing OTA-upgraded speakers to accept authenticated LAN gateways
+    // alongside their local loopback gateway with zero USB edit.
     let allow_lan_gateway = hm_core::gateway::gateway_allow_lan_from_env();
-    if let Err(e) =
-        hm_core::gateway::ensure_gateway_bind_with_policy(gateway_bind, allow_lan_gateway)
-    {
-        eprintln!("refusing to start: {e}");
-        std::process::exit(1);
-    }
-    if allow_lan_gateway && !gateway_bind.ip().is_loopback() {
-        tracing::warn!(
+    let lock_loopback = hm_core::gateway::gateway_lock_loopback_from_env();
+    let env_gateway_bind: Option<SocketAddr> = std::env::var("HM_GATEWAY_BIND")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.parse().expect("HM_GATEWAY_BIND must be host:port"));
+    let gateway_bind = match hm_core::gateway::resolve_gateway_bind(
+        bind,
+        env_gateway_bind,
+        allow_lan_gateway,
+        lock_loopback,
+        state.auth.configured(),
+    ) {
+        Ok(addr) => addr,
+        Err(e) => {
+            eprintln!("refusing to start: {e}");
+            std::process::exit(1);
+        }
+    };
+    if !gateway_bind.ip().is_loopback() {
+        tracing::info!(
             %gateway_bind,
-            "HM_GATEWAY_ALLOW_LAN=1 enabled: device gateway listener bound to non-loopback address for Docker/NAS mode"
+            auth_required = state.auth.configured(),
+            "multi-gateway LAN listener enabled"
         );
     }
+    state
+        .hub
+        .set_voice_gateway_open(!gateway_bind.ip().is_loopback());
     state.start_gateway_listener(gateway_bind);
+
+    // #271: Active LAN UDP discovery responder/beacon (default UDP 8933).
+    // Best-effort bind so localhost multi-core tests never fail on EADDRINUSE.
+    let discovery_enabled = !hm_core::discovery::discovery_disabled_from_env();
+    let mut discovery_port = None;
+    if discovery_enabled {
+        let mut disc_cfg =
+            hm_core::discovery::DiscoveryConfig::for_ports(bind.port(), gateway_bind.port());
+        discovery_port = Some(disc_cfg.bind_addr.port());
+        if bind.ip().is_loopback()
+            && bind.port() != 8930
+            && std::env::var_os("HM_DISCOVERY_PORT").is_none()
+        {
+            disc_cfg.broadcast_interval = None;
+        }
+        hm_core::discovery::spawn_discovery_beacon(state.clone(), disc_cfg);
+    }
+
+    // On drop-by-default Linux speaker firewalls (Dot2 emOS as root), ensure
+    // private-LAN rules exist for the open multi-gateway TCP and discovery UDP
+    // ports. No-op on non-Linux, non-root (NAS Docker), or ACCEPT firewalls.
+    if !bind.ip().is_loopback() {
+        let mut fw_ports: Vec<(&str, u16)> = Vec::new();
+        if !gateway_bind.ip().is_loopback() {
+            fw_ports.push(("tcp", gateway_bind.port()));
+        }
+        if let Some(udp_port) = discovery_port {
+            fw_ports.push(("udp", udp_port));
+        }
+        hm_core::net::ensure_speaker_lan_firewall_ports(&fw_ports);
+    }
 
     let app = router(state.clone());
     let listener = tokio::net::TcpListener::bind(bind)

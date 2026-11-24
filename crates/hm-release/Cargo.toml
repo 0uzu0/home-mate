@@ -3,7 +3,7 @@ name = "hm-release"
 description = "Home Mate release verifier/installer/activator (Ed25519 manifest, A/B activation, health gate)"
 edition = "2021"
 version = "0.1.0"
-license-file = "../../NOT-LICENSED"
+license-file.workspace = true
 
 [lib]
 name = "hm_release"

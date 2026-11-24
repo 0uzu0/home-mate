@@ -4,7 +4,8 @@
 
 Scope: This Apache-2.0 license applies specifically to the Home Mate
 Northbound v2 Device Gateway wire protocol specification, JSON schemas,
-and protocol contract definitions (`crates/protocol`).
+and protocol contract definitions (`crates/hm-core/src/gateway/` and
+protocol specification documents).
 
 Copyright 2026 Bakey Zhang (@yes999zc)
 

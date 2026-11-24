@@ -480,10 +480,9 @@ mod d0_source_tests {
     fn stop_and_wait_rejects_stale_connection_generation_without_sending() {
         let hub = DeviceHub::new();
         let (tx, mut rx) = outbound::outbound_channel();
-        *crate::lock_or_recover(&hub.outbound, "hub.outbound") = Some(tx);
+        hub.attach_test_outbound(2, tx);
         {
             let mut st = hub.lock_state();
-            st.generation = 2;
             st.active_plays.insert(
                 "P-stale".into(),
                 ActivePlay {
@@ -633,10 +632,10 @@ mod d0_source_tests {
         let hub = DeviceHub::new();
         let (tx, mut rx) =
             outbound::outbound_channel_with_metrics(hub.transport_tasks.outbound.clone());
-        *crate::lock_or_recover(&hub.outbound, "hub.outbound") = Some(tx);
+        hub.attach_test_outbound(1, tx);
         {
             let mut st = hub.lock_state();
-            st.generation = 1;
+            st.device_to_conn.insert("dot2-d".into(), 1);
             st.devices.insert(
                 "dot2-d".into(),
                 DeviceSlot {
@@ -781,5 +780,59 @@ mod d0_source_tests {
         assert!(ensure_gateway_bind_with_policy(lo_v4, true).is_ok());
         assert!(ensure_gateway_bind_with_policy(any_v4, true).is_ok());
         assert!(ensure_gateway_bind_with_policy(lan_v4, true).is_ok());
+    }
+
+    #[test]
+    fn resolve_gateway_bind_promotes_paired_lan_speaker_and_keeps_unpaired_or_loopback_closed() {
+        let http_lan: std::net::SocketAddr = "0.0.0.0:8930".parse().unwrap();
+        let http_lo: std::net::SocketAddr = "127.0.0.1:8930".parse().unwrap();
+        let gw_lo: std::net::SocketAddr = "127.0.0.1:8932".parse().unwrap();
+        let gw_custom_lo: std::net::SocketAddr = "127.0.0.1:55145".parse().unwrap();
+        let gw_any: std::net::SocketAddr = "0.0.0.0:8932".parse().unwrap();
+
+        // 1. Paired LAN speaker with legacy supervisor HM_GATEWAY_BIND=127.0.0.1:8932 or unset promotes to 0.0.0.0:8932.
+        assert_eq!(
+            resolve_gateway_bind(http_lan, Some(gw_lo), false, false, true).unwrap(),
+            gw_any
+        );
+        assert_eq!(
+            resolve_gateway_bind(http_lan, None, false, false, true).unwrap(),
+            gw_any
+        );
+        // Custom non-8932 loopback port stays untouched even on a paired LAN Core.
+        assert_eq!(
+            resolve_gateway_bind(http_lan, Some(gw_custom_lo), false, false, true).unwrap(),
+            gw_custom_lo
+        );
+        // 2. Explicit HM_GATEWAY_LOCK_LOOPBACK=1 keeps it on 127.0.0.1:8932 and rejects explicit non-loopback.
+        assert_eq!(
+            resolve_gateway_bind(http_lan, Some(gw_lo), false, true, true).unwrap(),
+            gw_lo
+        );
+        assert_eq!(
+            resolve_gateway_bind(http_lan, None, true, true, true).unwrap(),
+            gw_lo
+        );
+        assert!(resolve_gateway_bind(http_lan, Some(gw_any), true, true, true).is_err());
+        // 3. Unpaired speaker stays fail-closed on 127.0.0.1:8932 and rejects explicit 0.0.0.0:8932.
+        assert_eq!(
+            resolve_gateway_bind(http_lan, Some(gw_lo), false, false, false).unwrap(),
+            gw_lo
+        );
+        assert!(resolve_gateway_bind(http_lan, Some(gw_any), false, false, false).is_err());
+        // 4. Unpaired NAS Docker with HM_GATEWAY_ALLOW_LAN=1 binds 0.0.0.0:8932.
+        assert_eq!(
+            resolve_gateway_bind(http_lan, None, true, false, false).unwrap(),
+            gw_any
+        );
+        // 5. Loopback-only Core (dev/tests) never promotes even when paired.
+        assert_eq!(
+            resolve_gateway_bind(http_lo, Some(gw_lo), false, false, true).unwrap(),
+            gw_lo
+        );
+        assert_eq!(
+            resolve_gateway_bind(http_lo, None, false, false, true).unwrap(),
+            gw_lo
+        );
     }
 }

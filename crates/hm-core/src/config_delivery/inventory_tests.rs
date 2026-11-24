@@ -161,11 +161,6 @@ fn current_native_serde_configuration_fields_and_values_are_registered() {
     );
     defaults::<UnitAcousticProfile>("unit_acoustic_profiles.dot2-d");
     defaults::<DeviceLedConfig>("device_led_configs.dot2-d");
-    defaults::<crate::tool::remote_socket::RemoteSocketConfig>("remote_socket");
-    check::<crate::tool::remote_socket::RemoteCapabilitySpec>(
-        "remote_socket.capabilities[0]",
-        json!({"name":"fixture"}),
-    );
     check::<crate::tool::open_socket::OpenSocketContract>(
         "open_sockets[0]",
         json!({"name":"fixture","description":"fixture","effect":"Query","endpoint_url":"http://127.0.0.1/synthetic"}),
@@ -253,12 +248,6 @@ fn optional_scalars_containers_and_opaque_json_report_their_actual_shapes() {
         }
     }
     assert_eq!(
-        descriptor("remote_socket.capabilities[0].side_effect")
-            .unwrap()
-            .kind,
-        "string"
-    );
-    assert_eq!(
         descriptor("unit_acoustic_profiles.dot2-d.mic_calibrated")
             .unwrap()
             .kind,
@@ -279,7 +268,6 @@ fn concrete_wildcards_stay_protected_and_catalog_never_grants_new_apply_authorit
         "devices.zone.a.room",
         "weather.places[0].latitude",
         "open_sockets[0].parameters",
-        "remote_socket.capabilities[4].side_effect",
         "unit_acoustic_profiles.dot2-d.mic_calibrated",
     ] {
         assert_eq!(
@@ -307,7 +295,7 @@ fn concrete_wildcards_stay_protected_and_catalog_never_grants_new_apply_authorit
     assert_eq!(names.len(), catalog.len(), "duplicate descriptors");
     assert_eq!(
         catalog.iter().filter(|field| field.supported).count(),
-        128,
+        123,
         "descriptive coverage must not enable unexpected fields"
     );
     for path in [
@@ -382,7 +370,7 @@ fn concrete_wildcards_stay_protected_and_catalog_never_grants_new_apply_authorit
 #[test]
 fn all_descriptors_have_typed_metadata_bounds_and_unit_isolation() {
     let catalog = fields();
-    assert_eq!(catalog.len(), 243);
+    assert_eq!(catalog.len(), 234);
     for field in &catalog {
         assert!(!field.unit.is_empty(), "{} missing unit", field.path);
         assert!(

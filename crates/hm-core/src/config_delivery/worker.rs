@@ -131,7 +131,7 @@ pub(super) fn prepare(store: &Store) -> Result<Vec<Job>> {
             "SELECT o.principal,o.application_id,o.data_epoch,a.revision,o.payload_json,a.after_json,b.block
              FROM config_outbox o JOIN config_applications a USING(principal,application_id)
              JOIN config_application_blocks b USING(principal,application_id)
-             WHERE b.block IN ('persona','services','weather','home','music','news','search','openapi','mode','remote_socket','open_sockets','reflex','node','audio_eq','device_led_configs','unit_acoustic_profiles') AND b.state='saved_pending'
+             WHERE b.block IN ('persona','services','weather','home','music','news','search','openapi','mode','open_sockets','reflex','node','audio_eq','device_led_configs','unit_acoustic_profiles') AND b.state='saved_pending'
              ORDER BY a.revision LIMIT 64",
         )?;
             let rows = stmt
@@ -289,7 +289,6 @@ fn publish_transaction(
                     "music" => "MUSIC_BASELINE_CHANGED",
                     "openapi" => "OPENAPI_BASELINE_CHANGED",
                     "mode" => "VOICE_BASELINE_CHANGED",
-                    "remote_socket" => "REMOTE_SOCKET_BASELINE_CHANGED",
                     "open_sockets" => "OPEN_SOCKETS_BASELINE_CHANGED",
                     _ => "SEARCH_BASELINE_CHANGED",
                 }),
@@ -337,13 +336,6 @@ fn publish_transaction(
                 } else if let Some(block) = super::discovery::Block::named(&job.block) {
                     block.require_readable(&tx, store)?;
                     block.validate(desired.clone(), store.allows_loopback_public())?;
-                    if matches!(block, super::discovery::Block::RemoteSocket) {
-                        super::remote_socket::check_publication(
-                            &tx,
-                            store,
-                            &serde_json::from_value(desired.clone())?,
-                        )?;
-                    }
                 } else if job.block == "weather" {
                     super::weather::require_readable_baseline(&tx)?;
                     super::weather::validate(desired.clone(), store.allows_loopback_public())?;
@@ -428,7 +420,6 @@ fn publish_transaction(
                     "music" => "MUSIC_PUBLICATION_FAILED",
                     "openapi" => "OPENAPI_PUBLICATION_FAILED",
                     "mode" => "VOICE_PUBLICATION_FAILED",
-                    "remote_socket" => "REMOTE_SOCKET_PUBLICATION_FAILED",
                     "open_sockets" => "OPEN_SOCKETS_PUBLICATION_FAILED",
                     _ => "SEARCH_PUBLICATION_FAILED",
                 },

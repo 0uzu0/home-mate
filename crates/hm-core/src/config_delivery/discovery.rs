@@ -16,18 +16,16 @@ pub(super) enum Block {
     News,
     Search,
     OpenApi,
-    RemoteSocket,
     OpenSockets,
 }
 
 impl Block {
-    pub(super) const ALL: [Self; 7] = [
+    pub(super) const ALL: [Self; 6] = [
         Self::Home,
         Self::Music,
         Self::News,
         Self::Search,
         Self::OpenApi,
-        Self::RemoteSocket,
         Self::OpenSockets,
     ];
 
@@ -38,7 +36,6 @@ impl Block {
             "news" => Some(Self::News),
             "search" => Some(Self::Search),
             "openapi" => Some(Self::OpenApi),
-            "remote_socket" => Some(Self::RemoteSocket),
             "open_sockets" => Some(Self::OpenSockets),
             _ => None,
         }
@@ -51,7 +48,6 @@ impl Block {
             Self::News => "news",
             Self::Search => "search",
             Self::OpenApi => "openapi",
-            Self::RemoteSocket => crate::tool::remote_socket::REMOTE_SOCKET_CONFIG_KEY,
             Self::OpenSockets => super::open_sockets::KEY,
         }
     }
@@ -63,7 +59,6 @@ impl Block {
             Self::News => json!(NewsConfig::default()),
             Self::Search => json!(SearchConfig::default()),
             Self::OpenApi => json!(OpenApiConfig::default()),
-            Self::RemoteSocket => json!(crate::tool::remote_socket::RemoteSocketConfig::default()),
             Self::OpenSockets => json!([]),
         }
     }
@@ -96,10 +91,6 @@ impl Block {
                         super::openapi::reject_exposed_token(cfg, token.as_deref()).is_ok()
                     })
                     .map(|cfg| json!(cfg))
-            }
-            Self::RemoteSocket => {
-                let token = super::remote_socket::active_token(c, store)?;
-                super::remote_socket::project(&text, token.as_deref()).map(|cfg| json!(cfg))
             }
             Self::OpenSockets => {
                 let candidate = serde_json::from_str::<Value>(&text)
@@ -172,17 +163,6 @@ impl Block {
                     .at(self.key())
                 })? == cfg
             }
-            Self::RemoteSocket => {
-                let cfg: crate::tool::remote_socket::RemoteSocketConfig =
-                    serde_json::from_value(value)?;
-                let mut normalized = cfg.clone();
-                crate::tool::remote_socket::validate_remote_config(&mut normalized).map_err(
-                    |error| {
-                        DeliveryError::new("INVALID_REMOTE_SOCKET_CONFIG", error).at(self.key())
-                    },
-                )?;
-                normalized == cfg
-            }
             Self::OpenSockets => {
                 super::open_sockets::canonical(value)?;
                 true
@@ -194,7 +174,6 @@ impl Block {
                     Self::Home => "INVALID_HOME_CONFIG",
                     Self::Music => "INVALID_MUSIC_CONFIG",
                     Self::OpenApi => "INVALID_OPENAPI_CONFIG",
-                    Self::RemoteSocket => "INVALID_REMOTE_SOCKET_CONFIG",
                     _ => "INVALID_DISCOVERY_CONFIG",
                 },
                 "configuration must use canonical values",
@@ -271,22 +250,6 @@ impl Block {
                 Ok(Some(serde_json::to_value(super::open_sockets::canonical(
                     value.clone(),
                 )?)?))
-            }
-            Operation::Set { path, .. } if path == "remote_socket.capabilities" => {
-                Err(DeliveryError::new(
-                    "INVALID_OPERATION",
-                    "remote capabilities require a whole-list replacement",
-                )
-                .at(path))
-            }
-            Operation::Replace { path, value } if path == "remote_socket.capabilities" => {
-                let items = value.as_array().ok_or_else(|| {
-                    DeliveryError::new("INVALID_FIELD_TYPE", "expected capabilities array").at(path)
-                })?;
-                super::v1::validate_array_elements(path, items)?;
-                let capabilities: Vec<crate::tool::remote_socket::RemoteCapabilitySpec> =
-                    serde_json::from_value(value.clone())?;
-                Ok(Some(serde_json::to_value(capabilities)?))
             }
             Operation::Set { path, .. } if path == "openapi.operations" => Err(DeliveryError::new(
                 "INVALID_OPERATION",
@@ -367,7 +330,6 @@ pub(super) fn decode<T: DeserializeOwned + Default>(text: Option<&str>) -> store
 pub(super) fn revision(c: &Connection, block: Block, raw: Option<&str>) -> store::Result<String> {
     let credential = match block {
         Block::Search => Some(SEARCH_SECRET),
-        Block::RemoteSocket => Some(crate::tool::remote_socket::REMOTE_SOCKET_SECRET_KEY),
         _ => None,
     };
     let key: Option<String> = if let Some(name) = credential {

@@ -616,7 +616,7 @@ mod tests {
     #[test]
     fn endpoint_must_be_lan_and_http() {
         assert!(crate::config::valid_music_endpoint(
-            "http://192.168.1.20:4533"
+            "http://192.168.1.27:4533"
         ));
         assert!(crate::config::valid_music_endpoint(
             "http://nas.local:4533/music"

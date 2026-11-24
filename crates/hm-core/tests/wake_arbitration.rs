@@ -193,6 +193,7 @@ async fn spawn_node() -> (Arc<AppState>, Arc<Link>, std::net::SocketAddr) {
         }],
         aec_tail_ms: None,
         profile_version: None,
+        auth_token: None,
     })
     .await;
     // The hello_ack is the proof the device is registered.
@@ -994,6 +995,7 @@ async fn spawn_named_node(
         }],
         aec_tail_ms: None,
         profile_version: None,
+        auth_token: None,
     })
     .await;
     let mut rx = link.rx.lock().await;

@@ -266,9 +266,17 @@ export interface AuthTokenInfo {
 export interface AuthStatus {
   configured: boolean
   corrupt: boolean
+  core_id?: string
+  lan_gateway_exempt?: boolean
+  voice_gateway_open?: boolean
   tokens: AuthTokenInfo[]
   loopback_trusted: boolean
   detail?: string
+}
+
+export interface AuthLanExemptResponse {
+  lan_gateway_exempt: boolean
+  core_id: string
 }
 
 export interface AuthIssued {
@@ -285,6 +293,13 @@ export const provisionAuth = (opts?: RequestOptions) =>
 
 export const rotateAuth = (opts?: RequestOptions) =>
   request<AuthIssued>('/api/v0/auth/rotate', { method: 'POST' }, opts)
+
+export const setLanGatewayExempt = (lan_gateway_exempt: boolean, opts?: RequestOptions) =>
+  request<AuthLanExemptResponse>(
+    '/api/v0/auth/lan-exempt',
+    { method: 'PUT', body: JSON.stringify({ lan_gateway_exempt }) },
+    opts,
+  )
 
 export const LED_STATES = [
   'idle',

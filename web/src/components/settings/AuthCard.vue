@@ -8,7 +8,7 @@
  * browser adopts it immediately so the page does not lock itself out.
  */
 import { computed, ref } from 'vue'
-import { getAuthStatus, provisionAuth, rotateAuth } from '../../api'
+import { getAuthStatus, provisionAuth, rotateAuth, setLanGatewayExempt } from '../../api'
 import { authToken, clearAuthToken, setAuthToken } from '../../auth'
 import { formatDateTime, formatRelative } from '../../format'
 import { t } from '../../i18n'
@@ -19,6 +19,7 @@ import Panel from '../Panel.vue'
 import Pill from '../Pill.vue'
 import AppIcon from '../AppIcon.vue'
 import ConfirmDialog from '../ConfirmDialog.vue'
+import Toggle from '../Toggle.vue'
 
 const auth = useResource((signal) => getAuthStatus({ signal }), { timeoutMs: 5000, retries: 1 })
 usePoll(() => auth.load(), 10000)
@@ -27,9 +28,25 @@ const { busy, message, tone, run } = useSave()
 const confirming = ref(false)
 const fresh = ref<string | null>(null)
 const copied = ref(false)
+const toggleKey = ref(0)
 
 const entry = computed(() => auth.data.value?.tokens?.[0] ?? null)
 const paired = computed(() => auth.data.value?.configured === true)
+const coreId = computed(() => auth.data.value?.core_id ?? '')
+const lanExempt = computed(() => auth.data.value?.lan_gateway_exempt === true)
+
+async function toggleLanExempt(next: boolean): Promise<void> {
+  try {
+    await run(async () => {
+      const resp = await setLanGatewayExempt(next, { timeoutMs: 8000 })
+      await auth.load()
+      return resp.lan_gateway_exempt ? t('authLanExemptEnabled') : t('authLanExemptDisabled')
+    })
+  } finally {
+    // Re-sync DOM checkbox with authoritative server value if the save failed
+    toggleKey.value += 1
+  }
+}
 
 async function copy(): Promise<void> {
   if (!fresh.value) return
@@ -90,6 +107,18 @@ async function forget(): Promise<void> {
           {{ entry.last_used_ms ? formatRelative(entry.last_used_ms) : t('authNeverUsed') }}
         </span>
         <span class="auth__meta mono">{{ authToken ? 'hm1_••••' : '—' }}</span>
+        <span v-if="coreId" class="auth__meta mono">{{ t('authCoreId') }}: {{ coreId }}</span>
+      </div>
+
+      <div class="auth__exempt">
+        <Toggle
+          :key="toggleKey"
+          :model-value="lanExempt"
+          :disabled="busy"
+          :label="t('authLanExemptTitle')"
+          :hint="t('authLanExemptHint')"
+          @update:model-value="toggleLanExempt"
+        />
       </div>
 
       <p v-if="auth.data.value?.corrupt" class="auth__error">{{ t('authCorruptBody') }}</p>
@@ -156,6 +185,11 @@ async function forget(): Promise<void> {
 .auth__meta {
   color: var(--muted);
   font-size: var(--fs-xs);
+}
+
+.auth__exempt {
+  padding-top: var(--sp-2);
+  border-top: 1px solid var(--line);
 }
 
 .auth__token {

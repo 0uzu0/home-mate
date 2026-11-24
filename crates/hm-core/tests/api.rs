@@ -426,8 +426,8 @@ async fn config_backup_roundtrips_services_music_and_mode() {
         .put(format!("{base}/api/v0/config/services/music"))
         .json(&json!({
             "enabled": true, "prefer_local": true,
-            "library": {"endpoint": "http://192.168.1.10:4533", "user": "u", "secret": "lib-backup-1"},
-            "online": {"endpoint": "http://192.168.1.10:18082", "secret": "online-backup-1"}
+            "library": {"endpoint": "http://192.168.1.168:4533", "user": "u", "secret": "lib-backup-1"},
+            "online": {"endpoint": "http://192.168.1.168:18082", "secret": "online-backup-1"}
         }))
         .send()
         .await
@@ -570,7 +570,7 @@ async fn config_backup_roundtrips_services_music_and_mode() {
         .await
         .unwrap();
     assert_eq!(music["enabled"], true);
-    assert_eq!(music["library"]["endpoint"], "http://192.168.1.10:4533");
+    assert_eq!(music["library"]["endpoint"], "http://192.168.1.168:4533");
     assert_eq!(
         music["library"]["secret_set"], true,
         "the secret comes back through the import"
@@ -614,7 +614,7 @@ async fn a_stale_music_revision_is_refused_instead_of_overwriting() {
         .put(&url)
         .json(&json!({
             "enabled": true, "prefer_local": true,
-            "library": {"endpoint": "http://192.168.1.10:4533", "user": "u", "secret": "s"},
+            "library": {"endpoint": "http://192.168.1.168:4533", "user": "u", "secret": "s"},
             "revision": r0,
         }))
         .send()
@@ -623,14 +623,14 @@ async fn a_stale_music_revision_is_refused_instead_of_overwriting() {
         .json()
         .await
         .unwrap();
-    assert_eq!(saved["library"]["endpoint"], "http://192.168.1.10:4533");
+    assert_eq!(saved["library"]["endpoint"], "http://192.168.1.168:4533");
 
     // Page B still holds r0 and saves only the online source → 409, no write.
     let stale = client
         .put(&url)
         .json(&json!({
             "enabled": true, "prefer_local": true,
-            "online": {"endpoint": "http://192.168.1.10:18082", "secret": "t"},
+            "online": {"endpoint": "http://192.168.1.168:18082", "secret": "t"},
             "revision": r0,
         }))
         .send()
@@ -639,7 +639,7 @@ async fn a_stale_music_revision_is_refused_instead_of_overwriting() {
     assert_eq!(stale.status(), 409);
     let now: Value = client.get(&url).send().await.unwrap().json().await.unwrap();
     assert_eq!(
-        now["library"]["endpoint"], "http://192.168.1.10:4533",
+        now["library"]["endpoint"], "http://192.168.1.168:4533",
         "the stale save must not wipe the library"
     );
     assert!(now["online"].is_null());

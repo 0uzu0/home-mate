@@ -82,6 +82,7 @@ async fn wifi_change_with_client_drop_keeps_core_serving() {
             }],
             aec_tail_ms: None,
             profile_version: None,
+            auth_token: None,
         };
         let line = serde_json::to_string(&hello).unwrap();
         tx.write_all(format!("{line}\n").as_bytes()).await.unwrap();

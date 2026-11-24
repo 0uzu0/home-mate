@@ -147,6 +147,7 @@ pub(super) async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
     let tail_mismatch = enrich_gateway_tail_mismatch(&mut gateway, tail_blind_ms);
     Json(json!({
         "product": "Home Mate",
+        "core_id": state.auth.core_id(),
         "assistant_name": state.effective_assistant_name(),
         "now_ms": crate::id::now_ms(),
         "version": env!("CARGO_PKG_VERSION"),
@@ -163,6 +164,7 @@ pub(super) async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
             "configured": state.auth.configured(),
             "tokens": state.auth.summaries().len(),
             "loopback_trusted": true,
+            "lan_gateway_exempt": state.auth.lan_gateway_exempt(),
         },
         // M12a-1: how many stored credentials are sealed, how many could not
         // be opened, and whether the key is usable. Counts only, never a value.

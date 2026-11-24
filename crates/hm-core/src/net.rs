@@ -268,9 +268,208 @@ pub async fn time_bootstrap_if_needed() -> Option<i64> {
     }
 }
 
+/// RFC1918 + Tailscale CGNAT private CIDRs permitted when opening speaker
+/// firewall ports (`tcp/8932`, `udp/8933`). Public internet (`0.0.0.0/0`) is
+/// never opened.
+pub const PRIVATE_LAN_CIDRS: &[&str] = &[
+    "192.168.0.0/16",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "100.64.0.0/10",
+];
+
+/// True iff `ip` falls within RFC1918 (`10.0.0.0/8`, `172.16.0.0/12`,
+/// `192.168.0.0/16`) or Tailscale CGNAT (`100.64.0.0/10`). Handles
+/// IPv4-mapped IPv6 (`::ffff:x.x.x.x`). Public IPs, loopback, link-local,
+/// multicast, and global IPv6 always return `false`.
+pub fn is_private_lan_ip(ip: std::net::IpAddr) -> bool {
+    let v4 = match ip {
+        std::net::IpAddr::V4(v4) => v4,
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4,
+            None => return false,
+        },
+    };
+    let [a, b, _, _] = v4.octets();
+    a == 10
+        || (a == 192 && b == 168)
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 100 && (64..=127).contains(&b))
+}
+
+/// Detect whether `iptables -S INPUT` or `iptables -L INPUT -n` output
+/// indicates a default `DROP` policy on the `INPUT` chain (e.g. Dot2 emOS).
+pub fn input_policy_is_drop(iptables_output: &str) -> bool {
+    iptables_output.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed == "-P INPUT DROP"
+            || (trimmed.starts_with("Chain INPUT") && trimmed.contains("policy DROP"))
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_iptables_bin() -> &'static str {
+    for candidate in [
+        "/system/bin/iptables",
+        "/sbin/iptables",
+        "/usr/sbin/iptables",
+        "/bin/iptables",
+    ] {
+        if std::path::Path::new(candidate).is_file() {
+            return candidate;
+        }
+    }
+    "iptables"
+}
+
+#[cfg(target_os = "linux")]
+fn read_iptables_input_policy(iptables: &str) -> Option<String> {
+    let probes: [&[&str]; 2] = [&["-L", "INPUT", "-n"], &["-S", "INPUT"]];
+    for args in probes {
+        if let Ok(out) = std::process::Command::new(iptables).args(args).output() {
+            if out.status.success() {
+                return Some(String::from_utf8_lossy(&out.stdout).into_owned());
+            }
+        }
+    }
+    None
+}
+
+/// On Linux drop-by-default speaker firewalls (Dot2 emOS, running as root),
+/// idempotently ensure `iptables` accepts private-LAN packets for the given
+/// `(proto, port)` pairs (e.g. `("tcp", 8932)` and `("udp", 8933)`).
+///
+/// Safe no-op on non-Linux hosts, non-root processes (NAS Docker / dev), and
+/// hosts whose `INPUT` chain policy is not `DROP`. Best-effort — never fatal.
+pub fn ensure_speaker_lan_firewall_ports(ports: &[(&str, u16)]) {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = ports;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if ports.is_empty() {
+            return;
+        }
+        // Only root on embedded speakers can/should touch iptables.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let iptables = resolve_iptables_bin();
+        let Some(stdout) = read_iptables_input_policy(iptables) else {
+            return;
+        };
+        if !input_policy_is_drop(&stdout) {
+            return;
+        }
+        let mut opened = 0usize;
+        for &(proto, port) in ports {
+            if !matches!(proto, "tcp" | "udp") || port == 0 {
+                continue;
+            }
+            let port_s = port.to_string();
+            for &cidr in PRIVATE_LAN_CIDRS {
+                let exists = std::process::Command::new(iptables)
+                    .args([
+                        "-C", "INPUT", "-p", proto, "--dport", &port_s, "-s", cidr, "-j", "ACCEPT",
+                    ])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|s| s.success());
+                if exists {
+                    continue;
+                }
+                match std::process::Command::new(iptables)
+                    .args([
+                        "-I", "INPUT", "-p", proto, "--dport", &port_s, "-s", cidr, "-j", "ACCEPT",
+                    ])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                {
+                    Ok(s) if s.success() => opened += 1,
+                    Ok(s) => tracing::warn!(
+                        proto,
+                        port,
+                        cidr,
+                        code = ?s.code(),
+                        "speaker firewall: iptables insert failed"
+                    ),
+                    Err(e) => tracing::warn!(
+                        proto,
+                        port,
+                        cidr,
+                        error = %e,
+                        "speaker firewall: iptables exec failed"
+                    ),
+                }
+            }
+        }
+        if opened > 0 {
+            tracing::info!(
+                opened,
+                "speaker firewall: opened private-LAN iptables rules for multi-gateway/discovery"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_policy_is_drop_recognizes_both_iptables_formats() {
+        assert!(input_policy_is_drop(
+            "Chain INPUT (policy DROP)\ntarget prot opt source destination\n"
+        ));
+        assert!(!input_policy_is_drop(
+            "Chain INPUT (policy ACCEPT)\ntarget prot opt source destination\n"
+        ));
+        assert!(input_policy_is_drop("-P INPUT DROP\n-A INPUT -j ACCEPT\n"));
+        assert!(!input_policy_is_drop("-P INPUT ACCEPT\n"));
+        assert!(!PRIVATE_LAN_CIDRS.contains(&"0.0.0.0/0"));
+    }
+
+    #[test]
+    fn is_private_lan_ip_matches_rfc1918_and_tailscale_only() {
+        for ok in [
+            "10.0.0.1",
+            "10.255.255.254",
+            "172.16.0.1",
+            "172.31.255.254",
+            "192.168.0.1",
+            "192.168.1.100",
+            "100.64.0.1",
+            "100.127.255.254",
+            "::ffff:192.168.1.50",
+            "::ffff:100.64.10.20",
+        ] {
+            let ip: std::net::IpAddr = ok.parse().unwrap();
+            assert!(is_private_lan_ip(ip), "{ok} should be private LAN");
+        }
+        for bad in [
+            "127.0.0.1",
+            "::1",
+            "0.0.0.0",
+            "8.8.8.8",
+            "1.1.1.1",
+            "203.0.113.5",
+            "172.15.255.255",
+            "172.32.0.1",
+            "100.63.255.255",
+            "100.128.0.1",
+            "169.254.1.1",
+            "224.0.0.1",
+            "ff02::1",
+            "::ffff:8.8.8.8",
+            "2001:db8::1",
+        ] {
+            let ip: std::net::IpAddr = bad.parse().unwrap();
+            assert!(!is_private_lan_ip(ip), "{bad} must NOT be private LAN");
+        }
+    }
 
     #[test]
     fn parses_rfc7231_dates() {

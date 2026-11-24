@@ -488,10 +488,8 @@ async fn exports(State(state): State<Arc<AppState>>, headers: HeaderMap, body: B
             .map_err(|e| error(DeliveryError::internal(e)))?;
         if let Some(obj) = doc.as_object_mut() {
             if req.purpose == Some(Purpose::FamilyPolicy) {
-                obj.remove("remote_socket");
                 obj.remove("open_sockets");
                 obj.remove("open_sockets_source_node");
-                excluded.push("remote_socket_node_scope".into());
                 excluded.push("open_sockets_node_scope".into());
             }
             if !weather_reviewable {

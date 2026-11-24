@@ -176,11 +176,22 @@ impl Paths {
         // gateway hello and appears in `/status.gateway.devices[]`; `/mode`
         // carries the behavior state (kws/vad) but not the descriptor.
         let status = self.status()?;
-        let gw_dev = status
+        let devs = status
             .get("gateway")
             .and_then(|g| g.get("devices"))
             .and_then(|d| d.as_array())
-            .and_then(|d| d.first())
+            .ok_or("no device in /status.gateway.devices (gateway not connected?)")?;
+        // Prefer the local loopback / hm-firmware speaker gateway when multiple
+        // gateways (e.g. an Android companion client) are connected concurrently.
+        let gw_dev = devs
+            .iter()
+            .find(|d| {
+                d.get("loopback").and_then(|v| v.as_bool()).unwrap_or(false)
+                    || d.get("firmware")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|fw| fw.contains("hm-firmware "))
+            })
+            .or_else(|| devs.first())
             .ok_or("no device in /status.gateway.devices (gateway not connected?)")?;
         let firmware = gw_dev
             .get("firmware")

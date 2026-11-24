@@ -28,6 +28,8 @@ pub(super) async fn mode_get(State(state): State<Arc<AppState>>) -> Json<Value> 
             "search".into(),
             crate::tool::search::status_json(&state.search),
         );
+        // #267: provider-agnostic Master Brain status & recent delegated tasks.
+        obj.insert("master_brain".into(), state.master_brain.status_json());
         // M3: the live media sessions (queue + position), per device. The
         // console and the acceptance tools read the same facts the voice path
         // acts on.
@@ -268,6 +270,24 @@ pub(super) async fn voice_events(
     .await
     .unwrap_or_else(|e| json!({ "events": [], "error": format!("export failed: {e}") }));
     Json(out)
+}
+
+pub(super) async fn voice_announce_get(State(state): State<Arc<AppState>>) -> Json<Value> {
+    Json(state.voice.announce_snapshot())
+}
+
+pub(super) async fn voice_announce_post(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<crate::voice::AnnounceRequest>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    state
+        .voice
+        .enqueue_announce(body)
+        .map(|v| (StatusCode::ACCEPTED, Json(v)))
+        .map_err(|e| {
+            let status = StatusCode::from_u16(e.status).unwrap_or(StatusCode::BAD_REQUEST);
+            (status, Json(json!({ "error": e.detail, "code": e.code })))
+        })
 }
 
 // --- chat -------------------------------------------------------------------

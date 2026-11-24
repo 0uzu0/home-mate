@@ -10,6 +10,7 @@ pub mod config;
 pub mod config_delivery;
 pub mod cpu;
 pub mod diagnostics;
+pub mod discovery;
 pub mod execution;
 pub mod fleet;
 pub mod fwupdate;

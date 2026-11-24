@@ -487,13 +487,13 @@ const user = { id: 'u1', person_id: 'p1', key: 'language', content: 'English', r
   handler = (path, method, body) => {
     const clean = path.split('?')[0]
     if (clean === '/api/v0/config/services/story' && method === 'GET') {
-      return { enabled: true, url: 'http://192.168.1.10:18083', timeout_ms: 4000, bearer_token_set: true, state: 'ready' }
+      return { enabled: true, url: 'http://192.168.1.168:18083', timeout_ms: 4000, bearer_token_set: true, state: 'ready' }
     }
     if (clean === '/api/v0/config/services/joke' && method === 'GET') {
-      return { enabled: true, url: 'http://192.168.1.10:18081', timeout_ms: 4000, bearer_token_set: false, state: 'ready' }
+      return { enabled: true, url: 'http://192.168.1.168:18081', timeout_ms: 4000, bearer_token_set: false, state: 'ready' }
     }
     if (clean === '/api/v0/config/services/radio' && method === 'GET') {
-      return { enabled: true, url: 'http://192.168.1.10:18086', timeout_ms: 4000, bearer_token_set: true, state: 'ready' }
+      return { enabled: true, url: 'http://192.168.1.168:18086', timeout_ms: 4000, bearer_token_set: true, state: 'ready' }
     }
     if (clean === '/api/v0/config/services/story' && method === 'PUT') {
       storyPut = body
@@ -515,9 +515,9 @@ const user = { id: 'u1', person_id: 'p1', key: 'language', content: 'English', r
   const { root, app } = mount(StoryJokeCard)
   await flush()
   await button(root, 'Save services').props.onClick(); await flush()
-  assert.equal(storyPut?.url, 'http://192.168.1.10:18083')
-  assert.equal(jokePut?.url, 'http://192.168.1.10:18081')
-  assert.equal(radioPut?.url, 'http://192.168.1.10:18086')
+  assert.equal(storyPut?.url, 'http://192.168.1.168:18083')
+  assert.equal(jokePut?.url, 'http://192.168.1.168:18081')
+  assert.equal(radioPut?.url, 'http://192.168.1.168:18086')
   await button(root, 'Test connection').props.onClick(); await flush()
   assert.ok(text(root).includes('story: ok · joke: ok · radio: ok'))
   app.unmount()
@@ -529,7 +529,7 @@ const user = { id: 'u1', person_id: 'p1', key: 'language', content: 'English', r
   handler = (path, method, body) => {
     const clean = path.split('?')[0]
     if (clean === '/api/v0/config/services/learning' && method === 'GET') {
-      return { enabled: true, url: 'http://192.168.1.10:18085', timeout_ms: 4000, bearer_token_set: true, state: 'ready' }
+      return { enabled: true, url: 'http://192.168.1.168:18085', timeout_ms: 4000, bearer_token_set: true, state: 'ready' }
     }
     if (clean === '/api/v0/config/services/learning' && method === 'PUT') {
       lrnPut = body
@@ -541,7 +541,7 @@ const user = { id: 'u1', person_id: 'p1', key: 'language', content: 'English', r
   const { root, app } = mount(LearningCard)
   await flush()
   await button(root, 'Save learning config').props.onClick(); await flush()
-  assert.equal(lrnPut?.url, 'http://192.168.1.10:18085')
+  assert.equal(lrnPut?.url, 'http://192.168.1.168:18085')
   await button(root, 'Test learning service').props.onClick(); await flush()
   assert.ok(text(root).includes('configured'))
   assert.ok(text(root).includes('Open phone learning (/learn)'))

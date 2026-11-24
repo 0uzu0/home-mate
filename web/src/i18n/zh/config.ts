@@ -9,7 +9,7 @@ export default {
   cfgIdentitySettings: '设置本机身份',
   cfgProtectedAudio: '逐机声学、KWS、VAD、媒体增益和 EQ',
   cfgProtectedHardware: '唤醒词、反射词表、LED 和物理朝向',
-  cfgProtectedTools: '语音交互、动态工具注册和电脑服务',
+  cfgProtectedTools: '语音交互和动态工具注册',
   cfgProtectedData: '机队接入、凭据、个人记忆和学习数据',
 
   cfgDot2dTitle: 'dot2-d 人格配置包', cfgDot2dReview: '预览 dot2-d 人格配置包', cfgDot2dDownload: '下载仅人格 JSON 配置包',
@@ -42,8 +42,6 @@ export default {
   cfgVoiceWordList: '语音词表（JSON）', cfgVoiceReplaceWords: '替换词表', cfgVoiceListInvalid: '请输入语音词句的 JSON 数组。',
   cfgOpenSocketsReplace: '替换插座列表', cfgOpenSocketsContracts: '插座合同（JSON）', cfgOpenSocketsInvalid: '请输入插座合同的 JSON 数组。',
   cfgOpenSocketsPublication: '插座注册表发布',
-  cfgRemoteSocketReplaceCatalog: '替换能力列表', cfgRemoteSocketCapabilities: '能力列表（JSON）', cfgRemoteSocketCatalogInvalid: '请输入远端插座能力的 JSON 数组。',
-  cfgRemoteSocketPublication: '远端插座配置发布',
   cfgOpenApiReplaceCatalog: '替换操作列表', cfgOpenApiOperations: '操作列表（JSON）', cfgOpenApiCatalogInvalid: '请输入 OpenAPI 操作的 JSON 数组。',
   cfgReplaceMusicConnection: '替换连接', cfgDisableMusicConnection: '停用连接',
   cfgSet: '设为指定值', cfgClear: '移除当前层覆盖', cfgPreview: '预检并查看差异', cfgCommit: '提交已预检变更', cfgRetryCommit: '重试同一提交',

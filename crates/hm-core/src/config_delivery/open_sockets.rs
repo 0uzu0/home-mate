@@ -134,8 +134,8 @@ fn check_bindings_for_edit(
     check_public(c, store, desired)?;
     let document = serde_json::to_value(desired)?;
     if let Some((_, token)) = replacement.filter(|(_, token)| !token.is_empty()) {
-        if super::remote_socket::contains(&document, token)
-            || super::remote_socket::contains(&serde_json::to_value(&previous)?, token)
+        if contains(&document, token)
+            || contains(&serde_json::to_value(&previous)?, token)
             || public_history_contains(c, token)?
         {
             return Err(exposed_token());
@@ -181,7 +181,7 @@ pub(super) fn check_public(
             .secret_get_on(c, &key?)
             .map_err(DeliveryError::internal)?
         {
-            if !token.is_empty() && super::remote_socket::contains(&document, &token) {
+            if !token.is_empty() && contains(&document, &token) {
                 return Err(exposed_token());
             }
         }
@@ -211,12 +211,23 @@ fn public_history_contains(c: &Connection, token: &str) -> Result<bool> {
     let mut rows = query.query([])?;
     while let Some(row) = rows.next()? {
         if let Some(raw) = row.get::<_, Option<String>>(0)? {
-            if super::remote_socket::contains(&serde_json::from_str(&raw)?, token) {
+            if contains(&serde_json::from_str(&raw)?, token) {
                 return Ok(true);
             }
         }
     }
     Ok(false)
+}
+
+fn contains(value: &Value, token: &str) -> bool {
+    match value {
+        Value::String(s) => s.contains(token),
+        Value::Array(values) => values.iter().any(|value| contains(value, token)),
+        Value::Object(fields) => fields
+            .iter()
+            .any(|(key, value)| key.contains(token) || contains(value, token)),
+        _ => false,
+    }
 }
 
 pub(super) fn check_bindings(

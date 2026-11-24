@@ -219,6 +219,11 @@ pub enum GatewayFrame {
         aec_tail_ms: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         profile_version: Option<String>,
+        /// #271: Optional household Bearer token presented by non-loopback LAN
+        /// gateways (e.g. Android phone / smart display) when connecting to a
+        /// paired Core. Loopback gateways remain zero-config trusted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_token: Option<String>,
     },
     Wake {
         device: String,
