@@ -13,11 +13,12 @@ use std::time::Duration;
 use crate::gateway::{PlayTicket, StopOutcome, StopSubmission};
 use crate::tool::{Evidence, ToolCtx};
 
-use super::decode::{spawn_decoder, PcmBlock};
+use super::decode::{select_media_decimation, spawn_decoder, PcmBlock, PcmDecimator};
 use super::remote::open_stream;
 use super::{
-    describe, MediaSession, MediaState, MusicError, MusicRuntime, RepeatMode, Source, Track,
-    MEDIA_SESSION_TTL_MS, PLAY_AHEAD_SECS, PUSH_CHUNK_SECS,
+    describe, remote_play_ahead_budget_secs, MediaSession, MediaState, MusicError, MusicRuntime,
+    RepeatMode, Source, Track, MEDIA_SESSION_TTL_MS, PLAY_AHEAD_SECS, PUSH_CHUNK_SECS,
+    REMOTE_MEDIA_CONGESTION_WAIT_MS, REMOTE_MEDIA_QUEUE_HIGH_WATER,
 };
 
 /// Pure repeat decision for natural end-of-track transitions (music only).
@@ -132,7 +133,10 @@ impl MusicRuntime {
         if first.pcm.is_empty() {
             return Err(("MUSIC_DECODE".into(), "音频流是空的：没有播放".into()));
         }
-        let rate = first.sample_rate;
+        let native_rate = first.sample_rate;
+        let is_loopback = self.hub.device_is_loopback(&device);
+        let compact_link = !is_loopback && self.hub.device_prefers_compact_media(&device);
+        let (decimate_factor, rate) = select_media_decimation(native_rate, compact_link);
         // The device's `accepted` stage is an EVENT, not the terminal receipt:
         // the ticket resolves only on device_confirmed/failed/unknown, and a
         // song's device_confirmed arrives when the stream has DRAINED (minutes
@@ -199,6 +203,7 @@ impl MusicRuntime {
             "music_play_start",
             json!({ "device": device, "play_id": play_id, "source": track.source.as_str(),
                     "id": track.id, "title": track.title, "sample_rate": rate,
+                    "native_sample_rate": native_rate, "compact_link": compact_link,
                     "start_ms": start_ms, "index": index, "tracks": tracks.len(),
                     "repeat": repeat.as_str() }),
         );
@@ -215,6 +220,8 @@ impl MusicRuntime {
                     device,
                     play_id,
                     rate,
+                    decimate_factor,
+                    is_loopback,
                     start_ms,
                     first,
                     rx,
@@ -310,6 +317,8 @@ impl MusicRuntime {
         device: String,
         play_id: String,
         rate: u32,
+        decimate_factor: usize,
+        is_loopback: bool,
         start_ms: u64,
         first: PcmBlock,
         mut rx: tokio::sync::mpsc::Receiver<PcmBlock>,
@@ -321,8 +330,16 @@ impl MusicRuntime {
         let chunk_samples = ((rate as f64 * PUSH_CHUNK_SECS) as usize).max(320);
         let started = std::time::Instant::now();
         let mut last_progress = started;
+        let mut backpressure_since: Option<std::time::Instant> = None;
         let idle_timeout =
             Duration::from_millis(self.stream_idle_timeout_ms.load(Ordering::SeqCst));
+        let play_ahead_budget = |elapsed_secs: f64| {
+            if is_loopback {
+                PLAY_AHEAD_SECS
+            } else {
+                remote_play_ahead_budget_secs(elapsed_secs)
+            }
+        };
         // M3 resume: fetch from the start and discard the first `start_ms` of
         // PCM so every source/format supports resume without server-side seek.
         let to_skip: u64 = start_ms.saturating_mul(rate as u64) / 1000;
@@ -332,6 +349,8 @@ impl MusicRuntime {
         let mut pushed: u64 = 0;
         let mut seq: u64 = 0;
         let mut pending: Vec<i16> = Vec::with_capacity(chunk_samples * 2);
+        let mut decimator = PcmDecimator::new(decimate_factor);
+        let mut decimated: Vec<i16> = Vec::new();
         let mut first_block = Some(first);
         let mut ended = false;
         let total_ms = |pushed: u64| start_ms + pushed * 1000 / rate as u64;
@@ -371,7 +390,7 @@ impl MusicRuntime {
                     _ = tokio::time::sleep(Duration::from_millis(100)) => Step::Idle,
                 },
             };
-            let mut pcm = match step {
+            let pcm = match step {
                 Step::Block(PcmBlock { pcm, .. }) => {
                     last_progress = std::time::Instant::now();
                     pcm
@@ -403,6 +422,15 @@ impl MusicRuntime {
                         return;
                     }
                     if !ended {
+                        decimated.clear();
+                        decimator.flush_into(&mut decimated);
+                        if !decimated.is_empty() {
+                            if skipped < to_skip {
+                                let drop = (to_skip - skipped).min(decimated.len() as u64) as usize;
+                                decimated.drain(..drop);
+                            }
+                            pending.extend_from_slice(&decimated);
+                        }
                         // Decoder finished: the remainder goes out at the same
                         // lead. Pushing it all at once fills the device buffer
                         // with minutes of audio, which makes a stop inaudible.
@@ -410,9 +438,24 @@ impl MusicRuntime {
                             if cancel.load(Ordering::SeqCst) || !self.hub.play_active(&play_id) {
                                 break;
                             }
-                            let ahead =
-                                pushed as f64 / rate as f64 - started.elapsed().as_secs_f64();
-                            if ahead > PLAY_AHEAD_SECS {
+                            if !is_loopback
+                                && self.hub.device_media_queue_depth(&device)
+                                    >= REMOTE_MEDIA_QUEUE_HIGH_WATER
+                            {
+                                let since =
+                                    *backpressure_since.get_or_insert_with(std::time::Instant::now);
+                                if since.elapsed()
+                                    >= Duration::from_millis(REMOTE_MEDIA_CONGESTION_WAIT_MS)
+                                {
+                                    self.hub.mark_device_media_congested(&device);
+                                }
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                continue;
+                            }
+                            backpressure_since = None;
+                            let elapsed_secs = started.elapsed().as_secs_f64();
+                            let ahead = pushed as f64 / rate as f64 - elapsed_secs;
+                            if ahead > play_ahead_budget(elapsed_secs) {
                                 tokio::time::sleep(Duration::from_millis(50)).await;
                                 continue;
                             }
@@ -454,22 +497,42 @@ impl MusicRuntime {
                     return;
                 }
             };
+            decimated.clear();
+            decimator.push_into(&pcm, &mut decimated);
+            if decimated.is_empty() {
+                continue;
+            }
             if skipped < to_skip {
-                let drop = (to_skip - skipped).min(pcm.len() as u64) as usize;
-                pcm.drain(..drop);
+                let drop = (to_skip - skipped).min(decimated.len() as u64) as usize;
+                decimated.drain(..drop);
                 skipped += drop as u64;
-                if pcm.is_empty() {
+                if decimated.is_empty() {
                     continue;
                 }
             }
-            pending.extend_from_slice(&pcm);
+            pending.extend_from_slice(&decimated);
             while pending.len() >= chunk_samples {
+                if cancel.load(Ordering::SeqCst) || !self.hub.play_active(&play_id) {
+                    break;
+                }
+                if !is_loopback
+                    && self.hub.device_media_queue_depth(&device) >= REMOTE_MEDIA_QUEUE_HIGH_WATER
+                {
+                    let since = *backpressure_since.get_or_insert_with(std::time::Instant::now);
+                    if since.elapsed() >= Duration::from_millis(REMOTE_MEDIA_CONGESTION_WAIT_MS) {
+                        self.hub.mark_device_media_congested(&device);
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+                backpressure_since = None;
                 // Lead control: wall clock since start is the speaker's
                 // position (the device answers stops in ~40 ms; nothing else
                 // reports playhead). Only what THIS play pushed counts — the
                 // resume offset is already behind us.
-                let ahead = pushed as f64 / rate as f64 - started.elapsed().as_secs_f64();
-                if ahead > PLAY_AHEAD_SECS {
+                let elapsed_secs = started.elapsed().as_secs_f64();
+                let ahead = pushed as f64 / rate as f64 - elapsed_secs;
+                if ahead > play_ahead_budget(elapsed_secs) {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     continue;
                 }
@@ -1226,6 +1289,19 @@ impl MusicRuntime {
                 }
                 let (title, _pos, outcome, had_play) =
                     Self::pause_and_wait(self, device, "tool", &cancel).await?;
+                if !had_play {
+                    let mut out = ControlOutcome::media(
+                        "pause",
+                        title,
+                        String::new(),
+                        Evidence::Observed,
+                        false,
+                        "media",
+                    )
+                    .into_no_op();
+                    out.stop_outcome = Some(outcome);
+                    return Ok(out);
+                }
                 let confirmed = outcome.confirmed();
                 let out = ControlOutcome::media(
                     "pause",
@@ -1244,8 +1320,7 @@ impl MusicRuntime {
                     confirmed,
                     "media",
                 );
-                let out = out.with_stop_outcome(outcome);
-                Ok(if had_play { out } else { out.into_no_op() })
+                Ok(out.with_stop_outcome(outcome))
             }
             ("media", "resume") => {
                 let session = self.live_session(device).ok_or(MusicError::NoMedia)?;
@@ -1260,7 +1335,8 @@ impl MusicRuntime {
                         Evidence::DeviceConfirmed,
                         true,
                         "media",
-                    ));
+                    )
+                    .into_no_op());
                 }
                 let index = session.index;
                 let position = session.position_ms;
@@ -1339,11 +1415,68 @@ impl MusicRuntime {
                     "media",
                 ))
             }
+            ("media", "previous") => {
+                let session = self.live_session(device).ok_or(MusicError::NoMedia)?;
+                if session.tracks.is_empty() {
+                    return Err(MusicError::NoMedia);
+                }
+                let prev = if session.index > 0 {
+                    session.index - 1
+                } else if session.repeat == RepeatMode::All {
+                    session.tracks.len() - 1
+                } else {
+                    0
+                };
+                let tracks = session.tracks.clone();
+                let repeat = session.repeat;
+                let (play_id, evidence, detail) = self
+                    .play_index_with_repeat(
+                        device.to_string(),
+                        tracks.clone(),
+                        prev,
+                        0,
+                        cancel,
+                        repeat,
+                    )
+                    .await
+                    .map_err(|(code, detail)| {
+                        self.note(
+                            "media_previous_failed",
+                            json!({ "device": device, "code": code, "detail": detail }),
+                        );
+                        MusicError::NotAvailable
+                    })?;
+                let confirmed = matches!(evidence, Evidence::DeviceConfirmed | Evidence::Sent);
+                Ok(ControlOutcome::media(
+                    "play",
+                    tracks
+                        .get(prev)
+                        .map(|t| t.title.clone())
+                        .unwrap_or_default(),
+                    format!("{detail}; play_id={play_id}"),
+                    evidence,
+                    confirmed,
+                    "media",
+                ))
+            }
             ("media", "stop") => {
                 let (title, outcome, had_play) = self
                     .stop_and_wait(device, "tool", &cancel)
                     .await
                     .ok_or(MusicError::NoMedia)?;
+                if !had_play {
+                    let mut out = ControlOutcome::media(
+                        "stop",
+                        title,
+                        String::new(),
+                        Evidence::Observed,
+                        false,
+                        "media",
+                    )
+                    .into_no_op();
+                    out.stop_outcome = Some(outcome);
+                    return Ok(out);
+                }
                 let confirmed = outcome.confirmed();
                 let out = ControlOutcome::media(
                     "stop",
@@ -1362,8 +1495,7 @@ impl MusicRuntime {
                     confirmed,
                     "media",
                 );
-                let out = out.with_stop_outcome(outcome);
-                Ok(if had_play { out } else { out.into_no_op() })
+                Ok(out.with_stop_outcome(outcome))
             }
             ("program", "pause") => {
                 let voice = self.voice().ok_or(MusicError::NoProgram)?;
@@ -1445,8 +1577,8 @@ impl MusicRuntime {
                 )
                 .with_repeat(repeat))
             }
-            // 下一首 is a queue operation; a program has no queue.
-            ("program", "next") => Err(MusicError::NoMedia),
+            // 下一首 / 上一首 are queue operations; a program has no queue.
+            ("program", "next" | "previous") => Err(MusicError::NoMedia),
             ("program", "repeat") => Err(MusicError::RepeatUnsupported),
             _ => Err(MusicError::NotAvailable),
         }
@@ -1483,7 +1615,9 @@ impl ControlOutcome {
         self.no_op = true;
         self.confirmed = false;
         self.evidence = Evidence::Observed;
-        self.detail = "没有活动播放；仅更新本地会话，没有设备停稳回执".into();
+        if self.detail.trim().is_empty() {
+            self.detail = "没有活动播放；仅更新本地会话，没有设备停稳回执".into();
+        }
         self
     }
     fn media(
@@ -1614,5 +1748,41 @@ mod tests {
         playing.state = MediaState::Playing;
         music.seed_media_session_for_test(dev, playing);
         assert!(!music.media_pause_in_flight(dev, now + 100));
+    }
+
+    #[tokio::test]
+    async fn p2_2_control_outcome_into_no_op_preserves_specific_detail_and_honest_no_active_play() {
+        let music = runtime();
+        let dev = "dot2-d";
+        let now = crate::id::now_ms();
+
+        // 1. Pausing an already-paused session preserves specific detail "已经是暂停的".
+        music.seed_media_session_for_test(dev, paused_at(now));
+        let paused_again = music.control(dev, "pause", Some("media")).await.unwrap();
+        assert!(paused_again.no_op);
+        assert_eq!(paused_again.detail, "已经是暂停的");
+
+        // 2. Stopping when session is paused (had_play == false) reports honest no-active-play
+        //    detail rather than falsely claiming "停止请求已发出".
+        let stopped_idle = music.control(dev, "stop", Some("media")).await.unwrap();
+        assert!(stopped_idle.no_op);
+        assert_eq!(
+            stopped_idle.detail,
+            "没有活动播放；仅更新本地会话，没有设备停稳回执"
+        );
+        assert!(!stopped_idle.detail.contains("停止请求已发出"));
+
+        // 3. Pausing a Playing session whose play_id is None (had_play == false) also reports honest no-op.
+        let mut ghost_playing = paused_at(now);
+        ghost_playing.state = MediaState::Playing;
+        ghost_playing.play_id = None;
+        music.seed_media_session_for_test(dev, ghost_playing);
+        let paused_ghost = music.control(dev, "pause", Some("media")).await.unwrap();
+        assert!(paused_ghost.no_op);
+        assert_eq!(
+            paused_ghost.detail,
+            "没有活动播放；仅更新本地会话，没有设备停稳回执"
+        );
+        assert!(!paused_ghost.detail.contains("停止请求已发出"));
     }
 }

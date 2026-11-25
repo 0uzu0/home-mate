@@ -1033,11 +1033,40 @@ fn ensure_reflex_words(paths: &Paths) -> WordsWork {
             }
         }
     };
-    let device = mode
+    let local_stable_id: Option<String> = paths
+        .core_request("GET", "/api/v0/status", None, Duration::from_secs(5))
+        .ok()
+        .filter(|r| r.status == 200)
+        .and_then(|r| serde_json::from_slice::<Value>(&r.body).ok())
+        .and_then(|s| {
+            s.get("gateway")
+                .and_then(|g| g.get("devices"))
+                .and_then(|d| d.as_array())
+                .and_then(|devs| crate::health::select_gateway_device(devs, ""))
+                .and_then(|d| d.get("stable_id"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        });
+    let mode_devices = mode
         .as_ref()
         .and_then(|m| m.get("devices"))
-        .and_then(|d| d.as_array())
-        .and_then(|d| d.first());
+        .and_then(|d| d.as_array());
+    let device = mode_devices.and_then(|devs| {
+        local_stable_id
+            .as_deref()
+            .and_then(|sid| {
+                devs.iter()
+                    .find(|d| d.get("device").and_then(|v| v.as_str()) == Some(sid))
+            })
+            .or_else(|| devs.first())
+    });
+    let deploy_device = local_stable_id.or_else(|| {
+        device
+            .and_then(|d| d.get("device"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    });
     let kws_state = device
         .and_then(|d| d.get("kws"))
         .and_then(|k| k.get("state"))
@@ -1086,11 +1115,14 @@ fn ensure_reflex_words(paths: &Paths) -> WordsWork {
             hash: loaded.to_string(),
         };
     }
+    let deploy_body = deploy_device
+        .as_deref()
+        .and_then(|dev| serde_json::to_vec(&serde_json::json!({ "device": dev })).ok());
     match paths.core_request(
         "POST",
         "/api/v0/reflex/deploy",
-        None,
-        Duration::from_secs(15),
+        deploy_body.as_deref(),
+        Duration::from_secs(30),
     ) {
         Ok(r) if r.status == 200 => {
             let v: Value = serde_json::from_slice(&r.body).unwrap_or(Value::Null);
@@ -1502,6 +1534,103 @@ mod kws_tests {
             std::fs::read_to_string(paths.kws_dir().join("kw.txt")).unwrap(),
             "keep-me\n"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_reflex_words_targets_local_speaker_in_multi_gateway_setup() {
+        use std::io::{BufRead, Read, Write};
+        use std::sync::{Arc, Mutex};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured_deploy_body = Arc::new(Mutex::new(Option::<String>::None));
+        let body_slot = captured_deploy_body.clone();
+
+        let srv = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut req_line = String::new();
+                let _ = reader.read_line(&mut req_line);
+                let mut content_len = 0usize;
+                loop {
+                    let mut h = String::new();
+                    if reader.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
+                        break;
+                    }
+                    if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; content_len];
+                if content_len > 0 {
+                    let _ = reader.read_exact(&mut body);
+                }
+                let resp_body = if req_line.starts_with("GET /api/v0/mode ") {
+                    // Android listed FIRST with running kws; local speaker dot2-d listed SECOND with down kws.
+                    serde_json::json!({
+                        "devices": [
+                            {
+                                "device": "android-phone-1",
+                                "kws": { "state": "running", "local_exit": 1 },
+                                "reflex": { "words": [{ "intent": "retreat", "enabled": true }] }
+                            },
+                            {
+                                "device": "dot2-d",
+                                "kws": { "state": "down", "local_exit": 0 },
+                                "reflex": { "words": [{ "intent": "retreat", "enabled": true }] }
+                            }
+                        ]
+                    })
+                    .to_string()
+                } else if req_line.starts_with("GET /api/v0/status ") {
+                    serde_json::json!({
+                        "gateway": {
+                            "devices": [
+                                { "stable_id": "android-phone-1", "loopback": false, "firmware": "android-v2" },
+                                { "stable_id": "dot2-d", "loopback": true, "firmware": "hm-firmware 0.31.0 abc (emos)" }
+                            ]
+                        }
+                    })
+                    .to_string()
+                } else if req_line.starts_with("POST /api/v0/reflex/deploy ") {
+                    *body_slot.lock().unwrap() = Some(String::from_utf8_lossy(&body).into_owned());
+                    serde_json::json!({ "hash": "deadbeef", "words": 6 }).to_string()
+                } else {
+                    "{}".to_string()
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    resp_body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(resp_body.as_bytes());
+            }
+        });
+
+        let dir = temp("multi-gw-reflex");
+        let mut paths = Paths::for_test(dir.join("hm"), dir.join("fw"));
+        paths.core_url = format!("http://{addr}");
+        let work = ensure_reflex_words(&paths);
+        srv.join().unwrap();
+
+        match work {
+            WordsWork::Deployed { hash, words } => {
+                assert_eq!(hash, "deadbeef");
+                assert_eq!(words, 6);
+            }
+            other => panic!("expected WordsWork::Deployed for local speaker dot2-d, got {other:?}"),
+        }
+        let sent = captured_deploy_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("POST /api/v0/reflex/deploy body must be captured");
+        let parsed: Value = serde_json::from_str(&sent).unwrap();
+        assert_eq!(parsed["device"], serde_json::json!("dot2-d"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

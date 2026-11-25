@@ -29,6 +29,7 @@ pub struct Authority {
     physical_device: Option<String>,
     write_scope: Option<(String, String)>,
     principal: String,
+    lan_exempt: bool,
     epoch: u64,
     lease: Option<Arc<Lease>>,
     store: Arc<Store>,
@@ -61,6 +62,7 @@ impl Authority {
             scope,
             write_scope,
             principal: "internal".into(),
+            lan_exempt: false,
             epoch: epoch as u64,
             lease: None,
             store,
@@ -69,12 +71,29 @@ impl Authority {
         })
     }
 
-    pub(crate) fn anonymous(store: Arc<Store>, principal: Option<String>) -> Result<Self, String> {
+    pub(crate) fn internal_with_lan_exempt(
+        store: Arc<Store>,
+        scope: ScopeContext,
+        lan_exempt: bool,
+    ) -> Result<Self, String> {
+        Ok(Self::internal(store, scope)?.with_lan_exempt(lan_exempt))
+    }
+
+    pub fn anonymous(store: Arc<Store>, principal: Option<String>) -> Result<Self, String> {
         let mut authority = Self::internal(store, ScopeContext::default())?;
         authority.principal = principal
             .map(|p| format!("management:{p}"))
             .unwrap_or_else(|| "anonymous".into());
         Ok(authority)
+    }
+
+    pub fn with_lan_exempt(mut self, lan_exempt: bool) -> Self {
+        self.lan_exempt = lan_exempt;
+        self
+    }
+
+    pub fn is_lan_exempt(&self) -> bool {
+        self.lan_exempt
     }
 
     pub(crate) fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
@@ -221,8 +240,21 @@ impl Authority {
         Ok(())
     }
     fn session_fingerprint(&self) -> Result<String, String> {
+        // Physical device sessions (`dev:*`) are owned by the device identity
+        // (`DeviceSlot::can_be_claimed_by` blocks lower-trust hijacking) and are
+        // bound/managed by `SessionStore` regardless of whether a LAN gateway
+        // currently connects unauthenticated (`lan_exempt = true`) or paired
+        // (`lan_exempt = false`). Anonymous HTTP chat sessions (`physical_device
+        // == None`) keep `lan_exempt` in the fingerprint so unauthenticated LAN
+        // chat cannot share a session with loopback anonymous chat.
+        let fingerprint_lan_exempt = if self.physical_device.is_some() {
+            false
+        } else {
+            self.lan_exempt
+        };
         serde_json::to_string(&(
             &self.principal,
+            fingerprint_lan_exempt,
             &self.scope.person_id,
             &self.scope.device_id,
             &self.write_scope,
@@ -254,23 +286,56 @@ impl Authority {
             .optional()?;
         Ok(existing.is_some_and(|(key, epoch)| key == fingerprint && epoch as u64 == self.epoch))
     }
-    pub(crate) fn bind_session(&self, session: &str) -> Result<(), String> {
-        let fingerprint = self.session_fingerprint()?;
-        self.store.with(|c| {
-            let tx = c.unchecked_transaction()?;
-            self.check_in(&tx)?;
-            let existing: Option<(String,i64)> = tx.query_row("SELECT authority,data_epoch FROM execution_sessions WHERE session_id=?1", [session], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
-            match existing {
-                Some((key,epoch)) if key == fingerprint && epoch as u64 == self.epoch => {},
-                Some(_) => return Err(crate::store::StoreError::Authority("session belongs to another execution scope".into())),
-                None => {
-                    let messages: i64 = tx.query_row("SELECT count(*) FROM messages WHERE session_id=?1", [session], |r| r.get(0))?;
-                    if messages != 0 { return Err(crate::store::StoreError::Authority("SESSION_SCOPE_UNVERIFIED".into())); }
-                    tx.execute("INSERT INTO execution_sessions(session_id,authority,data_epoch) VALUES (?1,?2,?3)", rusqlite::params![session,fingerprint,self.epoch as i64])?;
-                }
+    pub(crate) fn bind_session_in(
+        &self,
+        c: &Connection,
+        session: &str,
+    ) -> crate::store::Result<()> {
+        let fingerprint = self
+            .session_fingerprint()
+            .map_err(crate::store::StoreError::Authority)?;
+        let existing: Option<(String, i64)> = c
+            .query_row(
+                "SELECT authority,data_epoch FROM execution_sessions WHERE session_id=?1",
+                [session],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        match existing {
+            Some((key, epoch)) if key == fingerprint && epoch as u64 == self.epoch => {}
+            Some(_) => {
+                return Err(crate::store::StoreError::Authority(
+                    "session belongs to another execution scope".into(),
+                ))
             }
-            tx.commit()?;
-            Ok(())
-        }).map_err(|e| e.to_string())
+            None => {
+                let messages: i64 = c.query_row(
+                    "SELECT count(*) FROM messages WHERE session_id=?1",
+                    [session],
+                    |r| r.get(0),
+                )?;
+                if messages != 0 {
+                    return Err(crate::store::StoreError::Authority(
+                        "SESSION_SCOPE_UNVERIFIED".into(),
+                    ));
+                }
+                c.execute(
+                    "INSERT INTO execution_sessions(session_id,authority,data_epoch) VALUES (?1,?2,?3)",
+                    rusqlite::params![session, fingerprint, self.epoch as i64],
+                )?;
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn bind_session(&self, session: &str) -> Result<(), String> {
+        self.store
+            .with(|c| {
+                let tx = c.unchecked_transaction()?;
+                self.check_in(&tx)?;
+                self.bind_session_in(&tx, session)?;
+                tx.commit()?;
+                Ok(())
+            })
+            .map_err(|e| e.to_string())
     }
 }

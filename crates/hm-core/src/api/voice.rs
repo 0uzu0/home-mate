@@ -9,8 +9,17 @@ use serde_json::{json, Value};
 use std::convert::Infallible;
 use std::sync::Arc;
 
-pub(super) async fn mode_get(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let mut snapshot = state.voice.mode_snapshot();
+#[derive(Deserialize, Default)]
+pub(super) struct ModeQuery {
+    #[serde(default)]
+    device: Option<String>,
+}
+
+pub(super) async fn mode_get(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ModeQuery>,
+) -> Json<Value> {
+    let mut snapshot = state.voice.mode_snapshot_for(q.device.as_deref());
     // R1j/P0-b: the home service's state belongs in the same snapshot the
     // console already polls (voice settings + per-device facts). Read from
     // the runtime that would execute the tool, never from a UI constant.
@@ -71,8 +80,10 @@ pub(super) struct SessionCloseBody {
 
 pub(super) async fn session_close(
     State(state): State<Arc<AppState>>,
+    lan_exempt: Option<axum::Extension<super::LanExemptUnauthenticated>>,
     Json(body): Json<SessionCloseBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    super::reject_lan_exempt_loopback_device(&state, lan_exempt.as_ref(), &body.device)?;
     if !state.hub.device_exists(&body.device) {
         return Err((
             StatusCode::NOT_FOUND,
@@ -112,7 +123,7 @@ pub(super) struct ModePut {
     /// Local wake-ack phrases (user directive 2026-11-09): bare wakes
     /// answer from pre-synthesized device-local WAVs, never the cloud.
     #[serde(default)]
-    wake_ack: Option<crate::voice::WakeAckSettings>,
+    wake_ack: Option<crate::voice::WakeAckPatch>,
     /// Deterministic retreat intent ("退下" family) toggle.
     #[serde(default)]
     retreat_intent: Option<bool>,
@@ -163,9 +174,10 @@ pub(super) struct ModePut {
     truncation_notice: Option<String>,
     /// R2 (2026-11-13): the spoken-delivery policy (sentences/characters per
     /// voice answer, what counts as a long-content request, the continuation
-    /// clue). The composite edit validates it before storing a single change.
+    /// clue). Partial patch so omitting `detail_words`/`long_form_words`
+    /// preserves existing stored lists instead of overwriting with defaults.
     #[serde(default)]
-    spoken: Option<crate::voice::SpokenDeliverySettings>,
+    spoken: Option<crate::voice::SpokenDeliveryPatch>,
     /// 2026-11-14 (commercial privacy): whether idle room speech is
     /// transcribed so a missed keyword can still wake the assistant. Off =
     /// ASR runs only inside an open session. Global policy, applied live.
@@ -180,19 +192,95 @@ pub(super) struct ModePut {
     wake_arbitration: Option<String>,
 }
 
+impl ModePut {
+    /// Fields that alter prompts, privacy policy, lexicons, calibration, or
+    /// synthesis jobs require an authenticated admin Bearer token — never
+    /// unauthenticated `lan_gateway_exempt` LAN access.
+    fn has_privileged_fields(&self) -> bool {
+        let fw = &self.follow_window;
+        fw.follow_window_enabled.is_some()
+            || fw.follow_window_ms.is_some()
+            || fw.context_window_ms.is_some()
+            || fw.followup_credits.is_some()
+            || fw.assistant_name.is_some()
+            || fw.persona_prompt.is_some()
+            || fw.system_prompt_override.is_some()
+            || fw.kws_threshold.is_some()
+            || fw.kws_score.is_some()
+            || self.proactive_speech.is_some()
+            || self.wake_words.is_some()
+            || self.vad.is_some()
+            || self.follow_window_tone.is_some()
+            || self.wake_ack.as_ref().is_some_and(|w| {
+                w.enabled.is_some() || w.phrases.is_some() || w.resynth == Some(true)
+            })
+            || self.retreat_intent.is_some()
+            || self.retreat_words.is_some()
+            || self.retreat_ack.is_some()
+            || self.window_close_ack.is_some()
+            || self.tail_blind_ms.is_some()
+            || self.media_trim_db.is_some()
+            || self.barge_in.is_some()
+            || self.keyword_interrupt.is_some()
+            || self.barge_protect_ms.is_some()
+            || self.filler.is_some()
+            || self.stop_intents.is_some()
+            || self.truncation_notice.is_some()
+            || self.spoken.is_some()
+            || self.asr_wake_fallback.is_some()
+            || self.proactive_asr_wake.is_some()
+            || self.wake_arbitration.is_some()
+    }
+}
+
+pub(super) async fn mode_put_global(
+    State(state): State<Arc<AppState>>,
+    lan_exempt: Option<axum::Extension<super::LanExemptUnauthenticated>>,
+    Json(body): Json<ModePut>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if lan_exempt.is_some() {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": "admin bearer token required for global mode settings"
+            })),
+        ));
+    }
+    apply_mode_put(&state, "global", body)
+}
+
 pub(super) async fn mode_put(
     State(state): State<Arc<AppState>>,
     Path(device): Path<String>,
+    lan_exempt: Option<axum::Extension<super::LanExemptUnauthenticated>>,
     Json(body): Json<ModePut>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    super::reject_lan_exempt_loopback_device(&state, lan_exempt.as_ref(), &device)?;
+    if lan_exempt.is_some() && body.has_privileged_fields() {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": "admin bearer token required for privileged mode settings"
+            })),
+        ));
+    }
     if !state.hub.device_exists(&device) {
         return Err((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": format!("unknown device '{device}'") })),
         ));
     }
+    apply_mode_put(&state, &device, body)
+}
+
+fn apply_mode_put(
+    state: &Arc<AppState>,
+    device: &str,
+    body: ModePut,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let wake_ack = body.wake_ack;
     let mut patch = body.follow_window;
-    patch.spoken = body.spoken;
+    patch.spoken_patch = body.spoken;
     patch.idle_asr_enabled = body.proactive_asr_wake.or(body.asr_wake_fallback);
     patch.wake_arbitration = body
         .wake_arbitration
@@ -204,13 +292,13 @@ pub(super) async fn mode_put(
         })
         .transpose()?;
     match state.voice.set_mode_with_follow_window(
-        &device,
+        device,
         body.duplex_requested,
         body.proactive_speech,
         body.wake_words,
         body.vad,
         body.follow_window_tone,
-        body.wake_ack,
+        wake_ack,
         body.retreat_intent,
         body.retreat_words,
         body.retreat_ack,
@@ -280,9 +368,17 @@ pub(super) async fn voice_announce_post(
     State(state): State<Arc<AppState>>,
     Json(body): Json<crate::voice::AnnounceRequest>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    let task_known = body
+        .task_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some_and(|tid| {
+            state.tasks.exists(tid) || state.master_brain.task_snapshot(tid).is_some()
+        });
     state
         .voice
-        .enqueue_announce(body)
+        .enqueue_announce_checked(body, task_known)
         .map(|v| (StatusCode::ACCEPTED, Json(v)))
         .map_err(|e| {
             let status = StatusCode::from_u16(e.status).unwrap_or(StatusCode::BAD_REQUEST);
@@ -314,6 +410,7 @@ fn default_source() -> String {
 
 pub(super) async fn chat(
     State(state): State<Arc<AppState>>,
+    lan_exempt: Option<axum::Extension<super::LanExemptUnauthenticated>>,
     headers: axum::http::HeaderMap,
     Json(req): Json<ChatRequest>,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)>
@@ -354,7 +451,8 @@ pub(super) async fn chat(
         (authority, Some(session))
     } else {
         let authority = crate::execution::Authority::anonymous(state.store.clone(), principal)
-            .map_err(crate::execution::api::error)?;
+            .map_err(crate::execution::api::error)?
+            .with_lan_exempt(lan_exempt.is_some());
         if req
             .session_id
             .as_deref()
@@ -408,22 +506,30 @@ pub(super) struct CancelRequest {
 
 pub(super) async fn cancel(
     State(state): State<Arc<AppState>>,
+    lan_exempt: Option<axum::Extension<super::LanExemptUnauthenticated>>,
     Json(req): Json<CancelRequest>,
-) -> Json<Value> {
-    match state.tasks.request_cancel(&req.task_id) {
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if lan_exempt.is_some() {
+        if let Some(session_id) = state.tasks.session_id_for(&req.task_id) {
+            super::reject_lan_exempt_loopback_session(&state, lan_exempt.as_ref(), &session_id)?;
+        }
+    }
+    Ok(match state.tasks.request_cancel(&req.task_id) {
         Some(true) => Json(json!({ "task_id": req.task_id, "result": "cancel_requested" })),
         Some(false) => Json(json!({ "task_id": req.task_id, "result": "not_running" })),
         None => Json(json!({ "task_id": req.task_id, "result": "unknown_task" })),
-    }
+    })
 }
 
 pub(super) async fn session_messages(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Json<Value> {
+    lan_exempt: Option<axum::Extension<super::LanExemptUnauthenticated>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    super::reject_lan_exempt_loopback_session(&state, lan_exempt.as_ref(), &id)?;
     match state.sessions.messages(&id) {
-        Ok(msgs) => Json(json!({ "session_id": id, "messages": msgs })),
-        Err(e) => Json(json!({ "error": e.to_string() })),
+        Ok(msgs) => Ok(Json(json!({ "session_id": id, "messages": msgs }))),
+        Err(e) => Ok(Json(json!({ "error": e.to_string() }))),
     }
 }
 
@@ -517,21 +623,59 @@ pub(super) async fn reflex_put(
         "warnings": crate::config::reflex_warnings(&saved),
     });
     if body.deploy {
-        let device = body
+        let targets: Vec<String> = match body
             .device
-            .or_else(|| state.hub.primary_audio_out().map(|d| d.stable_id))
-            .ok_or_else(|| {
-                (
-                    StatusCode::CONFLICT,
-                    Json(json!({ "error": "no audio device online" })),
-                )
-            })?;
-        let deployed = state
-            .voice
-            .deploy_reflex_auto(&device)
-            .await
-            .map_err(|e| (StatusCode::CONFLICT, Json(json!({ "error": e }))))?;
-        out["deploy"] = deployed;
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(d) => vec![d.to_string()],
+            None => {
+                let mut devs = state.hub.devices_with_cap("audio_in");
+                if devs.is_empty() {
+                    devs = state.hub.audio_out_devices();
+                }
+                devs
+            }
+        };
+        if targets.is_empty() {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "no audio device online" })),
+            ));
+        }
+        let mut results = Vec::with_capacity(targets.len());
+        let mut first_ok: Option<Value> = None;
+        let mut first_err: Option<String> = None;
+        for dev in &targets {
+            match state.voice.deploy_reflex_auto(dev).await {
+                Ok(deployed) => {
+                    if first_ok.is_none() {
+                        first_ok = Some(deployed.clone());
+                    }
+                    results.push(deployed);
+                }
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e.clone());
+                    }
+                    results.push(json!({ "device": dev, "error": e }));
+                }
+            }
+        }
+        if let Some(mut primary) = first_ok {
+            if targets.len() > 1 {
+                if let Some(obj) = primary.as_object_mut() {
+                    obj.insert("devices".into(), json!(results));
+                }
+            }
+            out["deploy"] = primary;
+        } else {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({ "error": first_err.unwrap_or_else(|| "deploy failed".into()) })),
+            ));
+        }
     }
     Ok(Json(out))
 }
@@ -589,9 +733,19 @@ pub(super) async fn config_audio_put(
             Json(json!({ "error": e.to_string() })),
         )
     })?;
-    // Apply to every audio-out device that is online; the gateway logs the
-    // applied curve and the core notes which devices were sent.
-    let devices = state.hub.audio_out_devices();
+    // Apply to legacy (pre-v2) audio-out devices and v2 devices that advertise
+    // `config_block_audio_eq` (or `audio_eq`); skip v2 gateways (e.g. Android)
+    // that advertise `config_apply_v2` without EQ support.
+    let devices: Vec<String> = state
+        .hub
+        .audio_out_devices()
+        .into_iter()
+        .filter(|d| {
+            !state.hub.device_supports(d, "config_apply_v2")
+                || state.hub.device_supports(d, "config_block_audio_eq")
+                || state.hub.device_supports(d, "audio_eq")
+        })
+        .collect();
     let mut sent = Vec::new();
     let mut errors = Vec::new();
     for device in devices {
@@ -639,19 +793,57 @@ pub(super) async fn reflex_deploy(
             )
         })?
     };
-    let device = body
+    let targets: Vec<String> = match body
         .device
-        .or_else(|| state.hub.primary_audio_out().map(|d| d.stable_id))
-        .ok_or_else(|| {
-            (
-                StatusCode::CONFLICT,
-                Json(json!({ "error": "no audio device online" })),
-            )
-        })?;
-    let out = state
-        .voice
-        .deploy_reflex_auto(&device)
-        .await
-        .map_err(|e| (StatusCode::CONFLICT, Json(json!({ "error": e }))))?;
-    Ok(Json(out))
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(d) => vec![d.to_string()],
+        None => {
+            let mut devs = state.hub.devices_with_cap("audio_in");
+            if devs.is_empty() {
+                devs = state.hub.audio_out_devices();
+            }
+            devs
+        }
+    };
+    if targets.is_empty() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "no audio device online" })),
+        ));
+    }
+    let mut results = Vec::with_capacity(targets.len());
+    let mut first_ok: Option<Value> = None;
+    let mut first_err: Option<String> = None;
+    for dev in &targets {
+        match state.voice.deploy_reflex_auto(dev).await {
+            Ok(deployed) => {
+                if first_ok.is_none() {
+                    first_ok = Some(deployed.clone());
+                }
+                results.push(deployed);
+            }
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e.clone());
+                }
+                results.push(json!({ "device": dev, "error": e }));
+            }
+        }
+    }
+    if let Some(mut primary) = first_ok {
+        if targets.len() > 1 {
+            if let Some(obj) = primary.as_object_mut() {
+                obj.insert("devices".into(), json!(results));
+            }
+        }
+        Ok(Json(primary))
+    } else {
+        Err((
+            StatusCode::CONFLICT,
+            Json(json!({ "error": first_err.unwrap_or_else(|| "deploy failed".into()) })),
+        ))
+    }
 }

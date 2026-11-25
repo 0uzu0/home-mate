@@ -109,7 +109,7 @@ async fn a_word_outside_the_table_is_a_no_action_fact() {
     explicit_request(&state, &gw, 1, "你好高达").await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    send_keyword(&gw, 2, "退下", false).await;
+    send_keyword(&gw, 2, "未配置词", false).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     let log = state.voice.recent(300);
     assert!(

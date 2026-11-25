@@ -173,10 +173,14 @@ function kindTone(kind: string): 'ok' | 'warn' | 'info' | 'muted' {
 }
 
 watch(
-  () => props.mode,
-  (mode) => {
-    if (!mode) return
-    if (!touched.value) value.value = mode.wake_arbitration?.mode ?? 'off'
+  [() => props.mode, () => props.device],
+  ([mode, device], [, prevDevice]) => {
+    const switchedDevice = prevDevice?.device !== undefined && prevDevice.device !== device?.device
+    if (switchedDevice) touched.value = false
+    if (!mode && !device) return
+    if (!touched.value) {
+      value.value = device?.wake_arbitration ?? mode?.wake_arbitration?.mode ?? 'off'
+    }
   },
   { immediate: true },
 )
@@ -203,6 +207,9 @@ async function save(): Promise<void> {
     :title="t('arbTitle')"
     :hint="t('arbHint')"
   >
+    <template v-if="device" #actions>
+      <Pill size="sm" tone="accent" mono>{{ t('scopeThisDevice', { device: device.device }) }}</Pill>
+    </template>
     <EmptyState v-if="!device" :title="t('noDevice')" />
 
     <template v-else>

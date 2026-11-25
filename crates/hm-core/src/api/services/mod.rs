@@ -21,7 +21,7 @@ pub(super) use system::{
 pub(super) use tools::*;
 
 use super::*;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
@@ -78,7 +78,16 @@ pub(super) fn reset_device_history_if_capabilities_changed(state: &AppState, bef
 
 // --- status -------------------------------------------------------------------
 
-pub(super) async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
+#[derive(Default, Deserialize)]
+pub(super) struct StatusQuery {
+    #[serde(default)]
+    pub(super) device: Option<String>,
+}
+
+pub(super) async fn status(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<StatusQuery>,
+) -> Json<Value> {
     let services = state.config.statuses().unwrap_or(json!({}));
     // R2 maintenance (2026-11-13): the last retention/checkpoint run as the
     // store recorded it (window, deleted rows, WAL frames). Null until the
@@ -98,53 +107,86 @@ pub(super) async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
         }
         None => db = json!({ "schema": schema }),
     }
+    // Per-device `wifi_provisioning` tracking (`MG-P2-04`): preserve every
+    // device's active provisioning request without letting sibling devices
+    // overwrite or hide each other.
     let recent_voice = state.voice.recent(100);
     let mut resolved_wifi_devices = std::collections::BTreeSet::new();
-    let mut wifi_provisioning = json!({
-        "requested": false,
-        "device": Value::Null,
-        "action": Value::Null,
-        "trigger": Value::Null,
-        "ts_ms": Value::Null,
-    });
+    let mut wifi_provisioning_by_device: std::collections::BTreeMap<String, Value> =
+        std::collections::BTreeMap::new();
     for e in &recent_voice {
         let dev = e["device"].as_str().unwrap_or_default();
+        if dev.is_empty() {
+            continue;
+        }
         match e["kind"].as_str() {
             Some("wifi_state")
                 if matches!(
                     e["state"].as_str(),
-                    Some("applied" | "connected" | "joined")
+                    Some("applied" | "connected" | "joined" | "associated")
                 ) =>
             {
                 resolved_wifi_devices.insert(dev.to_string());
             }
-            Some("wifi_provisioning_requested") if !resolved_wifi_devices.contains(dev) => {
-                wifi_provisioning = json!({
-                    "requested": true,
-                    "device": e["device"],
-                    "action": e["action"],
-                    "trigger": e.get("trigger").cloned().unwrap_or_else(|| json!("mute_hold")),
-                    "ts_ms": e["ts_ms"],
-                });
-                break;
+            Some("wifi_provisioning_requested")
+                if !resolved_wifi_devices.contains(dev)
+                    && !wifi_provisioning_by_device.contains_key(dev) =>
+            {
+                wifi_provisioning_by_device.insert(
+                    dev.to_string(),
+                    json!({
+                        "requested": true,
+                        "device": dev,
+                        "action": e["action"],
+                        "trigger": e.get("trigger").cloned().unwrap_or_else(|| json!("mute_hold")),
+                        "ts_ms": e["ts_ms"],
+                    }),
+                );
             }
             _ => {}
         }
     }
-    if !wifi_provisioning["requested"].as_bool().unwrap_or(false) {
-        if let Some(dev) = state.voice.wifi_provisioning_devices().into_iter().next() {
-            wifi_provisioning = json!({
-                "requested": true,
-                "device": dev,
-                "action": "mute_hold_wifi_setup",
-                "trigger": "mute_hold",
-                "ts_ms": Value::Null,
+    for (dev, ts_ms) in state.voice.wifi_provisioning_map() {
+        wifi_provisioning_by_device
+            .entry(dev.clone())
+            .or_insert_with(|| {
+                json!({
+                    "requested": true,
+                    "device": dev,
+                    "action": "mute_hold_wifi_setup",
+                    "trigger": "mute_hold",
+                    "ts_ms": ts_ms,
+                })
             });
-        }
     }
+    let requested_dev = q.device.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let empty_wifi_prov = |dev: Option<&str>| {
+        json!({
+            "requested": false,
+            "device": dev,
+            "action": Value::Null,
+            "trigger": Value::Null,
+            "ts_ms": Value::Null,
+        })
+    };
+    let wifi_provisioning = match requested_dev {
+        Some(dev) => wifi_provisioning_by_device
+            .get(dev)
+            .cloned()
+            .unwrap_or_else(|| empty_wifi_prov(Some(dev))),
+        None => wifi_provisioning_by_device
+            .values()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| empty_wifi_prov(None)),
+    };
     let mut gateway = state.hub.snapshot();
-    let tail_blind_ms = state.voice.settings_snapshot().tail_blind_ms;
-    let tail_mismatch = enrich_gateway_tail_mismatch(&mut gateway, tail_blind_ms);
+    let voice_settings = state.voice.settings_snapshot();
+    let tail_blind_ms = match requested_dev {
+        Some(dev) => voice_settings.effective_for(dev).tail_blind_ms,
+        None => voice_settings.tail_blind_ms,
+    };
+    let tail_mismatch = enrich_gateway_tail_mismatch(&mut gateway, &voice_settings);
     Json(json!({
         "product": "Home Mate",
         "core_id": state.auth.core_id(),
@@ -175,19 +217,30 @@ pub(super) async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
             "tail_mismatch": tail_mismatch,
         },
         "wifi_provisioning": wifi_provisioning,
+        "wifi_provisioning_by_device": wifi_provisioning_by_device,
     }))
 }
 
-pub(super) fn enrich_gateway_tail_mismatch(gateway: &mut Value, tail_blind_ms: u64) -> bool {
+pub(super) fn enrich_gateway_tail_mismatch(
+    gateway: &mut Value,
+    settings: &crate::voice::VoiceSettings,
+) -> bool {
     let mut any_mismatch = false;
     if let Some(devices) = gateway.get_mut("devices").and_then(|v| v.as_array_mut()) {
         for dev in devices {
+            let dev_id = dev.get("stable_id").and_then(|v| v.as_str()).unwrap_or("");
+            let dev_tail = if dev_id.is_empty() {
+                settings.tail_blind_ms
+            } else {
+                settings.effective_for(dev_id).tail_blind_ms
+            };
             let aec_tail = dev.get("aec_tail_ms").and_then(|v| v.as_u64());
-            let mismatch = aec_tail.is_some_and(|aec| tail_blind_ms < aec);
+            let mismatch = aec_tail.is_some_and(|aec| dev_tail < aec);
             if mismatch {
                 any_mismatch = true;
             }
             if let Some(obj) = dev.as_object_mut() {
+                obj.insert("tail_blind_ms".into(), json!(dev_tail));
                 obj.insert("tail_mismatch".into(), json!(mismatch));
             }
         }
@@ -297,6 +350,12 @@ pub(super) async fn system_factory_reset(
                 Json(json!({ "error": e.to_string() })),
             )
         })?;
+    state.auth.reset_after_factory_reset().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+    })?;
     let (data_epoch, revision) = state
         .store
         .with(|c| {

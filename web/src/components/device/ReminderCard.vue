@@ -12,22 +12,50 @@
  * creates for the device it is showing and labels rows from other speakers
  * rather than hiding them.
  */
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import {
   addReminder,
   cancelReminder,
   getReminders,
+  isDeviceRequiredError,
   type ModeDevice,
   type Reminder,
 } from '../../api'
+import { deviceName, devices as storeDevices } from '../../stores/devices'
 import { t } from '../../i18n'
-import { formatTime } from '../../format'
+import { errorDetail, formatTime } from '../../format'
 import Panel from '../Panel.vue'
 import Pill from '../Pill.vue'
 import EmptyState from '../EmptyState.vue'
 import ErrorNotice from '../ErrorNotice.vue'
 
-const props = defineProps<{ device: ModeDevice | null }>()
+const props = defineProps<{
+  device: ModeDevice | null
+  devices?: ModeDevice[]
+}>()
+
+const availableDevices = computed<ModeDevice[]>(() => {
+  if (props.devices !== undefined) return props.devices
+  if (storeDevices.value.length) return storeDevices.value
+  return props.device ? [props.device] : []
+})
+
+const targetDevice = ref('')
+watch(
+  [() => props.device?.device, availableDevices],
+  ([devId, list], [prevDevId]) => {
+    const propChanged = prevDevId !== undefined && devId !== prevDevId
+    if (devId && (propChanged || !targetDevice.value || !list.some((d) => d.device === targetDevice.value))) {
+      targetDevice.value = devId
+      return
+    }
+    if (targetDevice.value && list.some((d) => d.device === targetDevice.value)) {
+      return
+    }
+    targetDevice.value = devId || (list.length === 1 ? list[0].device : '')
+  },
+  { immediate: true },
+)
 
 const rows = ref<Reminder[] | null>(null)
 const error = ref<unknown>(null)
@@ -63,7 +91,13 @@ const pending = computed(() => (rows.value ?? []).filter((r) => r.state === 'pen
 const done = computed(() => (rows.value ?? []).filter((r) => r.state !== 'pending').slice(0, 8))
 
 async function create(): Promise<void> {
-  if (!props.device || busy.value) return
+  if (busy.value) return
+  const target = targetDevice.value.trim() || props.device?.device?.trim() || ''
+  if (!target) {
+    message.value = availableDevices.value.length > 1 ? t('deviceRequiredError') : t('noDevice')
+    tone.value = 'error'
+    return
+  }
   const text = note.value.trim()
   if (!text) {
     message.value = t('reminderNeedNote')
@@ -75,8 +109,8 @@ async function create(): Promise<void> {
   try {
     const body =
       mode.value === 'delay'
-        ? { note: text, device: props.device.device, delay_minutes: minutes.value }
-        : { note: text, device: props.device.device, hour: hour.value, minute: minute.value }
+        ? { note: text, device: target, delay_minutes: minutes.value }
+        : { note: text, device: target, hour: hour.value, minute: minute.value }
     await addReminder(body)
     note.value = ''
     tone.value = 'ok'
@@ -84,7 +118,7 @@ async function create(): Promise<void> {
     await load()
   } catch (e) {
     tone.value = 'error'
-    message.value = e instanceof Error ? e.message : String(e)
+    message.value = isDeviceRequiredError(e) ? t('deviceRequiredError') : errorDetail(e)
   } finally {
     busy.value = false
   }
@@ -118,6 +152,9 @@ function stateLabel(r: Reminder): string {
 <template>
   <Panel icon="reminder" :title="t('reminderTitle')" :hint="t('reminderHint')">
     <template #actions>
+      <Pill v-if="targetDevice" size="sm" tone="accent" mono>
+        {{ t('scopeThisDevice', { device: targetDevice }) }}
+      </Pill>
       <button type="button" class="btn" :disabled="loading" @click="load">
         {{ loading ? t('loading') : t('refresh') }}
       </button>
@@ -127,6 +164,17 @@ function stateLabel(r: Reminder): string {
 
     <template v-else>
       <section class="rem">
+        <div v-if="availableDevices.length > 1" class="rem__row">
+          <label class="rem__label">
+            <span>{{ t('reminderTargetDevice') }}</span>
+            <select v-model="targetDevice" class="input mono" :aria-label="t('reminderTargetDevice')">
+              <option value="" disabled>{{ t('selectTargetDevice') }}</option>
+              <option v-for="d in availableDevices" :key="d.device" :value="d.device">
+                {{ deviceName(d.device) === d.device ? d.device : `${deviceName(d.device)} (${d.device})` }}
+              </option>
+            </select>
+          </label>
+        </div>
         <div class="rem__row">
           <label class="rem__label">
             <input v-model="mode" type="radio" value="delay" />
@@ -175,7 +223,7 @@ function stateLabel(r: Reminder): string {
             :aria-label="t('reminderNote')"
             @keyup.enter="create"
           />
-          <button type="button" class="btn btn--primary" :disabled="busy || !device" @click="create">
+          <button type="button" class="btn btn--primary" :disabled="busy || (!targetDevice && availableDevices.length <= 1)" @click="create">
             {{ busy ? t('saving') : t('reminderAdd') }}
           </button>
         </div>
@@ -198,7 +246,7 @@ function stateLabel(r: Reminder): string {
             <td class="mono">{{ formatTime(r.due_ms) }}</td>
             <td>{{ r.note }}</td>
             <td class="mono">
-              <Pill v-if="device && r.device !== device.device" size="sm" tone="warn">{{ r.device }}</Pill>
+              <Pill v-if="targetDevice && r.device !== targetDevice" size="sm" tone="warn">{{ deviceName(r.device) === r.device ? r.device : `${deviceName(r.device)} (${r.device})` }}</Pill>
               <span v-else class="rem__same">{{ t('reminderThisDevice') }}</span>
             </td>
             <td>

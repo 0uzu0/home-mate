@@ -14,12 +14,14 @@ import {
   getDeviceMeta,
   getDevices,
   getMode,
+  resolveWifiProvisioningForDevice,
   type DeviceMeta,
   type GatewayDevice,
   type GatewaySnapshot,
   type ModeDevice,
   type ModeSnapshot,
   type RingEvent,
+  type Status,
   type WifiProvisioningNotice,
 } from '../api'
 
@@ -35,6 +37,7 @@ function readStoredId(): string | null {
 
 export const mode = shallowRef<ModeSnapshot | null>(null)
 export const gateway = shallowRef<GatewaySnapshot | null>(null)
+export const statusSnapshot = shallowRef<Status | null>(null)
 export const voiceLog = shallowRef<RingEvent[]>([])
 export const meta = shallowRef<Record<string, DeviceMeta>>({})
 export const modeError = shallowRef<unknown>(null)
@@ -53,27 +56,51 @@ export const devices = computed<ModeDevice[]>(() => mode.value?.devices ?? [])
 export const gatewayDevices = computed<GatewayDevice[]>(() => gateway.value?.devices ?? [])
 export const error = computed(() => modeError.value ?? gatewayError.value)
 
-export const wifiProvisioning = computed<WifiProvisioningNotice>(() => {
+export const wifiProvisioningByDevice = computed<Record<string, WifiProvisioningNotice>>(() => {
+  const map: Record<string, WifiProvisioningNotice> = {}
+  const fromStatus = statusSnapshot.value?.wifi_provisioning_by_device
+  if (fromStatus && typeof fromStatus === 'object') {
+    for (const [dev, notice] of Object.entries(fromStatus)) {
+      if (dev && notice?.requested) map[dev] = notice
+    }
+  }
   const resolved = new Set<string>()
   for (const e of voiceLog.value) {
-    const dev = typeof e.device === 'string' ? e.device : ''
+    const dev = typeof e.device === 'string' ? e.device.trim() : ''
+    if (!dev) continue
     if (
       e.kind === 'wifi_state' &&
-      (e.state === 'applied' || e.state === 'connected' || e.state === 'joined')
+      (e.state === 'applied' ||
+        e.state === 'connected' ||
+        e.state === 'joined' ||
+        e.state === 'associated')
     ) {
       resolved.add(dev)
-    } else if (e.kind === 'wifi_provisioning_requested' && !resolved.has(dev)) {
-      return {
+    } else if (e.kind === 'wifi_provisioning_requested' && !resolved.has(dev) && !map[dev]) {
+      map[dev] = {
         requested: true,
-        device: dev || null,
+        device: dev,
         action: typeof e.action === 'string' ? e.action : null,
         trigger: typeof e.trigger === 'string' ? e.trigger : 'mute_hold',
         ts_ms: e.ts_ms,
       }
     }
   }
-  return { requested: false }
+  return map
 })
+
+export const wifiProvisioning = computed<WifiProvisioningNotice>(() =>
+  resolveWifiProvisioningForDevice(
+    selected.value?.device ?? selectedId.value,
+    statusSnapshot.value,
+    wifiProvisioningByDevice.value,
+    devices.value.length || gatewayDevices.value.length,
+  ),
+)
+
+export function setStatusSnapshot(next: Status | null): void {
+  statusSnapshot.value = next
+}
 
 /** Existing room names, for the datalist in the device-label editor. */
 export const rooms = computed(() =>
@@ -112,17 +139,18 @@ export function selectDevice(id: string): void {
 }
 
 let sequence = 0
+let missingSelectedTicks = 0
+const seenDevices = new Set<string>()
+const MISSING_TICKS_BEFORE_FALLBACK = 3
 
-/**
- * Refresh both snapshots. `allSettled` keeps the half that answered: a mode
- * timeout must not blank the gateway panel, and vice versa.
- */
-export async function refresh(): Promise<void> {
+async function doRefresh(silentRequested: boolean): Promise<void> {
   const mine = ++sequence
-  loading.value = true
+  const silent = silentRequested && mode.value !== null
+  if (!silent) loading.value = true
   attemptedAt.value = Date.now()
+  const targetDevice = selectedId.value?.trim() || undefined
   const [modeResult, gatewayResult, metaResult] = await Promise.allSettled([
-    getMode(),
+    getMode(targetDevice ? { device: targetDevice } : undefined),
     getDevices(),
     getDeviceMeta(),
   ])
@@ -155,24 +183,59 @@ export async function refresh(): Promise<void> {
   loading.value = false
 }
 
+/**
+ * Refresh both snapshots. `allSettled` keeps the half that answered: a mode
+ * timeout must not blank the gateway panel, and vice versa.
+ */
+export function refresh(): Promise<void> {
+  return doRefresh(false)
+}
+
+/** Silent 500ms background poll: does not flip `loading` after the initial load. */
+export function refreshSilent(): Promise<void> {
+  return doRefresh(true)
+}
+
 // The stored/selected id must survive a rename or a device going away: fall
-// back to the first device the backend reports.
+// back to the first device the backend reports, while tolerating transient
+// single-tick dropouts for a device already seen in this session.
 watch(
   devices,
   (list) => {
     if (!list.length) return
-    if (!selectedId.value || !list.some((device) => device.device === selectedId.value)) {
+    for (const device of list) seenDevices.add(device.device)
+    if (!selectedId.value) {
+      missingSelectedTicks = 0
+      selectedId.value = list[0].device
+      return
+    }
+    if (list.some((device) => device.device === selectedId.value)) {
+      missingSelectedTicks = 0
+      return
+    }
+    if (!seenDevices.has(selectedId.value)) {
+      missingSelectedTicks = 0
+      selectedId.value = list[0].device
+      return
+    }
+    missingSelectedTicks += 1
+    if (missingSelectedTicks >= MISSING_TICKS_BEFORE_FALLBACK) {
+      missingSelectedTicks = 0
       selectedId.value = list[0].device
     }
   },
   { immediate: true },
 )
 
-watch(selectedId, (id) => {
+watch(selectedId, (id, prev) => {
+  missingSelectedTicks = 0
   try {
     if (id) localStorage.setItem(STORAGE_KEY, id)
     else localStorage.removeItem(STORAGE_KEY)
   } catch {
     /* private mode */
+  }
+  if (id && prev && id !== prev && mode.value) {
+    void refresh()
   }
 })

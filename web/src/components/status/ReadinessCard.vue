@@ -19,12 +19,16 @@ import { getServices } from '../../api'
 import { errorDetail } from '../../format'
 import { t } from '../../i18n'
 import { useResource } from '../../hooks/useResource'
-import type { ModeDevice, ModeSnapshot } from '../../api'
+import type { GatewayDevice, ModeDevice, ModeSnapshot } from '../../api'
 import Panel from '../Panel.vue'
 import Pill from '../Pill.vue'
 import AppIcon from '../AppIcon.vue'
 
-const props = defineProps<{ mode: ModeSnapshot | null; device: ModeDevice | null }>()
+const props = defineProps<{
+  mode: ModeSnapshot | null
+  device: ModeDevice | null
+  gatewayDevice?: GatewayDevice | null
+}>()
 
 const services = useResource((signal) => getServices({ signal }), { timeoutMs: 6000, retries: 1 })
 // `useResource` only loads when asked; without this the row sat on
@@ -59,7 +63,13 @@ const serviceReady = computed(() => {
   return !!(s.llm?.configured && s.asr?.configured && s.tts?.configured) && missingKeys.value.length === 0
 })
 
-const deviceOnline = computed(() => props.mode?.devices.length ? true : null)
+const deviceOnline = computed(() => {
+  if (!props.device) return null
+  if (props.gatewayDevice && props.gatewayDevice.stable_id === props.device.device) {
+    return props.gatewayDevice.online ? true : false
+  }
+  return props.mode?.devices.some((d) => d.device === props.device?.device) ? true : null
+})
 
 /** The device's own wake evidence since this core started. */
 const wakeCount = computed(() => {
@@ -101,7 +111,12 @@ const rows = computed<Row[]>(() => [
   {
     ok: deviceOnline.value,
     label: t('readyDevice'),
-    detail: deviceOnline.value ? `${props.device?.device ?? ''} · ${t('readyDeviceOk')}` : t('readyDeviceMissing'),
+    detail:
+      deviceOnline.value === true
+        ? `${props.device?.device ?? ''} · ${t('readyDeviceOk')}`
+        : deviceOnline.value === false
+          ? `${props.device?.device ?? ''} · ${t('offline')}`
+          : t('readyDeviceMissing'),
     to: '/devices',
     cta: t('navDevices'),
   },

@@ -28,6 +28,36 @@ impl VoicePipeline {
         provenance: crate::gateway::InputProvenance,
         remote_vad: Option<bool>,
     ) {
+        self.feed_chunk_with_vad_seq(
+            device,
+            pcm,
+            sample_rate,
+            channels,
+            ts,
+            provenance,
+            remote_vad,
+            0,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn feed_chunk_with_vad_seq(
+        self: &Arc<Self>,
+        device: String,
+        pcm: Vec<i16>,
+        sample_rate: u32,
+        channels: u16,
+        ts: u64,
+        provenance: crate::gateway::InputProvenance,
+        remote_vad: Option<bool>,
+        seq: u64,
+    ) {
+        let chunk_hook =
+            crate::lock_or_recover(&self.test_audio_chunk_hook, "voice.test_audio_chunk_hook")
+                .clone();
+        if let Some(hook) = chunk_hook {
+            hook(&device, seq);
+        }
         if self.source_identity(&device, &provenance, "pcm").is_none() {
             return;
         }
@@ -44,27 +74,37 @@ impl VoicePipeline {
             } else {
                 pcm.clone()
             };
-            let mut slot = crate::lock_or_recover(&self.mic_capture, "voice.mic_capture");
-            if let Some(cap) = slot.as_mut() {
-                if !cap.done && cap.device == device {
-                    let room = cap.target.saturating_sub(cap.samples.len());
-                    cap.samples.extend(mono.iter().take(room));
-                    if cap.samples.len() >= cap.target {
-                        cap.done = true;
-                        let wav = MicCapture::to_wav(&cap.samples, cap.rate);
-                        let path = cap.path.clone();
-                        let device = cap.device.clone();
-                        let seconds = cap.samples.len() as f64 / cap.rate as f64;
-                        let written = std::fs::write(&path, &wav);
-                        drop(slot);
-                        self.note(
-                            "mic_capture_done",
-                            json!({ "device": device, "path": path.to_string_lossy(),
-                                    "seconds": (seconds * 10.0).round() / 10.0,
-                                    "bytes": wav.len(), "ok": written.is_ok() }),
-                        );
+            let finished_capture = {
+                let mut slot = crate::lock_or_recover(&self.mic_capture, "voice.mic_capture");
+                if let Some(cap) = slot.get_mut(&device) {
+                    if !cap.done {
+                        let room = cap.target.saturating_sub(cap.samples.len());
+                        cap.samples.extend(mono.iter().take(room));
+                        if cap.samples.len() >= cap.target {
+                            cap.done = true;
+                            let wav = MicCapture::to_wav(&cap.samples, cap.rate);
+                            let path = cap.path.clone();
+                            let cap_device = cap.device.clone();
+                            let seconds = cap.samples.len() as f64 / cap.rate as f64;
+                            Some((wav, path, cap_device, seconds))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
                     }
+                } else {
+                    None
                 }
+            };
+            if let Some((wav, path, cap_device, seconds)) = finished_capture {
+                let written = std::fs::write(&path, &wav);
+                self.note(
+                    "mic_capture_done",
+                    json!({ "device": cap_device, "path": path.to_string_lossy(),
+                            "seconds": (seconds * 10.0).round() / 10.0,
+                            "bytes": wav.len(), "ok": written.is_ok() }),
+                );
             }
         }
         #[derive(Clone, Copy)]
@@ -113,11 +153,9 @@ impl VoicePipeline {
         }
         match barge_phase {
             BargePhase::Stopped(utterance_from) => {
-                let mut procs = crate::lock_or_recover(&self.mic, "voice.mic");
-                if let Some(p) = procs.get_mut(&device) {
-                    p.reset();
+                if let Some(arc) = self.mic_arc(&device) {
+                    crate::lock_or_recover(&arc, "voice.mic.dev").reset();
                 }
-                drop(procs);
                 let mono: Vec<i16> = if channels == 2 {
                     pcm.chunks_exact(2).map(|p| p[0]).collect()
                 } else {
@@ -159,12 +197,16 @@ impl VoicePipeline {
                     );
                 }
                 let (vad_start_db, uses_silero) = {
-                    let procs = crate::lock_or_recover(&self.mic, "voice.mic");
-                    procs
-                        .get(&device)
-                        .map(|p| (p.effective_thresholds().0, p.uses_silero()))
+                    self.mic_arc(&device)
+                        .map(|arc| {
+                            let p = crate::lock_or_recover(&arc, "voice.mic.dev");
+                            (p.effective_thresholds().0, p.uses_silero())
+                        })
                         .unwrap_or_else(|| {
-                            (self.live_vad_config().start_db, self.silero.model.is_some())
+                            (
+                                self.live_vad_config_for(&device).start_db,
+                                self.silero.model.is_some(),
+                            )
                         })
                 };
                 let live_loud = if uses_silero {
@@ -173,10 +215,8 @@ impl VoicePipeline {
                     remote_vad.unwrap_or_else(|| crate::mic::block_db(&mono) >= vad_start_db)
                 };
                 let outcome = {
-                    let mut procs = crate::lock_or_recover(&self.mic, "voice.mic");
-                    let p = procs
-                        .entry(device.clone())
-                        .or_insert_with(|| self.new_mic_processor());
+                    let mic_arc = self.mic_arc_or_init(&device);
+                    let mut p = crate::lock_or_recover(&mic_arc, "voice.mic.dev");
                     let head_vad = if p.uses_silero() {
                         None
                     } else {
@@ -228,9 +268,11 @@ impl VoicePipeline {
         if voice_live || blind || media_playing {
             let wake_ack_overlap =
                 self.capture_is_wake_ack_only(&device, voice_live, media_playing, now);
+            let tail_blind_only = blind && !voice_live && !media_playing;
             for span in &mut provenance.spans {
                 span.control_only = true;
                 span.wake_ack_overlap = wake_ack_overlap;
+                span.tail_blind_only = tail_blind_only;
             }
             if let Some(st) = crate::lock_or_recover(&self.states, "voice.states").get_mut(&device)
             {
@@ -247,10 +289,8 @@ impl VoicePipeline {
             pcm
         };
         let outcome = {
-            let mut procs = crate::lock_or_recover(&self.mic, "voice.mic");
-            let p = procs
-                .entry(device.clone())
-                .or_insert_with(|| self.new_mic_processor());
+            let mic_arc = self.mic_arc_or_init(&device);
+            let mut p = crate::lock_or_recover(&mic_arc, "voice.mic.dev");
             p.feed_with_provenance_and_vad(mono, sample_rate, provenance, remote_vad)
         };
         {
@@ -288,9 +328,9 @@ impl VoicePipeline {
                 {
                     st.mic_counters.speech_started += 1;
                 }
-                let provenance = crate::lock_or_recover(&self.mic, "voice.mic")
-                    .get(device)
-                    .map(|p| p.open_provenance());
+                let provenance = self
+                    .mic_arc(device)
+                    .map(|arc| crate::lock_or_recover(&arc, "voice.mic.dev").open_provenance());
                 self.note(
                     "mic_speech_started",
                     json!({ "device": device, "ts": ts, "provenance": provenance }),
@@ -324,7 +364,7 @@ impl VoicePipeline {
                 let duration_ms = seg.pcm.len() as u64 * 1000 / sample_rate as u64;
                 let ticket = seg.provenance;
                 let lead_pcm = seg.lead_pcm;
-                let (pcm, head_ms) = (seg.pcm, 0u64);
+                let pcm = seg.pcm;
                 {
                     let mut states = crate::lock_or_recover(&self.states, "voice.states");
                     let st = states.entry(device.to_string()).or_default();
@@ -335,22 +375,15 @@ impl VoicePipeline {
                     }
                 }
                 let (vad_start, vad_end, floor) = {
-                    let procs = crate::lock_or_recover(&self.mic, "voice.mic");
-                    match procs.get(device) {
-                        Some(p) => {
+                    match self.mic_arc(device) {
+                        Some(arc) => {
+                            let p = crate::lock_or_recover(&arc, "voice.mic.dev");
                             let (s, e) = p.effective_thresholds();
                             (s, e, p.noise_floor_db())
                         }
                         None => (0.0, 0.0, None),
                     }
                 };
-                if head_ms > 0 {
-                    self.note(
-                        "barge_in_head_kept",
-                        json!({ "device": device, "head_ms": head_ms,
-                                "why": "first syllable the guard refused to segment on" }),
-                    );
-                }
                 if let Some(st) =
                     crate::lock_or_recover(&self.states, "voice.states").get_mut(device)
                 {
@@ -360,7 +393,7 @@ impl VoicePipeline {
                 self.note(
                     "mic_segment_closed",
                     json!({ "device": device, "blocks": seg.blocks, "duration_ms": duration_ms,
-                            "head_ms": head_ms, "barge_in": barge_served,
+                            "head_ms": 0, "barge_in": barge_served,
                             "close_reason": close_reason,
                             "floor_db": floor, "start_db": vad_start, "end_db": vad_end,
                             "ticket": ticket }),
@@ -475,7 +508,7 @@ impl VoicePipeline {
                 let factory = self.asr_factory.clone();
                 let dev = device.to_string();
                 let (input_id, window_epoch, deadline) = reservation;
-                let control_only = ticket.spans.iter().any(|s| s.control_only);
+                let control_only = ticket.effective_control_only();
                 let capture_seq = seg.total_blocks_seen;
                 // Register the worker under the same owner lock as cancellation.
                 // A revoked reservation cannot start an HTTP request afterward.
@@ -533,8 +566,9 @@ impl VoicePipeline {
         }
     }
 
-    /// The VAD config new mic processors start with: measured settings win
-    /// over env/defaults (G4 calibration flow).
+    /// The VAD config new mic processors start with: measured per-device
+    /// settings win over node-level `vad`, which wins over env/defaults.
+    #[cfg(test)]
     pub(super) fn live_vad_config(&self) -> VadConfig {
         let mut cfg = VadConfig::from_env();
         if let Some(v) = crate::lock_or_recover(&self.settings, "voice.settings").vad {
@@ -544,10 +578,21 @@ impl VoicePipeline {
         cfg
     }
 
+    pub(super) fn live_vad_config_for(&self, device: &str) -> VadConfig {
+        let mut cfg = VadConfig::from_env();
+        let settings = crate::lock_or_recover(&self.settings, "voice.settings");
+        if let Some(v) = settings.vad_by_device.get(device).or(settings.vad.as_ref()) {
+            cfg.start_db = v.start_db;
+            cfg.end_db = v.end_db;
+        }
+        cfg
+    }
+
     pub(super) fn clear_passive_presence_if_idle(&self, device: &str) {
-        let active = crate::lock_or_recover(&self.mic, "voice.mic")
-            .get(device)
-            .is_some_and(|p| p.in_speech() || p.onset_pending());
+        let active = self.mic_arc(device).is_some_and(|arc| {
+            let p = crate::lock_or_recover(&arc, "voice.mic.dev");
+            p.in_speech() || p.onset_pending()
+        });
         if !active {
             self.arbiter.clear_passive_presence(device);
         }
@@ -730,7 +775,7 @@ impl VoicePipeline {
             Ok(text) => text,
             Err(_) => unreachable!("unusable results are handled before the identity gate"),
         };
-        if self.exit_text(&text) {
+        if self.exit_text_for(&t.device, &text) {
             self.clear_passive_presence_if_idle(&t.device);
             if self.reflex_deduped(&t.device, interaction::KeywordIntent::Retreat, "transcript") {
                 return;
@@ -752,7 +797,7 @@ impl VoicePipeline {
         {
             return;
         }
-        let wakes = self.effective_wake_words();
+        let wakes = self.effective_wake_words_for(&t.device);
         let has_wake = wakes
             .iter()
             .any(|w| mic::wake_span_near(&text, w).is_some());
@@ -857,11 +902,12 @@ impl VoicePipeline {
             true
         };
         let now_ms = id::now_ms();
+        let leased_followup = leased_session || (!t.control_only && frozen_context.is_some());
         let (in_conversation, awaiting_close_confirm) = if !media_playing
             && allowed_by_capture
             && crate::lock_or_recover(&self.states, "voice.states")
                 .get(&t.device)
-                .is_some_and(|st| leased_session || st.session_open(now_ms))
+                .is_some_and(|st| leased_followup || st.session_open(now_ms))
         {
             let close_confirm = crate::lock_or_recover(&self.states, "voice.states")
                 .get(&t.device)
@@ -938,7 +984,7 @@ impl VoicePipeline {
                 let mut states = crate::lock_or_recover(&self.states, "voice.states");
                 states.get_mut(&t.device).and_then(|st| {
                     if st.participation.identity() != input_identity
-                        || (!leased_session && !st.session_open(id::now_ms()))
+                        || (!leased_followup && !st.session_open(id::now_ms()))
                     {
                         return None;
                     }
@@ -989,7 +1035,7 @@ impl VoicePipeline {
                 st.mic_counters.followup_turns += 1;
             }
             let wakes = {
-                let eff = self.effective_wake_words();
+                let eff = self.effective_wake_words_for(&t.device);
                 if eff.is_empty() {
                     default_wake_words()
                 } else {
@@ -1078,7 +1124,19 @@ impl VoicePipeline {
             if wake_confirmed {
                 self.pause_input_handoff("in_window").await;
             }
-            let (_, context_ms) = self.context_policy();
+            let (_, context_ms) = self.context_policy_for(&t.device);
+            let is_non_wake_reflex = self
+                .reflex_text_command_for(&t.device, &command)
+                .is_some_and(|(_, intent)| intent != interaction::KeywordIntent::Wake);
+            let pre_paused_media = if wake_confirmed && !is_non_wake_reflex {
+                self.pause_media_before_wake_activate(
+                    &t.device,
+                    identity,
+                    t.leased.then_some(t.input_id),
+                )
+            } else {
+                None
+            };
             {
                 let mut states = crate::lock_or_recover(&self.states, "voice.states");
                 let Some(st) = states.get_mut(&t.device) else {
@@ -1135,7 +1193,7 @@ impl VoicePipeline {
                     }
                 }
             }
-            if let Some((word, intent)) = self.reflex_text_command(&command) {
+            if let Some((word, intent)) = self.reflex_text_command_for(&t.device, &command) {
                 if intent != interaction::KeywordIntent::Wake {
                     if debit && !self.debit_control(&t.device, &mut identity) {
                         return;
@@ -1145,16 +1203,16 @@ impl VoicePipeline {
                 }
             }
             let next = if t.leased {
-                self.barge_input(&t.device, identity, t.input_id)
+                self.barge_input(&t.device, identity, t.input_id, pre_paused_media)
             } else {
-                self.barge_in_if_half_duplex(&t.device, "utterance", identity)
+                self.barge_in_if_half_duplex(&t.device, "utterance", identity, pre_paused_media)
             };
             let Some(next) = next else {
                 return;
             };
             identity = next;
             self.push_assistant_state(&t.device, false);
-            let (retreat_on, retreat_words) = self.effective_retreat_policy();
+            let (retreat_on, retreat_words) = self.effective_retreat_policy_for(&t.device);
             if retreat_on && retreat_match(&command, &retreat_words) {
                 if debit && !self.debit_control(&t.device, &mut identity) {
                     return;
@@ -1193,7 +1251,7 @@ impl VoicePipeline {
         }
         // Idle: wake-word check on pinyin syllables (tone-insensitive).
         let wakes = {
-            let eff = self.effective_wake_words();
+            let eff = self.effective_wake_words_for(&t.device);
             if eff.is_empty() {
                 default_wake_words()
             } else {
@@ -1225,6 +1283,18 @@ impl VoicePipeline {
                     st.mic_counters.wakes += 1;
                     st.wake_flash_until_ms = id::now_ms() + WAKE_FLASH_MS;
                 }
+                let is_non_wake_reflex = self
+                    .reflex_text_command_for(&t.device, &rest)
+                    .is_some_and(|(_, intent)| intent != interaction::KeywordIntent::Wake);
+                let pre_paused_media = if !is_non_wake_reflex {
+                    self.pause_media_before_wake_activate(
+                        &t.device,
+                        input_identity,
+                        t.leased.then_some(t.input_id),
+                    )
+                } else {
+                    None
+                };
                 let mut identity = if t.leased {
                     let Some((identity, context)) =
                         self.activate_consumed_input(&t.device, t.input_id, input_identity)
@@ -1250,7 +1320,7 @@ impl VoicePipeline {
                     let gen = st.participation.generation();
                     st.last_wake = Some(("asr".into(), w.clone(), gen));
                 }
-                if let Some((word, intent)) = self.reflex_text_command(&rest) {
+                if let Some((word, intent)) = self.reflex_text_command_for(&t.device, &rest) {
                     if intent != interaction::KeywordIntent::Wake {
                         self.handle_reflex_text(&t.device, &word, intent, "wake_rest", identity);
                         self.push_assistant_state(&t.device, false);
@@ -1258,16 +1328,16 @@ impl VoicePipeline {
                     }
                 }
                 let next = if t.leased {
-                    self.barge_input(&t.device, identity, t.input_id)
+                    self.barge_input(&t.device, identity, t.input_id, pre_paused_media)
                 } else {
-                    self.barge_in_if_half_duplex(&t.device, "wake", identity)
+                    self.barge_in_if_half_duplex(&t.device, "wake", identity, pre_paused_media)
                 };
                 let Some(next) = next else {
                     return;
                 };
                 identity = next;
                 self.push_assistant_state(&t.device, false);
-                let (retreat_on, retreat_words) = self.effective_retreat_policy();
+                let (retreat_on, retreat_words) = self.effective_retreat_policy_for(&t.device);
                 if retreat_on && retreat_match(&rest, &retreat_words) {
                     if self.reflex_deduped(
                         &t.device,
@@ -1287,10 +1357,11 @@ impl VoicePipeline {
                     // Consumed.
                 } else if is_greeting_only(&rest) {
                     let ack_enabled = crate::lock_or_recover(&self.settings, "voice.settings")
+                        .effective_for(&t.device)
                         .wake_ack
                         .enabled;
                     if ack_enabled {
-                        match self.pick_ack_phrase() {
+                        match self.pick_ack_phrase_for(&t.device) {
                             Some(phrase) => {
                                 let _ = self.play_local_ack(&t.device, &phrase, "wake_ack");
                             }
@@ -1722,6 +1793,9 @@ impl VoicePipeline {
     /// Contract v2 #2 (2026-11-16): remember that THIS device just said a cue,
     /// and tell the peers.
     pub(super) fn note_house_cue(&self, device: &str, phrase: &str) {
+        if !self.device_in_household_acoustic_domain(device) {
+            return;
+        }
         let key = cue_key(phrase);
         if key.is_empty() {
             return;
@@ -1752,6 +1826,9 @@ impl VoicePipeline {
         active: bool,
         text_preview: &str,
     ) {
+        if !self.device_in_household_acoustic_domain(device) {
+            return;
+        }
         let notice = crate::sovereignty::FleetPlaybackNotice {
             device: device.to_string(),
             room: self.room_of(device),
@@ -1786,6 +1863,9 @@ impl VoicePipeline {
         device: &str,
         text: &str,
     ) -> Option<(String, String, u64)> {
+        if !self.device_in_household_acoustic_domain(device) {
+            return None;
+        }
         let key = cue_key(text);
         if key.is_empty() {
             return None;
@@ -1799,51 +1879,77 @@ impl VoicePipeline {
             .cloned()
     }
 
-    /// Record `seconds` of the post-AEC mono for this device.
+    /// Record `seconds` of the post-AEC mono for this device (`MG-P2-01` per-device isolated).
     pub fn start_mic_capture(
         &self,
         device: &str,
         seconds: u64,
     ) -> Result<serde_json::Value, String> {
         let seconds = seconds.clamp(1, 30);
-        let mut slot = crate::lock_or_recover(&self.mic_capture, "voice.mic_capture");
-        if let Some(cap) = slot.as_ref() {
-            if !cap.done {
-                return Err("已有一路录音在进行".into());
-            }
-        }
         let rate = 16_000u32;
         let dir = self.data_dir.join("captures");
+        // Perform filesystem directory creation OUTSIDE `voice.mic_capture`.
         std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
-        let path = dir.join(format!("dot-{}.wav", id::now_ms()));
-        *slot = Some(MicCapture {
-            device: device.to_string(),
-            samples: Vec::with_capacity((rate as u64 * seconds) as usize),
-            rate,
-            target: (rate as u64 * seconds) as usize,
-            path: path.clone(),
-            started_ms: id::now_ms(),
-            done: false,
-        });
+        let safe_dev: String = device
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let now_ms = id::now_ms();
+        let path = dir.join(format!("cap-{safe_dev}-{now_ms}-{}.wav", id::next("C")));
+        {
+            let mut slot = crate::lock_or_recover(&self.mic_capture, "voice.mic_capture");
+            if slot.get(device).is_some_and(|c| c.is_expired(now_ms)) {
+                slot.remove(device);
+            }
+            if let Some(cap) = slot.get(device) {
+                if !cap.done {
+                    return Err(format!("设备 {device} 已有一路录音在进行"));
+                }
+            }
+            slot.insert(
+                device.to_string(),
+                MicCapture {
+                    device: device.to_string(),
+                    samples: Vec::with_capacity((rate as u64 * seconds) as usize),
+                    rate,
+                    target: (rate as u64 * seconds) as usize,
+                    path: path.clone(),
+                    started_ms: now_ms,
+                    done: false,
+                },
+            );
+        }
         self.note(
             "mic_capture_start",
             json!({ "device": device, "seconds": seconds, "path": path.to_string_lossy() }),
         );
-        Ok(json!({ "state": "recording", "seconds": seconds, "path": path.to_string_lossy() }))
+        Ok(
+            json!({ "state": "recording", "device": device, "seconds": seconds, "path": path.to_string_lossy() }),
+        )
     }
 
     pub fn mic_capture_status(&self, device: &str) -> serde_json::Value {
-        mic_capture_status_json(
-            crate::lock_or_recover(&self.mic_capture, "voice.mic_capture").as_ref(),
-            device,
-        )
+        let now_ms = id::now_ms();
+        let mut slot = crate::lock_or_recover(&self.mic_capture, "voice.mic_capture");
+        if slot.get(device).is_some_and(|c| c.is_expired(now_ms)) {
+            slot.remove(device);
+        }
+        mic_capture_status_json(slot.get(device), device)
     }
 
     /// The finished capture as WAV bytes (None until it is complete).
     pub fn mic_capture_wav(&self, device: &str) -> Option<Vec<u8>> {
-        let slot = crate::lock_or_recover(&self.mic_capture, "voice.mic_capture");
-        let cap = slot.as_ref().filter(|c| c.device == device && c.done)?;
-        std::fs::read(&cap.path).ok()
+        let path = {
+            let slot = crate::lock_or_recover(&self.mic_capture, "voice.mic_capture");
+            slot.get(device).filter(|c| c.done)?.path.clone()
+        };
+        std::fs::read(&path).ok()
     }
 
     pub(super) fn in_window_command(text: &str, wakes: &[String]) -> InWindow {
@@ -1859,13 +1965,56 @@ impl VoicePipeline {
         InWindow::Command(text.to_string())
     }
 
+    /// Pause active media cleanly OUTSIDE `voice.states` and strictly BEFORE
+    /// `activate_consumed_input` / `activate_session_at` cancels active requests
+    /// (which would otherwise cancel `music::pump` and delete `MediaSession`
+    /// before `honor_wake_word` can bookmark/pause it, causing
+    /// `media_takeover_pause_failed`).
+    pub(super) fn pause_media_before_wake_activate(
+        &self,
+        device: &str,
+        expected: Identity,
+        admitted_input: Option<u64>,
+    ) -> Option<serde_json::Value> {
+        let valid = {
+            let states = crate::lock_or_recover(&self.states, "voice.states");
+            states.get(device).is_some_and(|st| {
+                st.participation.identity() == expected
+                    && admitted_input.is_none_or(|input_id| {
+                        self.consumed_input_valid_locked(device, st, input_id)
+                    })
+            })
+        };
+        if !valid {
+            return None;
+        }
+        if self.media_state(device) != Some(crate::tool::music::MediaState::Playing) {
+            return None;
+        }
+        let decision = interaction::decide(
+            self.effective_duplex(device),
+            Trigger::WakeWord,
+            Content {
+                voice: false,
+                media: true,
+            },
+        );
+        if decision.honor && decision.stop {
+            self.pause_media_for_takeover(device)
+        } else {
+            None
+        }
+    }
+
     pub(super) fn barge_in_if_half_duplex(
         &self,
         device: &str,
         reason: &str,
         expected: Identity,
+        pre_paused_media: Option<serde_json::Value>,
     ) -> Option<Identity> {
-        let (decision, identity) = self.honor_wake_word(device, reason, expected, None)?;
+        let (decision, identity) =
+            self.honor_wake_word(device, reason, expected, None, pre_paused_media)?;
         if !decision.stop {
             self.note(
                 "barge_in_skipped_full_duplex",

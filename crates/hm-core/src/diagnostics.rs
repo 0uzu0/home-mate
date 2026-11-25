@@ -51,12 +51,35 @@ fn stage(stage: &str, state: &str, detail: impl Into<String>, evidence: Value) -
 
 /// The five stages, in order. `required` stages decide `verdict`.
 pub async fn run(input: &SelfCheckInput<'_>, deep: bool) -> Value {
+    run_for_device(input, deep, None).await
+}
+
+/// The five stages, optionally scoped to one `device` while also reporting
+/// per-device health in stage evidence so secondary gateways are never hidden.
+pub async fn run_for_device(
+    input: &SelfCheckInput<'_>,
+    deep: bool,
+    target_device: Option<&str>,
+) -> Value {
     let mode = input.voice.mode_snapshot();
     let hub = input.hub.snapshot();
     let events = input.voice.recent(100);
     let devices = hub["devices"].as_array().cloned().unwrap_or_default();
+    let target = target_device.map(str::trim).filter(|s| !s.is_empty());
 
     let with_cap = |cap: &str| -> Option<Value> {
+        if let Some(req_id) = target {
+            return devices
+                .iter()
+                .find(|d| {
+                    d["stable_id"].as_str() == Some(req_id)
+                        && d["capabilities"]
+                            .as_array()
+                            .map(|c| c.iter().any(|x| x == cap))
+                            .unwrap_or(false)
+                })
+                .cloned();
+        }
         devices
             .iter()
             .find(|d| {
@@ -86,6 +109,148 @@ pub async fn run(input: &SelfCheckInput<'_>, deep: bool) -> Value {
             .find(|d| d["device"].as_str() == Some(id))
             .cloned()
     };
+    let eval_mic_device = |d: &Value| -> (&'static str, String, Value) {
+        let id = d["stable_id"].as_str().unwrap_or("");
+        let online = d["online"].as_bool().unwrap_or(false);
+        let m = device_mode(Some(id));
+        let muted = m
+            .as_ref()
+            .and_then(|m| m["muted"].as_bool())
+            .unwrap_or(false);
+        let session = m
+            .as_ref()
+            .and_then(|m| m["mic"]["session"].as_bool())
+            .unwrap_or(false);
+        let last = m
+            .as_ref()
+            .and_then(|m| m["mic"]["last_chunk_ms"].as_u64())
+            .unwrap_or(0);
+        let now = crate::id::now_ms();
+        let age = if last == 0 {
+            None
+        } else {
+            Some(now.saturating_sub(last))
+        };
+        let cps = m
+            .as_ref()
+            .and_then(|m| m["mic"]["chunks_per_sec"].as_f64())
+            .unwrap_or(0.0);
+        let counters = m
+            .as_ref()
+            .map(|m| m["mic"]["counters"].clone())
+            .unwrap_or(json!({}));
+        let kws_state = m
+            .as_ref()
+            .and_then(|m| m["kws"]["state"].as_str())
+            .unwrap_or("");
+        let kws_running = kws_state == "running";
+        let in_speech = m
+            .as_ref()
+            .and_then(|m| m["mic"]["in_speech"].as_bool())
+            .unwrap_or(false);
+        let session_open = m
+            .as_ref()
+            .and_then(|m| m["participation"].as_str())
+            .is_some_and(|p| p != "idle");
+        let has_idle_gate_cap = d["capabilities"].as_array().is_some_and(|caps| {
+            caps.iter().any(|c| {
+                matches!(
+                    c.as_str(),
+                    Some("idle_gated_mic" | "idle_gated_audio" | "offline_kws_idle_gate")
+                )
+            })
+        });
+        // Non-loopback mobile/offline-KWS gateways (e.g. `android-v2`) intentionally
+        // pause uplink `AudioChunk` while idle and waiting on local KWS (`MG-P2-03`).
+        // Keep real `stale` detection intact for continuous-capture gateways and for
+        // active listening/speech sessions on idle-gated gateways.
+        let is_idle_gated_gateway = has_idle_gate_cap
+            || !input.voice.device_in_household_acoustic_domain(id)
+            || crate::gateway::DeviceHub::is_mobile_profile_version(d["profile_version"].as_str());
+        let idle_gated_active = is_idle_gated_gateway
+            && online
+            && !muted
+            && session
+            && kws_running
+            && !in_speech
+            && !session_open;
+        let (state, detail) = if !online {
+            ("inactive", format!("{id} 不在线"))
+        } else if muted {
+            ("inactive", format!("{id} 已静音：按设备上的隐私键恢复"))
+        } else if !session {
+            ("inactive", format!("{id} 的麦克风会话没有建立"))
+        } else if idle_gated_active && (age.is_none() || age.unwrap_or(0) > 3_000 || cps < 1.0) {
+            (
+                "ready",
+                format!("{id} 在线，离线唤醒待命中（空闲门控暂停上行音频）"),
+            )
+        } else if age.is_none() {
+            ("stale", "麦克风会话在，但还没有收到音频块".to_string())
+        } else if age.unwrap_or(0) > 3_000 {
+            (
+                "stale",
+                format!(
+                    "最近一个音频块是 {} ms 前（链路可能卡住）",
+                    age.unwrap_or(0)
+                ),
+            )
+        } else if cps < 1.0 {
+            (
+                "stale",
+                format!("音频块速率只有 {cps:.1}/s（应在 12/s 左右）"),
+            )
+        } else {
+            (
+                "ready",
+                format!("{id} 在线，麦克风会话 active，{cps:.1} 块/s"),
+            )
+        };
+        let evidence = json!({
+            "device": id,
+            "online": online,
+            "muted": muted,
+            "mic_session": session,
+            "last_chunk_age_ms": age,
+            "chunks_per_sec": cps,
+            "counters": counters,
+            "idle_gated": idle_gated_active,
+            "kws_state": kws_state,
+        });
+        (state, detail, evidence)
+    };
+    let all_mic_devices: Vec<Value> = devices
+        .iter()
+        .filter(|d| {
+            d["capabilities"]
+                .as_array()
+                .map(|c| c.iter().any(|x| x == "audio_in"))
+                .unwrap_or(false)
+        })
+        .map(|d| {
+            let (state, detail, mut evidence) = eval_mic_device(d);
+            if let Some(obj) = evidence.as_object_mut() {
+                obj.insert("state".into(), json!(state));
+                obj.insert("detail".into(), json!(detail));
+            }
+            evidence
+        })
+        .collect();
+    let all_out_devices: Vec<Value> = devices
+        .iter()
+        .filter(|d| {
+            d["capabilities"]
+                .as_array()
+                .map(|c| c.iter().any(|x| x == "audio_out"))
+                .unwrap_or(false)
+        })
+        .map(|d| {
+            json!({
+                "device": d["stable_id"].as_str().unwrap_or(""),
+                "online": d["online"].as_bool().unwrap_or(false),
+            })
+        })
+        .collect();
     let count =
         |kind: &str| -> usize { events.iter().filter(|e| e["kind"] == json!(kind)).count() };
 
@@ -98,72 +263,11 @@ pub async fn run(input: &SelfCheckInput<'_>, deep: bool) -> Value {
             json!({ "devices": devices.len() }),
         ),
         Some(d) => {
-            let id = d["stable_id"].as_str().unwrap_or("");
-            let online = d["online"].as_bool().unwrap_or(false);
-            let m = device_mode(Some(id));
-            let muted = m
-                .as_ref()
-                .and_then(|m| m["muted"].as_bool())
-                .unwrap_or(false);
-            let session = m
-                .as_ref()
-                .and_then(|m| m["mic"]["session"].as_bool())
-                .unwrap_or(false);
-            let last = m
-                .as_ref()
-                .and_then(|m| m["mic"]["last_chunk_ms"].as_u64())
-                .unwrap_or(0);
-            let now = crate::id::now_ms();
-            let age = if last == 0 {
-                None
-            } else {
-                Some(now.saturating_sub(last))
-            };
-            let cps = m
-                .as_ref()
-                .and_then(|m| m["mic"]["chunks_per_sec"].as_f64())
-                .unwrap_or(0.0);
-            let counters = m
-                .as_ref()
-                .map(|m| m["mic"]["counters"].clone())
-                .unwrap_or(json!({}));
-            let (state, detail) = if !online {
-                ("inactive", format!("{id} 不在线"))
-            } else if muted {
-                ("inactive", format!("{id} 已静音：按设备上的隐私键恢复"))
-            } else if !session {
-                ("inactive", format!("{id} 的麦克风会话没有建立"))
-            } else if age.is_none() {
-                ("stale", "麦克风会话在，但还没有收到音频块".to_string())
-            } else if age.unwrap_or(0) > 3_000 {
-                (
-                    "stale",
-                    format!(
-                        "最近一个音频块是 {} ms 前（链路可能卡住）",
-                        age.unwrap_or(0)
-                    ),
-                )
-            } else if cps < 1.0 {
-                (
-                    "stale",
-                    format!("音频块速率只有 {cps:.1}/s（应在 12/s 左右）"),
-                )
-            } else {
-                (
-                    "ready",
-                    format!("{id} 在线，麦克风会话 active，{cps:.1} 块/s"),
-                )
-            };
-            stage(
-                "mic",
-                state,
-                detail,
-                json!({
-                    "device": id, "online": online, "muted": muted,
-                    "mic_session": session, "last_chunk_age_ms": age,
-                    "chunks_per_sec": cps, "counters": counters,
-                }),
-            )
+            let (state, detail, mut evidence) = eval_mic_device(d);
+            if let Some(obj) = evidence.as_object_mut() {
+                obj.insert("all_devices".into(), json!(all_mic_devices));
+            }
+            stage("mic", state, detail, evidence)
         }
     };
 
@@ -287,6 +391,7 @@ pub async fn run(input: &SelfCheckInput<'_>, deep: bool) -> Value {
                     "tts_provider": services.tts.provider, "tts_model": services.tts.model,
                     "recent_successes": tts_ok, "recent_failures": tts_failed,
                     "last_output_stage": last_stage,
+                    "all_devices": all_out_devices,
                 }),
             )
         }

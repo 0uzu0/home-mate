@@ -210,7 +210,8 @@ impl AppState {
         let personal_media =
             crate::tool::personal_media::PersonalMediaRuntime::new(store.clone(), hub.clone())
                 .with_music(music.clone());
-        let learning = crate::tool::learning::LearningRuntime::new(store.clone());
+        let learning =
+            crate::tool::learning::LearningRuntime::new(store.clone()).with_hub(hub.clone());
         let master_brain = crate::tool::master_brain::MasterBrainRuntime::new(store.clone());
         let openapi = crate::tool::openapi::OpenApiRuntime::new(store.clone());
         let open_sockets = crate::tool::open_socket::OpenSocketRuntime::new(store.clone());
@@ -777,6 +778,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/v0/devices/{id}/program/resume",
             post(device_program_resume),
         )
+        .route(
+            "/api/v0/devices/{id}/media/control",
+            post(device_media_control),
+        )
         .route("/api/v0/devices/{id}/volume", post(device_volume))
         // Diagnostic mic capture: the post-AEC mono the SPOTTER consumes, so
         // a KWS hit-rate measurement needs no firmware flag and no extra mic.
@@ -794,7 +799,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/v0/devices/{id}/profile",
             get(device_profile_get).put(device_profile_put),
         )
-        .route("/api/v0/mode", get(mode_get))
+        .route("/api/v0/mode", get(mode_get).put(mode_put_global))
         .route("/api/v0/session/close", post(session_close))
         .route("/api/v0/prompts", put(prompts_put))
         .route("/api/v0/mode/{device}", put(mode_put))
@@ -868,23 +873,28 @@ async fn api_security_headers(
 ) -> axum::response::Response {
     let is_api = req.uri().path().starts_with("/api/");
     let mut resp = next.run(req).await;
+    let headers = resp.headers_mut();
+    headers.insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        axum::http::header::REFERRER_POLICY,
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
     if is_api {
-        let headers = resp.headers_mut();
-        headers.insert(
-            axum::http::header::X_CONTENT_TYPE_OPTIONS,
-            axum::http::HeaderValue::from_static("nosniff"),
-        );
         headers.insert(
             axum::http::header::X_FRAME_OPTIONS,
             axum::http::HeaderValue::from_static("DENY"),
         );
         headers.insert(
-            axum::http::header::REFERRER_POLICY,
-            axum::http::HeaderValue::from_static("no-referrer"),
-        );
-        headers.insert(
             axum::http::header::CACHE_CONTROL,
             axum::http::HeaderValue::from_static("no-store"),
+        );
+    } else {
+        headers.insert(
+            axum::http::header::X_FRAME_OPTIONS,
+            axum::http::HeaderValue::from_static("SAMEORIGIN"),
         );
     }
     resp
@@ -907,6 +917,15 @@ fn unauthorized(detail: &str) -> axum::response::Response {
             .insert(axum::http::header::WWW_AUTHENTICATE, v);
     }
     resp
+}
+
+fn forbidden(detail: &str) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({ "error": "forbidden", "detail": detail })),
+    )
+        .into_response()
 }
 
 fn too_many_requests(retry_after_secs: u64) -> axum::response::Response {
@@ -949,35 +968,66 @@ fn log_denied(peer: Option<std::net::SocketAddr>, path: &str, reason: &str, fail
 
 /// The single auth gate. Order matters:
 /// 1. non-API paths (console bundle) pass — a navigation cannot carry a header;
-/// 2. the two bootstrap endpoints pass (handlers enforce their own precondition);
-/// 3. never paired → open (visible unpaired state, ends at first provisioning);
-/// 4. loopback → trusted (`hm-release` snapshot/restart/health; user decision
-///    2026-11-14 keeps this rather than coupling release order to the
-///    installer's token support);
-/// 5. otherwise require `Authorization: Bearer hm1_…` (and rate-limit repeated
-///    failures per source IP).
+/// 2. never paired (`Ok(None)`):
+///    - loopback (and in-process router tests without ConnectInfo) stays open;
+///    - non-private / public IPs are rejected outright with `403 Forbidden`
+///      (including `/api/v0/auth/provision`);
+///    - private LAN / Tailscale / IPv6 ULA peers are blocked (`401`) on
+///      high-risk irreversible/secret-exfiltration routes while keeping
+///      read-only status/auth and one-shot `/api/v0/auth/provision` usable;
+/// 3. once paired (`Ok(Some(list))`), the two bootstrap endpoints pass
+///    (`/api/v0/auth` hides token metadata; `/api/v0/auth/provision` returns 409);
+/// 4. loopback → trusted for legacy `hm-release` routes;
+/// 5. otherwise require `Authorization: Bearer hm1_…` (or private-LAN everyday
+///    allowlist when `lan_gateway_exempt = true`), with per-IP failure rate limit.
 async fn require_bearer(
     State(state): State<Arc<AppState>>,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let path = req.uri().path().to_string();
-    if !path.starts_with("/api/") || path == "/api/v0/auth" || path == "/api/v0/auth/provision" {
+    if !path.starts_with("/api/") {
         return next.run(req).await;
     }
     let peer = req
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
         .map(|c| c.0);
+    let is_loopback = peer.is_some_and(|p| crate::net::is_loopback_ip(p.ip()));
     let entries = match state.auth.entries() {
-        Ok(None) => return next.run(req).await,
+        Ok(None) => {
+            if peer.is_none() || is_loopback {
+                return next.run(req).await;
+            }
+            let ip = peer.unwrap().ip();
+            let allowed_lan = crate::net::is_private_lan_ip(ip) || crate::net::is_ipv6_ula(ip);
+            if !allowed_lan {
+                log_denied(peer, &path, "unpaired core rejected non-private peer", 0);
+                return forbidden(
+                    "unpaired core only accepts loopback or private LAN / Tailscale peers",
+                );
+            }
+            if is_unpaired_lan_blocked_route(req.method(), &path) {
+                log_denied(peer, &path, "unpaired LAN blocked high-risk route", 0);
+                return unauthorized(
+                    "pair a household token before calling this endpoint from LAN",
+                );
+            }
+            return next.run(req).await;
+        }
         Ok(Some(list)) => list,
         Err(e) => {
+            if path == "/api/v0/auth" {
+                return next.run(req).await;
+            }
             // Fail closed: a corrupt store must not silently reopen the API.
             log_denied(peer, &path, &format!("token store unreadable: {e}"), 0);
             return unauthorized("token store unreadable; recovery requires root");
         }
     };
+    if path == "/api/v0/auth" || path == "/api/v0/auth/provision" {
+        return next.run(req).await;
+    }
     let presented = req
         .headers()
         .get(axum::http::header::AUTHORIZATION)
@@ -985,7 +1035,7 @@ async fn require_bearer(
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::trim)
         .unwrap_or("");
-    if peer.map(|p| p.ip().is_loopback()).unwrap_or(false) {
+    if is_loopback {
         if !presented.is_empty() {
             if crate::release::verify_local_token(&state.data_dir, presented) {
                 return next.run(req).await;
@@ -1022,6 +1072,7 @@ async fn require_bearer(
             .unwrap_or(false)
         && is_lan_exempt_everyday_route(req.method(), &path)
     {
+        req.extensions_mut().insert(LanExemptUnauthenticated);
         return next.run(req).await;
     }
     match crate::auth::verify_in(&entries, presented) {
@@ -1051,6 +1102,32 @@ async fn require_bearer(
     }
 }
 
+/// High-risk irreversible or secret-exfiltration routes that are blocked with
+/// `401 Unauthorized` from non-loopback private LAN peers while the Core is
+/// still unpaired (`auth.configured == false`).
+///
+/// Read-only status/auth/console and one-shot `POST /api/v0/auth/provision`
+/// stay reachable from private LAN so a household owner can pair a fresh NAS
+/// Docker or speaker via the Web Console; public IPs are rejected outright with
+/// `403 Forbidden` before reaching this check.
+fn is_unpaired_lan_blocked_route(method: &axum::http::Method, path: &str) -> bool {
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    matches!(
+        (method.as_str(), segs.as_slice()),
+        ("GET" | "POST", ["api", "v0", "config", "export"])
+            | ("POST", ["api", "v0", "config", "import"])
+            | ("POST", ["api", "v0", "system", "factory-reset" | "restart"])
+            | (_, ["api", "v0", "devices", _, "mic", ..])
+            | ("POST", ["api", "v0", "devices", _, "wifi"])
+            | (_, ["api", "v0", "release", ..])
+            | (_, ["api", "v0", "firmware", ..])
+            | ("POST", ["api", "v0", "auth", "rotate"])
+            | ("PUT", ["api", "v0", "auth", "lan-exempt"])
+            | ("POST", ["api", "v0", "fleet", "push"])
+            | ("POST", ["api", "v0", "reflex", "deploy"])
+    )
+}
+
 /// Transitional compatibility for pre-Phase-5 on-device `hm-release` binaries
 /// before their one-shot USB flash (#231): only the exact management routes the
 /// installer calls may proceed unauthenticated over loopback when no token is
@@ -1065,6 +1142,92 @@ fn is_legacy_loopback_release_route(method: &axum::http::Method, path: &str) -> 
                 "/api/v0/release/snapshot" | "/api/v0/reflex/deploy" | "/api/v0/system/restart"
             )
     )
+}
+
+/// Marker inserted into request extensions when `require_bearer` admits an
+/// unauthenticated private-LAN peer under `lan_gateway_exempt`. Handlers that
+/// mix everyday toggles with privileged fields (such as `PUT /api/v0/mode/{dev}`)
+/// inspect this marker to enforce field-level fail-closed authorization.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LanExemptUnauthenticated;
+
+/// Enforce loopback speaker isolation for unauthenticated `lan_gateway_exempt`
+/// LAN requests (`MG-P0-03`): a remote LAN/Android client without an admin
+/// Bearer token may only operate on non-loopback devices, never on a local
+/// loopback speaker such as `dot2-d`.
+pub(super) fn reject_lan_exempt_loopback_device(
+    state: &AppState,
+    lan_exempt: Option<&axum::Extension<LanExemptUnauthenticated>>,
+    device: &str,
+) -> Result<(), (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
+    if lan_exempt.is_some() && state.hub.device_is_loopback_protected(device) {
+        return Err((
+            axum::http::StatusCode::UNAUTHORIZED,
+            axum::Json(serde_json::json!({
+                "error": "admin bearer token required to access loopback speaker device"
+            })),
+        ));
+    }
+    Ok(())
+}
+
+/// Extract the owning device id from physical session namespaces:
+/// - `dev:<device>`
+/// - `dev:scope11:<device>:<epoch>`
+/// - `dev:context12:<device>:<ctx_id>`
+fn extract_physical_session_device(session_id: &str) -> Option<&str> {
+    let rest = session_id.strip_prefix("dev:")?;
+    if let Some(after_ns) = rest
+        .strip_prefix("scope11:")
+        .or_else(|| rest.strip_prefix("context12:"))
+    {
+        let (dev, _) = after_ns.rsplit_once(':')?;
+        return (!dev.is_empty()).then_some(dev);
+    }
+    (!rest.is_empty()).then_some(rest)
+}
+
+/// Enforce loopback speaker isolation on session-scoped routes
+/// (`GET /api/v0/session/{id}/messages`, `POST /api/v0/session/cancel`)
+/// when called unauthenticated under `lan_gateway_exempt` (`MG-P0-03`).
+pub(super) fn reject_lan_exempt_loopback_session(
+    state: &AppState,
+    lan_exempt: Option<&axum::Extension<LanExemptUnauthenticated>>,
+    session_id: &str,
+) -> Result<(), (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
+    if lan_exempt.is_none() {
+        return Ok(());
+    }
+    let deny = || {
+        Err((
+            axum::http::StatusCode::UNAUTHORIZED,
+            axum::Json(serde_json::json!({
+                "error": "admin bearer token required to access loopback speaker device"
+            })),
+        ))
+    };
+    if let Some(dev) = extract_physical_session_device(session_id) {
+        if state.hub.device_is_loopback_protected(dev) {
+            return deny();
+        }
+    }
+    for dev in state.hub.loopback_protected_devices() {
+        if session_id == format!("dev:{dev}")
+            || session_id.starts_with(&format!("dev:scope11:{dev}:"))
+            || session_id.starts_with(&format!("dev:context12:{dev}:"))
+        {
+            return deny();
+        }
+    }
+    if let Some(owner) = state
+        .sessions
+        .device_for_context_session_any_epoch(session_id)
+    {
+        if state.hub.device_is_loopback_protected(&owner) {
+            return deny();
+        }
+    }
+    Ok(())
 }
 
 /// Option 1A (`lan_gateway_exempt`) strict allowlist of everyday household
@@ -1093,19 +1256,22 @@ pub(crate) fn is_lan_exempt_everyday_route(method: &axum::http::Method, path: &s
         ) => true,
         ("GET", ["api", "v0", "devices", id, "conversation"]) if clean_seg(id) => true,
         ("GET", ["api", "v0", "session", id, "messages"]) if clean_seg(id) => true,
-        // Everyday chat, voice session, playback & volume controls
+        // Everyday chat, voice session, playback & volume controls.
+        // Note: `POST /api/v0/voice/announce` is intentionally EXCLUDED (external
+        // callback that can open follow-up mic windows; always requires Bearer auth).
         (
             "POST",
             ["api", "v0", "chat"]
             | ["api", "v0", "session", "cancel"]
-            | ["api", "v0", "session", "close"]
-            | ["api", "v0", "voice", "announce"],
+            | ["api", "v0", "session", "close"],
         ) => true,
         ("POST", ["api", "v0", "devices", id, "stop" | "volume"]) if clean_seg(id) => true,
         ("POST", ["api", "v0", "devices", id, "program", "pause" | "resume"]) if clean_seg(id) => {
             true
         }
-        // Everyday mode & mute toggles
+        ("POST", ["api", "v0", "devices", id, "media", "control"]) if clean_seg(id) => true,
+        // Everyday mode & mute toggles (privileged mode fields are additionally
+        // rejected with 401 inside `mode_put` when `LanExemptUnauthenticated` is set)
         ("PUT", ["api", "v0", "mode", dev]) if clean_seg(dev) => true,
         ("PUT", ["api", "v0", "devices", id, "mute"]) if clean_seg(id) => true,
         _ => false,
@@ -1127,7 +1293,9 @@ async fn auth_status(
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
         .map(|c| c.0);
-    let non_loopback_ip = peer.map(|p| p.ip()).filter(|ip| !ip.is_loopback());
+    let non_loopback_ip = peer
+        .map(|p| p.ip())
+        .filter(|ip| !crate::net::is_loopback_ip(*ip));
     let presented = req
         .headers()
         .get(axum::http::header::AUTHORIZATION)

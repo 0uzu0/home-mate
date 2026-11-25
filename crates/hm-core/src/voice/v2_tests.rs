@@ -660,9 +660,10 @@ async fn play_finished_resets_tainted_control_only_mic_echo_segment() {
         );
     }
     assert!(
-        pipe.mic.lock().unwrap().get(dev).is_some_and(
-            |p| p.in_speech() && p.open_provenance().spans.iter().any(|s| s.control_only)
-        ),
+        pipe.mic_arc(dev).is_some_and(|arc| {
+            let p = arc.lock().unwrap();
+            p.in_speech() && p.open_provenance().spans.iter().any(|s| s.control_only)
+        }),
         "expected an open control_only mic echo segment during voice playback"
     );
 
@@ -677,7 +678,7 @@ async fn play_finished_resets_tainted_control_only_mic_echo_segment() {
     .await;
 
     assert!(
-        !pipe.mic.lock().unwrap().get(dev).unwrap().in_speech(),
+        !pipe.mic_arc(dev).unwrap().lock().unwrap().in_speech(),
         "tainted control_only mic segment must be reset on voice PlayFinished"
     );
     assert!(
@@ -1118,6 +1119,7 @@ async fn gateway_disconnect_emits_device_left_first_and_cleans_voice_state() {
         st.current_task = Some(task_id.clone());
         st.mic_active = Some(true);
         st.acoustics_reconciled = true;
+        st.kws_reconciled = true;
     }
 
     // Drop the TCP connection to simulate a gateway disconnect.
@@ -1155,6 +1157,7 @@ async fn gateway_disconnect_emits_device_left_first_and_cleans_voice_state() {
                         && st.current_task.is_none()
                         && st.mic_active == Some(false)
                         && !st.acoustics_reconciled
+                        && !st.kws_reconciled
                 })
             };
             if clean {
@@ -1220,11 +1223,10 @@ async fn play_finished_clears_an_uncommitted_echo_onset_before_the_next_sentence
         );
     }
     assert!(
-        pipe.mic
-            .lock()
-            .unwrap()
-            .get(dev)
-            .is_some_and(|p| !p.in_speech() && p.onset_pending()),
+        pipe.mic_arc(dev).is_some_and(|arc| {
+            let p = arc.lock().unwrap();
+            !p.in_speech() && p.onset_pending()
+        }),
         "expected an uncommitted echo onset during voice playback"
     );
 
@@ -1239,11 +1241,10 @@ async fn play_finished_clears_an_uncommitted_echo_onset_before_the_next_sentence
     .await;
 
     assert!(
-        pipe.mic
-            .lock()
-            .unwrap()
-            .get(dev)
-            .is_some_and(|p| !p.onset_pending() && !p.in_speech()),
+        pipe.mic_arc(dev).is_some_and(|arc| {
+            let p = arc.lock().unwrap();
+            !p.onset_pending() && !p.in_speech()
+        }),
         "PlayFinished must clear the uncommitted echo run"
     );
 
@@ -1260,11 +1261,8 @@ async fn play_finished_clears_an_uncommitted_echo_onset_before_the_next_sentence
         );
     }
     assert!(
-        pipe.mic
-            .lock()
-            .unwrap()
-            .get(dev)
-            .is_some_and(|p| p.in_speech()),
+        pipe.mic_arc(dev)
+            .is_some_and(|arc| arc.lock().unwrap().in_speech()),
         "real speech right after PlayFinished must open a segment"
     );
     let quiet = vec![0i16; 1280];
@@ -1540,16 +1538,14 @@ async fn media_takeover_wake_ack_preserves_followup_across_play_finished() {
             crate::gateway::InputProvenance::default(),
         );
     }
-    assert!(pipe
-        .mic
-        .lock()
-        .unwrap()
-        .get(dev)
-        .is_some_and(|p| p.in_speech()
+    assert!(pipe.mic_arc(dev).is_some_and(|arc| {
+        let p = arc.lock().unwrap();
+        p.in_speech()
             && p.open_provenance()
                 .spans
                 .iter()
-                .all(|s| s.control_only && !s.wake_ack_overlap)));
+                .all(|s| s.control_only && !s.wake_ack_overlap)
+    }));
 
     // 2) Production keyword_wake pauses radio (hub media play still active!) and transfers+promotes capture.
     pipe.on_keyword(
@@ -1570,7 +1566,7 @@ async fn media_takeover_wake_ack_preserves_followup_across_play_finished() {
         .iter()
         .any(|e| e["kind"] == "wake_capture_transferred"));
     assert!(
-        pipe.mic.lock().unwrap().get(dev).unwrap().open_provenance().spans
+        pipe.mic_arc(dev).unwrap().lock().unwrap().open_provenance().spans
             .iter().all(|s| s.control_only && s.wake_ack_overlap),
         "production restore_wake_capture_locked must promote all pre-wake media spans to wake_ack_overlap"
     );
@@ -1625,7 +1621,7 @@ async fn media_takeover_wake_ack_preserves_followup_across_play_finished() {
         ts: now + 720,
     })
     .await;
-    assert!(pipe.mic.lock().unwrap().get(dev).unwrap().in_speech());
+    assert!(pipe.mic_arc(dev).unwrap().lock().unwrap().in_speech());
     assert!(!pipe
         .recent(20)
         .iter()
@@ -1652,10 +1648,9 @@ async fn media_takeover_wake_ack_preserves_followup_across_play_finished() {
         crate::gateway::InputProvenance::default(),
     );
     assert!(
-        pipe.mic
-            .lock()
+        pipe.mic_arc(dev)
             .unwrap()
-            .get(dev)
+            .lock()
             .unwrap()
             .open_provenance()
             .spans
@@ -1675,15 +1670,14 @@ async fn media_takeover_wake_ack_preserves_followup_across_play_finished() {
         );
     }
     assert!(
-        pipe.mic.lock().unwrap().get(dev).unwrap().open_provenance().spans
+        pipe.mic_arc(dev).unwrap().lock().unwrap().open_provenance().spans
             .last().is_some_and(|s| !s.control_only),
         "after natural tail expiry, speech with un-acked hub media pause must no longer be control_only"
     );
     assert!(
-        pipe.mic
-            .lock()
+        pipe.mic_arc(dev)
             .unwrap()
-            .get(dev)
+            .lock()
             .unwrap()
             .open_provenance()
             .allows_wake_ack_followup(),
@@ -2030,7 +2024,6 @@ async fn xiaoai_3tier_wake_suspect_drop_mid_segment_bare_wake_and_oneshot_slice(
             wake_end_cursor: None,
         },
         false,
-        false,
     );
     assert_eq!(
         pipe.states.lock().unwrap()[d1].participation.session.state,
@@ -2097,7 +2090,6 @@ async fn xiaoai_3tier_wake_suspect_drop_mid_segment_bare_wake_and_oneshot_slice(
             wake_end_cursor: None,
         },
         false,
-        false,
     );
     assert_eq!(
         pipe.states.lock().unwrap()[d2].participation.session.state,
@@ -2142,7 +2134,6 @@ async fn xiaoai_3tier_wake_suspect_drop_mid_segment_bare_wake_and_oneshot_slice(
             l2_passed: Some(true),
             wake_end_cursor: None,
         },
-        false,
         false,
     );
     assert_eq!(
@@ -2224,7 +2215,6 @@ async fn xiaoai_3tier_wake_suspect_drop_mid_segment_bare_wake_and_oneshot_slice(
             wake_end_cursor: None,
         },
         false,
-        false,
     );
     for i in 8..14u64 {
         pipe.feed_chunk(
@@ -2302,7 +2292,6 @@ async fn xiaoai_3tier_wake_suspect_drop_mid_segment_bare_wake_and_oneshot_slice(
             wake_end_cursor: None,
         },
         false,
-        false,
     );
     assert_eq!(
         pipe.states.lock().unwrap()[d5].participation.session.state,
@@ -2343,7 +2332,6 @@ async fn xiaoai_3tier_wake_suspect_drop_mid_segment_bare_wake_and_oneshot_slice(
             wake_end_cursor: None,
         },
         false,
-        false,
     );
     assert_eq!(
         pipe.states.lock().unwrap()[d6].participation.close_reason,
@@ -2381,7 +2369,6 @@ async fn xiaoai_3tier_wake_suspect_drop_mid_segment_bare_wake_and_oneshot_slice(
             l2_passed: Some(true),
             wake_end_cursor: None,
         },
-        false,
         false,
     );
     for i in 8..12u64 {
@@ -2448,7 +2435,6 @@ async fn xiaoai_3tier_wake_suspect_drop_mid_segment_bare_wake_and_oneshot_slice(
             l2_passed: Some(true),
             wake_end_cursor: None,
         },
-        false,
         false,
     );
     for i in 8..12u64 {
@@ -2541,7 +2527,6 @@ async fn xiaoai_3tier_wake_suspect_drop_mid_segment_bare_wake_and_oneshot_slice(
             wake_end_cursor: None,
         },
         false,
-        false,
     );
     assert_eq!(
         pipe.media_state(d9),
@@ -2603,7 +2588,6 @@ async fn xiaoai_3tier_wake_suspect_drop_mid_segment_bare_wake_and_oneshot_slice(
             wake_end_cursor: None,
         },
         false,
-        false,
     );
     assert_eq!(
         pipe.media_state(d9b),
@@ -2625,7 +2609,12 @@ async fn xiaoai_3tier_wake_suspect_drop_mid_segment_bare_wake_and_oneshot_slice(
             crate::gateway::InputProvenance::default(),
         );
     }
-    let captured_cursor = pipe.mic.lock().unwrap()[d10].current_block_cursor();
+    let captured_cursor = pipe
+        .mic_arc(d10)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .current_block_cursor();
     // Simulate 4 post-wake command blocks (320 ms) arriving during the arbitration window
     // BEFORE `on_keyword_at(..., arbitrated=true)` re-enters with the preserved cursor.
     for i in 8..12u64 {
@@ -2655,7 +2644,6 @@ async fn xiaoai_3tier_wake_suspect_drop_mid_segment_bare_wake_and_oneshot_slice(
             wake_end_cursor: Some(captured_cursor),
         },
         true,
-        false,
     );
     for i in 12..24u64 {
         pipe.feed_chunk(
@@ -2720,7 +2708,6 @@ async fn xiaoai_3tier_wake_suspect_drop_mid_segment_bare_wake_and_oneshot_slice(
                 l2_passed: Some(true),
                 wake_end_cursor: None,
             },
-            false,
             false,
         );
         for i in 9..20u64 {
@@ -2787,8 +2774,8 @@ async fn xiaoai_3tier_wake_suspect_drop_mid_segment_bare_wake_and_oneshot_slice(
     // Close VAD directly inside MicProcessor WITHOUT letting handle_mic_outcome stamp
     // st.mic_last_close_ms, reproducing the exact 2 ms cross-lock race from dot2-d seq 32..34.
     {
-        let mut procs = pipe.mic.lock().unwrap();
-        let p = procs.get_mut(d13).unwrap();
+        let arc = pipe.mic_arc(d13).unwrap();
+        let mut p = arc.lock().unwrap();
         let mut closed = false;
         for _ in 0..12 {
             if matches!(
@@ -2826,7 +2813,6 @@ async fn xiaoai_3tier_wake_suspect_drop_mid_segment_bare_wake_and_oneshot_slice(
             wake_end_cursor: None,
         },
         true,
-        false,
     );
     tokio::time::sleep(std::time::Duration::from_millis(80)).await;
     assert!(

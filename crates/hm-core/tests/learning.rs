@@ -198,7 +198,7 @@ async fn speaker_first_learning_tools_and_learn10_wait_state() {
     let now = hm_core::id::now_ms();
     let lease = state
         .learning
-        .active_wait(now)
+        .active_wait_for(None, now)
         .expect("LEARN-10 wait lease active");
     assert_eq!(lease.window_ms, LEARNING_WAIT_WINDOW_MS);
     assert_eq!(lease.session_id.as_deref(), Some("S1"));
@@ -206,7 +206,7 @@ async fn speaker_first_learning_tools_and_learn10_wait_state() {
     // Hard TTL ceiling prevents infinite open mic
     assert!(state
         .learning
-        .active_wait(now + LEARNING_WAIT_TTL_MS + 1)
+        .active_wait_for(None, now + LEARNING_WAIT_TTL_MS + 1)
         .is_none());
 
     // Invalid dimension / mode / oversized answer rejected locally
@@ -225,7 +225,10 @@ async fn speaker_first_learning_tools_and_learn10_wait_state() {
         .execute(json!({}), &ctx)
         .await;
     assert_eq!(cur.status, ToolStatus::Completed);
-    assert!(state.learning.active_wait(hm_core::id::now_ms()).is_some());
+    assert!(state
+        .learning
+        .active_wait_for(None, hm_core::id::now_ms())
+        .is_some());
 
     // Reveal & answer keep session active
     let rev = LearningRevealTool::new(state.learning.clone())
@@ -243,5 +246,8 @@ async fn speaker_first_learning_tools_and_learn10_wait_state() {
         .execute(json!({ "action": "pause" }), &ctx)
         .await;
     assert_eq!(pause.status, ToolStatus::Completed);
-    assert!(state.learning.active_wait(hm_core::id::now_ms()).is_none());
+    assert!(state
+        .learning
+        .active_wait_for(None, hm_core::id::now_ms())
+        .is_none());
 }

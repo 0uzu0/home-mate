@@ -8,13 +8,64 @@
  *   synthesis, service probes). Still never plays a sound.
  * The stage words are the same ones the service cards use.
  */
-import { computed, ref } from 'vue'
-import { runSelfCheck, type SelfCheckResult } from '../../api'
+import { computed, ref, watch } from 'vue'
+import { runSelfCheck, type ModeDevice, type SelfCheckResult, type SelfCheckStage } from '../../api'
+import { deviceName, selectedId as storeSelectedId } from '../../stores/devices'
 import { errorDetail } from '../../format'
 import { t } from '../../i18n'
 import Panel from '../Panel.vue'
 import Pill from '../Pill.vue'
 import AppIcon from '../AppIcon.vue'
+
+const props = defineProps<{
+  devices?: ModeDevice[]
+  selectedDeviceId?: string | null
+}>()
+
+const preferredDeviceId = computed(() =>
+  props.selectedDeviceId !== undefined ? props.selectedDeviceId ?? '' : storeSelectedId.value ?? '',
+)
+
+const selectedDevice = ref('')
+watch(
+  [() => props.devices ?? [], preferredDeviceId],
+  ([list, pref], [, prevPref]) => {
+    if (!list.length) {
+      selectedDevice.value = ''
+      return
+    }
+    const prefChanged = prevPref !== undefined && pref !== prevPref
+    if (pref && list.some((d) => d.device === pref) && (prefChanged || !selectedDevice.value || !list.some((d) => d.device === selectedDevice.value))) {
+      selectedDevice.value = pref
+      return
+    }
+    if (selectedDevice.value && list.some((d) => d.device === selectedDevice.value)) {
+      return
+    }
+    selectedDevice.value = list[0].device
+  },
+  { immediate: true },
+)
+
+interface StageDeviceEvidence {
+  device: string
+  state?: string
+  idle_gated?: boolean
+  online?: boolean
+}
+
+function isStageIdleGated(stage: SelfCheckStage): boolean {
+  return stage.evidence?.idle_gated === true
+}
+
+function stageAllDevices(stage: SelfCheckStage): StageDeviceEvidence[] {
+  const raw = stage.evidence?.all_devices
+  if (!Array.isArray(raw)) return []
+  return raw.filter(
+    (item): item is StageDeviceEvidence =>
+      Boolean(item) && typeof item === 'object' && typeof (item as { device?: unknown }).device === 'string',
+  )
+}
 
 const result = ref<SelfCheckResult | null>(null)
 const running = ref(false)
@@ -93,7 +144,7 @@ async function run(deep: boolean): Promise<void> {
   running.value = true
   error.value = ''
   try {
-    result.value = await runSelfCheck(deep)
+    result.value = await runSelfCheck(deep, selectedDevice.value || undefined)
   } catch (err) {
     error.value = errorDetail(err)
   } finally {
@@ -109,6 +160,16 @@ async function run(deep: boolean): Promise<void> {
     </template>
 
     <div class="sc__actions">
+      <select
+        v-if="devices && devices.length > 1"
+        v-model="selectedDevice"
+        class="btn mono"
+        :aria-label="t('targetDeviceLabel')"
+      >
+        <option v-for="d in devices" :key="d.device" :value="d.device">
+          {{ deviceName(d.device) === d.device ? d.device : `${deviceName(d.device)} (${d.device})` }}
+        </option>
+      </select>
       <button type="button" class="btn btn--primary" :disabled="running" @click="run(false)">
         <AppIcon name="check" :size="13" />
         {{ running ? t('selfCheckRunning') : t('selfCheckQuick') }}
@@ -131,9 +192,26 @@ async function run(deep: boolean): Promise<void> {
         <li v-for="stage in result.stages" :key="stage.stage" class="sc__stage">
           <div class="sc__stage-head">
             <span class="sc__stage-name">{{ stageLabel(stage.stage) }}</span>
-            <Pill :tone="stateTone(stage.state)" size="sm" mono>{{ stateLabel(stage.state) }}</Pill>
+            <div class="sc__stage-pills">
+              <Pill v-if="isStageIdleGated(stage)" tone="ok" size="sm">
+                {{ t('micIdleGated') }}
+              </Pill>
+              <Pill :tone="stateTone(stage.state)" size="sm" mono>{{ stateLabel(stage.state) }}</Pill>
+            </div>
           </div>
           <p class="sc__detail">{{ stage.detail }}</p>
+          <div v-if="stageAllDevices(stage).length > 1" class="sc__dev-pills">
+            <Pill
+              v-for="dev in stageAllDevices(stage)"
+              :key="`${stage.stage}-${dev.device}`"
+              :tone="dev.state ? stateTone(dev.state) : dev.online ? 'ok' : 'warn'"
+              size="sm"
+              mono
+            >
+              {{ dev.device }} ·
+              {{ dev.idle_gated ? t('micIdleGated') : dev.state ? stateLabel(dev.state) : dev.online ? t('online') : t('offline') }}
+            </Pill>
+          </div>
           <details class="sc__evidence">
             <summary>{{ t('selfCheckEvidence') }}</summary>
             <pre class="sc__json">{{ JSON.stringify(stage.evidence, null, 2) }}</pre>
@@ -194,6 +272,19 @@ async function run(deep: boolean): Promise<void> {
   align-items: center;
   justify-content: space-between;
   gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+.sc__stage-pills,
+.sc__dev-pills {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  flex-wrap: wrap;
+}
+
+.sc__dev-pills {
+  margin-top: var(--sp-1);
 }
 
 .sc__stage-name {

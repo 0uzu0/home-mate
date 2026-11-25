@@ -4,17 +4,22 @@
  * and latency. Nothing here is inferred — a missing report says so.
  */
 import { computed } from 'vue'
-import type { ModeDevice } from '../../api'
+import { isDeviceIdleGated, type GatewayDevice, type ModeDevice } from '../../api'
 import { t } from '../../i18n'
 import { formatDb, formatDuration } from '../../format'
 import Panel from '../Panel.vue'
+import Pill from '../Pill.vue'
 import StatTile from '../StatTile.vue'
 import Meter from '../Meter.vue'
 import EmptyState from '../EmptyState.vue'
 
-const props = defineProps<{ device: ModeDevice | null }>()
+const props = defineProps<{
+  device: ModeDevice | null
+  gatewayDevice?: GatewayDevice | null
+}>()
 
 const mic = computed(() => props.device?.mic ?? null)
+const idleGated = computed(() => isDeviceIdleGated(props.device, props.gatewayDevice))
 
 const sessionLabel = computed(() => {
   if (mic.value?.session === true) return t('micSessionOn')
@@ -48,22 +53,31 @@ const latency = computed(() => props.device?.latency ?? null)
 <template>
   <Panel
     icon="mic" :title="t('micTitle')" :hint="t('micHint')">
+    <template v-if="idleGated" #actions>
+      <Pill tone="ok" size="sm">{{ t('micIdleGated') }}</Pill>
+    </template>
     <EmptyState v-if="!mic" :title="t('noMic')" />
 
     <template v-else>
       <div class="mic__grid">
         <StatTile
           :label="t('micSession')"
-          :value="sessionLabel"
-          :tone="mic.session === true ? 'ok' : mic.session === false ? 'warn' : 'muted'"
-          :note="mic.detail || ''"
+          :value="idleGated ? t('micIdleGated') : sessionLabel"
+          :tone="idleGated || mic.session === true ? 'ok' : mic.session === false ? 'warn' : 'muted'"
+          :note="idleGated ? t('micIdleGatedNote') : mic.detail || ''"
         />
         <StatTile
           :label="t('micSpeech')"
           :value="mic.in_speech ? t('micInSpeech') : t('micIdle')"
           :tone="mic.in_speech ? 'live' : 'muted'"
         />
-        <StatTile :label="t('micRate')" :value="(mic.chunks_per_sec ?? 0).toFixed(1)" unit="/s" tone="muted" />
+        <StatTile
+          :label="t('micRate')"
+          :value="(mic.chunks_per_sec ?? 0).toFixed(1)"
+          unit="/s"
+          :tone="idleGated ? 'ok' : 'muted'"
+          :note="idleGated ? t('micIdleGated') : ''"
+        />
         <StatTile :label="t('blocksSeen')" :value="mic.blocks_seen ?? 0" tone="muted" />
       </div>
 

@@ -135,10 +135,10 @@ async fn keyword_does_not_rebase_stale_or_dispatched_capture() {
     ] {
         let (p, mut keyword) = prepared(true, 1);
         match cause {
-            "reset" => p.mic.lock().unwrap().get_mut("test").unwrap().reset(),
+            "reset" => p.mic_arc("test").unwrap().lock().unwrap().reset(),
             "onset" => {
-                let mut mic = p.mic.lock().unwrap();
-                let processor = mic.get_mut("test").unwrap();
+                let mic_arc = p.mic_arc("test").unwrap();
+                let mut processor = mic_arc.lock().unwrap();
                 processor.reset();
                 processor.feed_with_provenance(
                     vec![12000; 1280],
@@ -241,7 +241,7 @@ async fn restoration_rechecks_live_onset_and_connection_after_context_admission(
             .admit_context_locked("test", st, id::now_ms(), window, true)
             .unwrap();
         match cause {
-            "reset" => p.mic.lock().unwrap().get_mut("test").unwrap().reset(),
+            "reset" => p.mic_arc("test").unwrap().lock().unwrap().reset(),
             "connection" => st.input_connection_generation = Some(2),
             "deadline" => capture.capture_deadline = Instant::now() - Duration::from_millis(1),
             _ => unreachable!(),

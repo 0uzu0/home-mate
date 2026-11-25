@@ -17,14 +17,29 @@ export class ApiError extends Error {
   readonly code: ApiErrorCode
   readonly detail: string
   readonly status: number
+  readonly serverCode?: string
 
-  constructor(code: ApiErrorCode, detail: string, status = 0) {
+  constructor(code: ApiErrorCode, detail: string, status = 0, serverCode?: string) {
     super(detail || code)
     this.name = 'ApiError'
     this.code = code
     this.detail = detail
     this.status = status
+    this.serverCode = serverCode
   }
+}
+
+export function isDeviceRequiredError(err: unknown): boolean {
+  if (err instanceof ApiError) {
+    return err.serverCode === 'DEVICE_REQUIRED' || err.detail.includes('DEVICE_REQUIRED')
+  }
+  if (err && typeof err === 'object') {
+    const rec = err as { code?: unknown; error?: unknown; detail?: unknown }
+    if (rec.code === 'DEVICE_REQUIRED') return true
+    if (typeof rec.error === 'string' && rec.error.includes('DEVICE_REQUIRED')) return true
+    if (typeof rec.detail === 'string' && rec.detail.includes('DEVICE_REQUIRED')) return true
+  }
+  return false
 }
 
 export function isAbort(err: unknown): boolean {
@@ -107,14 +122,16 @@ export async function request<T>(path: string, init: RequestInit = {}, opts: Req
         markUnauthorized()
       }
       let detail = ''
+      let serverCode: string | undefined
       try {
-        const body = JSON.parse(text) as { error?: unknown; detail?: unknown }
+        const body = JSON.parse(text) as { error?: unknown; detail?: unknown; code?: unknown }
         detail =
           typeof body.error === 'string' ? body.error : typeof body.detail === 'string' ? body.detail : ''
+        if (typeof body.code === 'string' && body.code.trim()) serverCode = body.code.trim()
       } catch {
         detail = text.trim().slice(0, 300)
       }
-      throw new ApiError(codeFor(response.status), detail, response.status)
+      throw new ApiError(codeFor(response.status), detail, response.status, serverCode)
     }
     if (response.status === 204 || !text) return undefined as T
     let parsed: unknown
@@ -158,6 +175,7 @@ export interface GatewayDevice {
   capabilities: string[]
   audio_profile: string
   online: boolean
+  loopback?: boolean
   generation: number
   last_seq: number
   wifi_ssid?: string | null
@@ -203,8 +221,22 @@ export interface NorthboundReadback {
   stale: boolean
 }
 
+export interface GatewayConnection {
+  generation: number
+  gateway: string
+  gateway_version?: string | null
+  protocol_operating: number
+  peer_addr?: string | null
+  authenticated: boolean
+  devices: string[]
+}
+
 export interface GatewaySnapshot {
   connected: boolean
+  multi_gateway?: boolean
+  voice_gateway_open?: boolean
+  connection_count?: number
+  connections?: GatewayConnection[]
   gateway?: string | null
   gateway_version?: string | null
   protocol_operating?: number | null
@@ -252,9 +284,68 @@ export interface Status {
     key_path: string | null
   }
   wifi_provisioning?: WifiProvisioningNotice
+  wifi_provisioning_by_device?: Record<string, WifiProvisioningNotice>
 }
 
-export const getStatus = (opts?: RequestOptions) => request<Status>('/api/v0/status', {}, opts)
+export const getStatus = (opts?: RequestOptions & { device?: string }) => {
+  const { device, ...reqOpts } = opts ?? {}
+  const q = device?.trim() ? `?device=${encodeURIComponent(device.trim())}` : ''
+  return request<Status>(`/api/v0/status${q}`, {}, reqOpts)
+}
+
+/**
+ * Resolve Wi-Fi provisioning status strictly for the selected device.
+ *
+ * Reads `wifi_provisioning_by_device[selectedDevice]` first, falling back to
+ * legacy top-level `wifi_provisioning` ONLY when single-device or matching
+ * `selectedDevice` so sibling devices never bleed into the active view.
+ */
+export function resolveWifiProvisioningForDevice(
+  selectedDevice: string | null | undefined,
+  status: Pick<Status, 'wifi_provisioning' | 'wifi_provisioning_by_device' | 'gateway'> | null | undefined,
+  fallbackByDevice?: Record<string, WifiProvisioningNotice> | null,
+  deviceCount?: number,
+): WifiProvisioningNotice {
+  const dev = selectedDevice?.trim() || ''
+  const totalDevices = deviceCount ?? status?.gateway?.devices?.length ?? 0
+  const map = status?.wifi_provisioning_by_device
+
+  if (map && typeof map === 'object') {
+    if (dev) {
+      const entry = map[dev]
+      if (entry?.requested) return entry
+      // Map is authoritative when present; fall back to local voiceLog map for
+      // the SAME device only, never to a sibling device.
+      const localEntry = fallbackByDevice?.[dev]
+      return localEntry?.requested ? localEntry : { requested: false, device: dev }
+    }
+    if (totalDevices <= 1) {
+      const only = Object.values(map).find((entry) => entry?.requested)
+      if (only) return only
+    }
+  }
+
+  const top = status?.wifi_provisioning
+  if (top?.requested) {
+    const topDev = top.device?.trim() || ''
+    if (!dev && totalDevices <= 1) return top
+    if (dev && (topDev === dev || (!topDev && totalDevices <= 1))) return top
+  }
+
+  if (fallbackByDevice) {
+    if (dev) {
+      const entry = fallbackByDevice[dev]
+      if (entry?.requested) return entry
+      return { requested: false, device: dev }
+    }
+    if (totalDevices <= 1) {
+      const only = Object.values(fallbackByDevice).find((entry) => entry?.requested)
+      if (only) return only
+    }
+  }
+
+  return { requested: false, device: dev || null }
+}
 
 export interface AuthTokenInfo {
   id: string
@@ -304,6 +395,7 @@ export const setLanGatewayExempt = (lan_gateway_exempt: boolean, opts?: RequestO
 export const LED_STATES = [
   'idle',
   'listening',
+  'hearing',
   'wake',
   'thinking',
   'speaking',

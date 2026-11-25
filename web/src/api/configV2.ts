@@ -200,16 +200,6 @@ export interface HouseholdInvitation {
   created_ms: number
   expires_ms: number
 }
-export interface RedeemInvitationRequest {
-  token: string
-  node_id: string
-}
-export interface RedeemInvitationResponse {
-  invitation_id: string
-  household_id: string
-  expected_node_id: string
-  membership_generation: number
-}
 export interface JoinHouseholdRequest {
   token: string
   issuer_node_id?: string
@@ -225,8 +215,6 @@ export interface JoinHouseholdResponse {
 }
 export const issueHouseholdInvitation = (body: HouseholdInvitationRequest) =>
   request<HouseholdInvitation>('/api/v1/config/household/invitations', { method: 'POST', body: JSON.stringify(body) })
-export const redeemHouseholdInvitation = (body: RedeemInvitationRequest) =>
-  request<RedeemInvitationResponse>('/api/v1/config/household/invitations/redeem', { method: 'POST', body: JSON.stringify(body) })
 export const joinHousehold = (body: JoinHouseholdRequest) =>
   request<JoinHouseholdResponse>('/api/v1/config/household/join', { method: 'POST', body: JSON.stringify(body) })
 
@@ -312,11 +300,23 @@ export interface FleetRollbackResponse {
 }
 export const preflightFleet = (body: FleetPreflightRequest) =>
   request<FleetPreflightResponse>('/api/v1/config/fleet/preflight', { method: 'POST', body: JSON.stringify(body) })
-export const commitFleet = (body: FleetRunRequest) =>
-  request<FleetRunStatus>('/api/v1/config/fleet/runs', { method: 'POST', body: JSON.stringify(body) })
+export const commitFleet = (body: FleetRunRequest, opts?: RequestOptions) =>
+  request<FleetRunStatus>(
+    '/api/v1/config/fleet/runs',
+    { method: 'POST', body: JSON.stringify(body) },
+    { timeoutMs: 180000, ...opts },
+  )
 export const getFleetRun = (id: string, opts?: RequestOptions) =>
   request<FleetRunStatus>(`/api/v1/config/fleet/runs/${encodeURIComponent(id)}`, {}, opts)
-export const retryFleetRun = (id: string) =>
-  request<FleetRunStatus>(`/api/v1/config/fleet/runs/${encodeURIComponent(id)}/retry`, { method: 'POST', body: '{}' })
-export const rollbackFleetTarget = (id: string, node: string, body: FleetRollbackRequest = {}) =>
-  request<FleetRollbackResponse>(`/api/v1/config/fleet/runs/${encodeURIComponent(id)}/targets/${encodeURIComponent(node)}/rollback-preflight`, { method: 'POST', body: JSON.stringify(body) })
+export const retryFleetRun = (id: string, opts?: RequestOptions) =>
+  request<FleetRunStatus>(
+    `/api/v1/config/fleet/runs/${encodeURIComponent(id)}/retry`,
+    { method: 'POST', body: '{}' },
+    { timeoutMs: 180000, ...opts },
+  )
+export const rollbackFleetTarget = (id: string, node: string, body: FleetRollbackRequest = {}, opts?: RequestOptions) =>
+  request<FleetRollbackResponse>(
+    `/api/v1/config/fleet/runs/${encodeURIComponent(id)}/targets/${encodeURIComponent(node)}/rollback-preflight`,
+    { method: 'POST', body: JSON.stringify(body) },
+    { timeoutMs: 40000, ...opts },
+  )

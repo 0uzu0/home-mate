@@ -297,6 +297,139 @@ pub fn is_private_lan_ip(ip: std::net::IpAddr) -> bool {
         || (a == 100 && (64..=127).contains(&b))
 }
 
+/// True iff `ip` is an IPv6 Unique Local Address (`fc00::/7`).
+pub fn is_ipv6_ula(ip: std::net::IpAddr) -> bool {
+    matches!(ip, std::net::IpAddr::V6(v6) if (v6.segments()[0] & 0xfe00) == 0xfc00)
+}
+
+/// True iff `ip` is a Carrier-Grade NAT / Tailscale / WireGuard overlay address
+/// (`100.64.0.0/10` or IPv4-mapped `::ffff:100.64.0.0/10`). RFC1918 home LAN
+/// addresses (`192.168.0.0/16`, `10.0.0.0/8`, `172.16.0.0/12`) and loopback
+/// return `false` so local LAN Wi-Fi clients keep native lossless sample rates.
+pub fn is_cgnat_vpn_ip(ip: std::net::IpAddr) -> bool {
+    let v4 = match ip {
+        std::net::IpAddr::V4(v4) => v4,
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4,
+            None => return false,
+        },
+    };
+    let [a, b, _, _] = v4.octets();
+    a == 100 && (64..=127).contains(&b)
+}
+
+/// Query the Linux kernel's smoothed TCP round-trip time (`tcpi_rtt`, in
+/// microseconds) for a live gateway socket. Returns `None` on non-Linux hosts
+/// or before the kernel has recorded a non-zero RTT sample.
+pub fn tcp_smoothed_rtt_us(stream: &tokio::net::TcpStream) -> Option<u32> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = stream;
+        None
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_INFO,
+                (&mut info as *mut libc::tcp_info).cast::<libc::c_void>(),
+                &mut len,
+            )
+        };
+        let min_bytes = std::mem::offset_of!(libc::tcp_info, tcpi_rtt) + std::mem::size_of::<u32>();
+        if rc == 0 && (len as usize) >= min_bytes && info.tcpi_rtt > 0 {
+            Some(info.tcpi_rtt)
+        } else {
+            None
+        }
+    }
+}
+
+/// Cap kernel-queued unsent TCP bytes (`TCP_NOTSENT_LOWAT`) on non-loopback
+/// gateway sockets so bulk media chunks stay in user-space priority queues
+/// (where `Control`/`Voice` frames preempt them) without shrinking `SO_SNDBUF`
+/// or throttling LAN Hi-Fi bandwidth-delay product (`#297`).
+/// Best-effort: returns `false` on unsupported OSes/kernels without failing.
+pub fn set_tcp_notsent_lowat(stream: &tokio::net::TcpStream, bytes: u32) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::os::fd::AsRawFd;
+        #[cfg(target_os = "linux")]
+        const OPT_TCP_NOTSENT_LOWAT: libc::c_int = 25;
+        #[cfg(target_os = "macos")]
+        const OPT_TCP_NOTSENT_LOWAT: libc::c_int = 0x201;
+
+        let val: libc::c_uint = bytes;
+        let rc = unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                OPT_TCP_NOTSENT_LOWAT,
+                (&val as *const libc::c_uint).cast::<libc::c_void>(),
+                std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+            )
+        };
+        rc == 0
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (stream, bytes);
+        false
+    }
+}
+
+/// Test-only readback of `TCP_NOTSENT_LOWAT` via `getsockopt` so socket
+/// configuration tests assert actual kernel state rather than a proxy call.
+#[cfg(test)]
+pub fn tcp_notsent_lowat(stream: &tokio::net::TcpStream) -> Option<u32> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::os::fd::AsRawFd;
+        #[cfg(target_os = "linux")]
+        const OPT_TCP_NOTSENT_LOWAT: libc::c_int = 25;
+        #[cfg(target_os = "macos")]
+        const OPT_TCP_NOTSENT_LOWAT: libc::c_int = 0x201;
+
+        let mut val: libc::c_uint = 0;
+        let mut len = std::mem::size_of::<libc::c_uint>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                OPT_TCP_NOTSENT_LOWAT,
+                (&mut val as *mut libc::c_uint).cast::<libc::c_void>(),
+                &mut len,
+            )
+        };
+        if rc == 0 && (len as usize) >= std::mem::size_of::<libc::c_uint>() {
+            Some(val)
+        } else {
+            None
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = stream;
+        None
+    }
+}
+
+/// True iff `ip` is a loopback address (`127.0.0.0/8`, `::1`, or IPv4-mapped
+/// `::ffff:127.x.x.x`).
+pub fn is_loopback_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
+}
+
 /// Detect whether `iptables -S INPUT` or `iptables -L INPUT -n` output
 /// indicates a default `DROP` policy on the `INPUT` chain (e.g. Dot2 emOS).
 pub fn input_policy_is_drop(iptables_output: &str) -> bool {
@@ -449,6 +582,30 @@ mod tests {
             let ip: std::net::IpAddr = ok.parse().unwrap();
             assert!(is_private_lan_ip(ip), "{ok} should be private LAN");
         }
+        for vpn in [
+            "100.64.0.1",
+            "100.100.100.100",
+            "100.127.255.254",
+            "::ffff:100.64.10.20",
+        ] {
+            assert!(
+                is_cgnat_vpn_ip(vpn.parse().unwrap()),
+                "{vpn} should be CGNAT VPN"
+            );
+        }
+        for non_vpn in [
+            "127.0.0.1",
+            "192.168.1.100",
+            "10.0.0.1",
+            "172.16.0.1",
+            "100.63.255.255",
+            "100.128.0.1",
+        ] {
+            assert!(
+                !is_cgnat_vpn_ip(non_vpn.parse().unwrap()),
+                "{non_vpn} must NOT be CGNAT VPN"
+            );
+        }
         for bad in [
             "127.0.0.1",
             "::1",
@@ -468,6 +625,43 @@ mod tests {
         ] {
             let ip: std::net::IpAddr = bad.parse().unwrap();
             assert!(!is_private_lan_ip(ip), "{bad} must NOT be private LAN");
+        }
+    }
+
+    #[test]
+    fn is_ipv6_ula_and_loopback_ip_classify_addresses_accurately() {
+        for ula in ["fc00::1", "fd12:3456:789a::1", "fdff:ffff::ffff"] {
+            assert!(is_ipv6_ula(ula.parse().unwrap()), "{ula} should be ULA");
+        }
+        for non_ula in [
+            "::1",
+            "fe80::1",
+            "2001:db8::1",
+            "fbff::1",
+            "fe00::1",
+            "192.168.1.1",
+        ] {
+            assert!(
+                !is_ipv6_ula(non_ula.parse().unwrap()),
+                "{non_ula} must NOT be ULA"
+            );
+        }
+        for lb in ["127.0.0.1", "127.0.1.1", "::1", "::ffff:127.0.0.1"] {
+            assert!(
+                is_loopback_ip(lb.parse().unwrap()),
+                "{lb} should be loopback"
+            );
+        }
+        for non_lb in [
+            "192.168.1.1",
+            "203.0.113.9",
+            "::ffff:192.168.1.1",
+            "fc00::1",
+        ] {
+            assert!(
+                !is_loopback_ip(non_lb.parse().unwrap()),
+                "{non_lb} must NOT be loopback"
+            );
         }
     }
 

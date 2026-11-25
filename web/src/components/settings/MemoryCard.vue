@@ -25,7 +25,6 @@ import {
   type MemoryItem,
 } from '../../api'
 import { t } from '../../i18n'
-import { errorDetail } from '../../format'
 import { useResource } from '../../hooks/useResource'
 import { usePoll } from '../../hooks/usePoll'
 import { useSave } from '../../hooks/useSave'
@@ -44,9 +43,8 @@ const candidateList = useResource((signal) => getMemoryCandidates('pending', { s
   timeoutMs: 6000,
   retries: 1,
 })
-usePoll(() => {
-  list.load()
-  candidateList.load()
+usePoll(async () => {
+  await Promise.all([list.load(), candidateList.load()])
 }, 15000)
 
 const items = computed<MemoryItem[]>(() => list.data.value?.items ?? [])
@@ -362,7 +360,7 @@ async function ignoreCandidate(c: MemoryCandidate): Promise<void> {
   color: var(--ok);
 }
 
-.memory__msg--danger {
+.memory__msg--error {
   color: var(--danger);
 }
 

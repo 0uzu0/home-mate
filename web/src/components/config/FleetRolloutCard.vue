@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, shallowRef } from 'vue'
+import { computed, onMounted, ref, shallowRef, watch } from 'vue'
 import { getFleet, type FleetView } from '../../api'
 import { ApiError } from '../../api/client'
 import {
@@ -78,6 +78,10 @@ const preflightResult = shallowRef<FleetPreflightResponse | null>(null)
 const activeRun = shallowRef<FleetRunStatus | null>(null)
 const resumeRunId = ref(readStoredRunId())
 const pendingRunId = ref<string | null>(null)
+
+watch([packageDraft, selectedTargets, sanitizeFamily], () => {
+  pendingRunId.value = null
+})
 
 // Per-target rollback preview/result keyed by node_id
 const rollbackStates = ref<Record<string, FleetRollbackResponse>>({})

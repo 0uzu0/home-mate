@@ -25,6 +25,22 @@ use std::sync::Arc;
 
 const REMINDER_UNAVAILABLE: &str = "REMINDER_UNAVAILABLE";
 
+enum ReminderDeviceError {
+    Ambiguous(String),
+    Unauthorized(String),
+    Unavailable(String),
+}
+
+impl ReminderDeviceError {
+    fn into_tool_result(self) -> ToolResult {
+        match self {
+            Self::Ambiguous(msg) => ToolResult::failed("AMBIGUOUS_DEVICE", msg, false),
+            Self::Unauthorized(msg) => ToolResult::failed("PAIRING_REQUIRED", msg, false),
+            Self::Unavailable(msg) => ToolResult::failed(REMINDER_UNAVAILABLE, msg, true),
+        }
+    }
+}
+
 pub struct ReminderRuntime {
     svc: Arc<ReminderService>,
     hub: Arc<DeviceHub>,
@@ -56,28 +72,54 @@ impl ReminderRuntime {
         self.svc.clone()
     }
 
-    /// The speaker that owns the reminder: an online one, else an honest
-    /// refusal (a reminder for a speaker that is not there cannot fire).
-    fn device(&self) -> Result<String, String> {
-        if let Some(d) = &self.fixed_device {
-            return Ok(d.clone());
+    /// The device that owns the reminder:
+    /// 1. Test seam `fixed_device`
+    /// 2. Originating turn's `ctx.device_id` (M12a: "哪台设置，哪台提醒")
+    /// 3. Primary online audio_out device, else first online/known device.
+    fn device_for(&self, ctx: &ToolCtx) -> Result<String, ReminderDeviceError> {
+        let resolved = if let Some(d) = &self.fixed_device {
+            d.clone()
+        } else if let Some(ctx_dev) = ctx
+            .device_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            ctx_dev.to_string()
+        } else if let Some(primary) = self
+            .hub
+            .resolve_default_audio_out()
+            .map_err(ReminderDeviceError::Ambiguous)?
+        {
+            primary.stable_id
+        } else {
+            let snap = self.hub.snapshot();
+            let devices = snap["devices"].as_array().cloned().unwrap_or_default();
+            let mut first_known: Option<String> = None;
+            let mut first_online: Option<String> = None;
+            for d in &devices {
+                let id = d["stable_id"].as_str().unwrap_or_default().to_string();
+                if id.is_empty() {
+                    continue;
+                }
+                if first_known.is_none() {
+                    first_known = Some(id.clone());
+                }
+                if d["online"].as_bool().unwrap_or(false) {
+                    first_online = Some(id);
+                    break;
+                }
+            }
+            first_online
+                .or(first_known)
+                .ok_or_else(|| ReminderDeviceError::Unavailable(REMINDER_UNAVAILABLE.to_string()))?
+        };
+        if ctx.is_lan_exempt() && !self.hub.device_is_known_lan_device(&resolved) {
+            return Err(ReminderDeviceError::Unauthorized(format!(
+                "未认证的局域网访问不允许操作本机音箱「{resolved}」的提醒，请使用配对令牌认证"
+            )));
         }
-        let snap = self.hub.snapshot();
-        let devices = snap["devices"].as_array().cloned().unwrap_or_default();
-        let mut first_known: Option<String> = None;
-        for d in &devices {
-            let id = d["stable_id"].as_str().unwrap_or_default().to_string();
-            if id.is_empty() {
-                continue;
-            }
-            if first_known.is_none() {
-                first_known = Some(id.clone());
-            }
-            if d["online"].as_bool().unwrap_or(false) {
-                return Ok(id);
-            }
-        }
-        first_known.ok_or_else(|| REMINDER_UNAVAILABLE.to_string())
+        Ok(resolved)
     }
 }
 
@@ -99,10 +141,8 @@ fn when_of(args: &Value) -> Result<When, ReminderError> {
     if let Some(m) = args.get("delay_minutes").and_then(Value::as_u64) {
         return Ok(When::DelayMinutes(m));
     }
-    if let (Some(h), Some(mi)) = (
-        args.get("hour").and_then(Value::as_u64),
-        args.get("minute").and_then(Value::as_u64),
-    ) {
+    if let Some(h) = args.get("hour").and_then(Value::as_u64) {
+        let mi = args.get("minute").and_then(Value::as_u64).unwrap_or(0);
         let day = match args.get("day_offset") {
             Some(v) if v.is_u64() => Some(v.as_u64().unwrap()),
             _ => None,
@@ -114,7 +154,7 @@ fn when_of(args: &Value) -> Result<When, ReminderError> {
         });
     }
     Err(ReminderError::BadArgs(
-        "要给出时间：delay_minutes（几分钟后），或 hour+minute（可选 day_offset）".into(),
+        "要给出时间：delay_minutes（几分钟后），或 hour（可选 minute、day_offset）".into(),
     ))
 }
 
@@ -177,7 +217,7 @@ impl Tool for ReminderSetTool {
         Availability::Ready
     }
 
-    async fn execute(&self, args: Value, _ctx: &ToolCtx) -> ToolResult {
+    async fn execute(&self, args: Value, ctx: &ToolCtx) -> ToolResult {
         let note = match note_of(&args) {
             Ok(n) => n,
             Err(e) => return err_result(e),
@@ -194,9 +234,9 @@ impl Tool for ReminderSetTool {
             Ok(d) => d,
             Err(e) => return err_result(e),
         };
-        let device = match self.rt.device() {
+        let device = match self.rt.device_for(ctx) {
             Ok(d) => d,
-            Err(e) => return ToolResult::failed(REMINDER_UNAVAILABLE, e, true),
+            Err(e) => return e.into_tool_result(),
         };
         match self
             .rt
@@ -251,10 +291,10 @@ impl Tool for ReminderListTool {
         Availability::Ready
     }
 
-    async fn execute(&self, _args: Value, _ctx: &ToolCtx) -> ToolResult {
-        let device = match self.rt.device() {
+    async fn execute(&self, _args: Value, ctx: &ToolCtx) -> ToolResult {
+        let device = match self.rt.device_for(ctx) {
             Ok(d) => d,
-            Err(e) => return ToolResult::failed(REMINDER_UNAVAILABLE, e, true),
+            Err(e) => return e.into_tool_result(),
         };
         match self.rt.svc().pending(Some(&device)) {
             Ok(items) => {
@@ -317,10 +357,10 @@ impl Tool for ReminderCancelTool {
         Availability::Ready
     }
 
-    async fn execute(&self, args: Value, _ctx: &ToolCtx) -> ToolResult {
-        let device = match self.rt.device() {
+    async fn execute(&self, args: Value, ctx: &ToolCtx) -> ToolResult {
+        let device = match self.rt.device_for(ctx) {
             Ok(d) => d,
-            Err(e) => return ToolResult::failed(REMINDER_UNAVAILABLE, e, true),
+            Err(e) => return e.into_tool_result(),
         };
         let now_ms = now_secs() as u64 * 1000;
         let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
@@ -332,7 +372,13 @@ impl Tool for ReminderCancelTool {
                     .collect()
             })
         } else if let Some(id) = args.get("id").and_then(Value::as_i64) {
-            self.rt.svc().cancel(id, now_ms).map(|c| vec![c.note])
+            match self.rt.svc().pending(Some(&device)) {
+                Ok(items) if items.iter().any(|r| r.id == id) => {
+                    self.rt.svc().cancel(id, now_ms).map(|c| vec![c.note])
+                }
+                Ok(_) => Err(ReminderError::NotFound(id.to_string())),
+                Err(e) => Err(e),
+            }
         } else {
             return err_result(ReminderError::BadArgs("要给 id，或 all=true".into()));
         };

@@ -5,7 +5,7 @@
  * backend's; the page never derives a state from a guess.
  */
 import { computed } from 'vue'
-import type { GatewayDevice, GatewaySnapshot, ModeDevice } from '../../api'
+import { isDeviceIdleGated, type GatewayDevice, type GatewaySnapshot, type ModeDevice } from '../../api'
 import { t } from '../../i18n'
 import { formatTime } from '../../format'
 import Panel from '../Panel.vue'
@@ -52,13 +52,26 @@ const sessionTone = computed(() => {
   }
 })
 
+const matchedGatewayDevice = computed<GatewayDevice | null>(() => {
+  if (props.gatewayDevice && (!props.device || props.gatewayDevice.stable_id === props.device.device)) {
+    return props.gatewayDevice
+  }
+  const id = props.device?.device
+  if (!id || !props.gateway?.devices?.length) return null
+  return props.gateway.devices.find((d) => d.stable_id === id) ?? null
+})
+
+const idleGated = computed(() => isDeviceIdleGated(props.device, matchedGatewayDevice.value))
+
 const muteLabel = computed(() => {
   if (props.device?.muted === true) return t('mutedOn')
+  if (idleGated.value) return t('micIdleGated')
   if (props.device?.muted === false) return t('mutedOff')
   return t('mutedUnknown')
 })
 
 const muteSourceNote = computed(() => {
+  if (props.device?.muted !== true && idleGated.value) return t('micIdleGatedNote')
   const src = props.device?.mute_source
   if (src === 'core_set') return t('muteSourceCore')
   if (src === 'button' || src === 'hardware') return t('muteSourceKey')
@@ -66,22 +79,85 @@ const muteSourceNote = computed(() => {
   return t('deviceSovereign')
 })
 
+const deviceConnection = computed(() => {
+  const id = props.device?.device
+  if (!id || !props.gateway?.connections?.length) return null
+  return props.gateway.connections.find((c) => c.devices.includes(id)) ?? null
+})
+
+const isLegacySingleGateway = computed(() => {
+  if (!props.gateway) return false
+  if (props.gateway.connections && props.gateway.connections.length > 0) return false
+  return props.gateway.devices.length <= 1
+})
+
+const deviceGatewayConnected = computed(() => {
+  if (!props.device) return false
+  if (deviceConnection.value) {
+    return matchedGatewayDevice.value ? matchedGatewayDevice.value.online : true
+  }
+  if (props.gateway?.connections?.length) {
+    return false
+  }
+  if (matchedGatewayDevice.value) return matchedGatewayDevice.value.online
+  return isLegacySingleGateway.value && Boolean(props.gateway?.connected)
+})
+
 const gatewayNote = computed(() => {
   if (!props.gateway) return ''
-  const gen = `${t('generationLabel')} ${props.gateway.generation} · ${props.gateway.bind_addr}`
-  const version = props.gateway.gateway_version
-    ? ` · ${t('gatewayVersionLabel')} ${props.gateway.gateway_version}`
-    : ''
-  const proto =
-    props.gateway.protocol_operating != null
-      ? ` · ${t('protocolLabel')} v${props.gateway.protocol_operating}`
-      : ''
-  return `${gen}${version}${proto}`
+  const conn = deviceConnection.value
+  if (conn) {
+    const gen = `${t('generationLabel')} ${conn.generation} · ${conn.peer_addr || props.gateway.bind_addr}`
+    const version = conn.gateway_version ? ` · ${t('gatewayVersionLabel')} ${conn.gateway_version}` : ''
+    const proto = conn.protocol_operating != null ? ` · ${t('protocolLabel')} v${conn.protocol_operating}` : ''
+    return `${gen}${version}${proto}`
+  }
+  if (isLegacySingleGateway.value) {
+    const gen = `${t('generationLabel')} ${props.gateway.generation} · ${props.gateway.bind_addr}`
+    const ver = props.gateway.gateway_version
+    const version = ver ? ` · ${t('gatewayVersionLabel')} ${ver}` : ''
+    const op = props.gateway.protocol_operating
+    const proto = op != null ? ` · ${t('protocolLabel')} v${op}` : ''
+    return `${gen}${version}${proto}`
+  }
+  if (matchedGatewayDevice.value) {
+    return `${t('generationLabel')} ${matchedGatewayDevice.value.generation}`
+  }
+  return ''
+})
+
+const showLinkError = computed(() =>
+  Boolean(props.gateway?.last_link_error) && !deviceGatewayConnected.value && isLegacySingleGateway.value,
+)
+
+const deviceOutputsCount = computed(() => props.device?.outputs?.length ?? 0)
+
+const kwsStateLabel = computed(() => {
+  if (idleGated.value) return t('micIdleGated')
+  switch (props.device?.kws?.state) {
+    case 'running':
+      return t('kwsRunning')
+    case 'starting':
+      return t('kwsStarting')
+    case 'off':
+      return t('kwsOff')
+    case 'down':
+      return t('kwsDown')
+    default:
+      return t('kwsUnknown')
+  }
+})
+
+const kwsStateTone = computed<'ok' | 'warn' | 'danger' | 'muted'>(() => {
+  if (idleGated.value || props.device?.kws?.state === 'running') return 'ok'
+  if (props.device?.kws?.state === 'starting') return 'warn'
+  if (props.device?.kws?.state === 'down') return 'danger'
+  return 'muted'
 })
 
 const muteTone = computed(() => {
   if (props.device?.muted === true) return 'danger' as const
-  if (props.device?.muted === false) return 'ok' as const
+  if (idleGated.value || props.device?.muted === false) return 'ok' as const
   return 'muted' as const
 })
 
@@ -108,13 +184,16 @@ const duplexLabel = computed(() => {
         <div class="board__name">
           <p class="board__device mono">{{ device.device }}</p>
           <p class="board__meta">
-            {{ gatewayDevice?.model || t('unknown') }}
-            <template v-if="gatewayDevice?.firmware"> · {{ t('firmware') }}: {{ gatewayDevice.firmware }}</template>
-            <template v-if="gatewayDevice"> · {{ gatewayDevice.online ? t('online') : t('offline') }}</template>
+            {{ matchedGatewayDevice?.model || t('unknown') }}
+            <template v-if="matchedGatewayDevice?.firmware"> · {{ t('firmware') }}: {{ matchedGatewayDevice.firmware }}</template>
+            <template v-if="matchedGatewayDevice"> · {{ matchedGatewayDevice.online ? t('online') : t('offline') }}</template>
           </p>
         </div>
-        <Pill :tone="gatewayDevice?.online ? 'ok' : 'warn'" size="sm">
-          {{ gatewayDevice?.online ? t('online') : t('offline') }}
+        <Pill :tone="matchedGatewayDevice?.online ? 'ok' : 'warn'" size="sm">
+          {{ matchedGatewayDevice?.online ? t('online') : t('offline') }}
+        </Pill>
+        <Pill v-if="idleGated" tone="ok" size="sm">
+          {{ t('micIdleGated') }}
         </Pill>
         <Pill :tone="device.assistant_state ? 'accent' : 'neutral'" size="sm" mono>
           {{ t('assistantState') }}: {{ device.assistant_state || 'idle' }}
@@ -140,35 +219,40 @@ const duplexLabel = computed(() => {
           :tone="muteTone"
           :note="muteSourceNote"
         />
+        <StatTile
+          :label="t('deviceKwsState')"
+          :value="kwsStateLabel"
+          :tone="kwsStateTone"
+          :note="device.kws?.detail || ''"
+        />
         <StatTile :label="t('duplexEffective')" :value="duplexLabel" tone="accent" :note="device.duplex.negotiated" />
         <!-- '参与' duplicated the conversation-state tile in different words;
              one tile (with the raw session state) is enough (audit 2026-11-14). -->
         <StatTile
           :label="t('gatewayLabel')"
-          :value="gateway?.connected ? t('connected') : t('disconnected')"
-          :tone="gateway?.connected ? 'ok' : 'danger'"
+          :value="deviceGatewayConnected ? t('connected') : t('disconnected')"
+          :tone="deviceGatewayConnected ? 'ok' : 'danger'"
           :note="gatewayNote"
         />
-        <!-- protocol v1 (#8/#11/#12): the last link-level error the gateway
-             REPORTED. Null = healthy; the tile disappears entirely instead of
-             showing a fake 'ok'. -->
+        <!-- protocol v1 (#8/#11/#12): shown only when scoped to this single
+             unconnected gateway; multi-gateway panels never mix sibling link errors. -->
         <StatTile
-          v-if="gateway?.last_link_error"
+          v-if="showLinkError && gateway?.last_link_error"
           :label="t('linkErrorLabel')"
           :value="String(gateway.last_link_error.reason || gateway.last_link_error.kind)"
           tone="danger"
           :note="t('linkErrorNote')"
         />
         <StatTile
-          :label="t('pendingPlays')"
-          :value="gateway?.pending_plays ?? 0"
-          :tone="(gateway?.pending_plays ?? 0) > 0 ? 'warn' : 'muted'"
+          :label="t('deviceOutputsCount')"
+          :value="deviceOutputsCount"
+          :tone="deviceOutputsCount > 0 ? 'warn' : 'muted'"
         />
         <StatTile
           :label="t('lastSeq')"
-          :value="gatewayDevice?.last_seq ?? '—'"
+          :value="matchedGatewayDevice?.last_seq ?? '—'"
           tone="muted"
-          :note="gatewayDevice?.audio_profile || ''"
+          :note="matchedGatewayDevice?.audio_profile || ''"
         />
       </div>
     </template>

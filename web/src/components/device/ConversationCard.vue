@@ -30,17 +30,27 @@ const messages = useResource(
 usePoll(() => messages.load(), 15000)
 
 const count = computed(() => messages.data.value?.messages?.length ?? 0)
+const archivedCount = computed(() => messages.data.value?.archived_contexts?.length ?? 0)
+const hasArchived = computed(() => archivedCount.value > 0)
+const canClear = computed(() => count.value > 0 || archivedCount.value > 0)
+const countLabel = computed(() =>
+  archivedCount.value > 0
+    ? t('conversationCountWithArchives', { n: count.value, archives: archivedCount.value })
+    : t('conversationCount', { n: count.value }),
+)
 const last = computed(() => {
   const rows = messages.data.value?.messages ?? []
   return rows.length ? rows[rows.length - 1] : null
 })
 const confirming = ref(false)
 const confirmedSession = ref<string | null>(null)
+const confirmedIncludeArchived = ref(false)
 const { busy, message, tone, run } = useSave()
-watch(() => props.device.device, () => { selectedContext.value = ''; archiveBefore.value = undefined; messageBefore.value = undefined; confirming.value = false; confirmedSession.value = null; messages.reset(); void messages.load() })
+watch(() => props.device.device, () => { selectedContext.value = ''; archiveBefore.value = undefined; messageBefore.value = undefined; confirming.value = false; confirmedSession.value = null; confirmedIncludeArchived.value = false; messages.reset(); void messages.load() })
 
 function confirmClear(): void {
   confirmedSession.value = messages.data.value?.session_id ?? null
+  confirmedIncludeArchived.value = archivedCount.value > 0
   confirming.value = confirmedSession.value !== null
 }
 
@@ -49,6 +59,7 @@ async function changeContext(event: Event): Promise<void> {
   messageBefore.value = undefined
   confirming.value = false
   confirmedSession.value = null
+  confirmedIncludeArchived.value = false
   await messages.load()
 }
 
@@ -64,12 +75,17 @@ async function messagePage(earlier: boolean): Promise<void> {
 async function clearConversation(): Promise<void> {
   confirming.value = false
   const id = confirmedSession.value
+  const includeArchived = confirmedIncludeArchived.value
   if (!id) return
   await run(async () => {
-    const r = await clearDeviceConversation(props.device.device, id).catch((err) => {
+    const r = await clearDeviceConversation(props.device.device, id, includeArchived).catch((err) => {
       if (err instanceof ApiError && err.status === 409) throw new Error(t('conversationChanged'))
       throw err
     })
+    if (includeArchived) {
+      archiveBefore.value = undefined
+      messageBefore.value = undefined
+    }
     await messages.load()
     return t('conversationCleared', { n: r.cleared })
   })
@@ -79,7 +95,7 @@ async function clearConversation(): Promise<void> {
 <template>
   <Panel icon="history" apply="immediate" :title="t('conversationTitle')" :hint="t('conversationHint')">
     <template #actions>
-      <span class="mono conv__count">{{ t('conversationCount', { n: count }) }}</span>
+      <span class="mono conv__count">{{ countLabel }}</span>
     </template>
 
     <ErrorNotice v-if="messages.error.value" :error="messages.error.value" @retry="messages.load" />
@@ -120,7 +136,7 @@ async function clearConversation(): Promise<void> {
         <button
           type="button"
           class="btn btn--danger"
-          :disabled="Boolean(selectedContext) || busy || messages.loading.value || Boolean(messages.error.value) || !messages.data.value?.session_id || count === 0"
+          :disabled="Boolean(selectedContext) || busy || messages.loading.value || Boolean(messages.error.value) || !messages.data.value?.session_id || !canClear"
           @click="confirmClear"
         >
           {{ t('conversationClear') }}
@@ -132,7 +148,7 @@ async function clearConversation(): Promise<void> {
     <ConfirmDialog
       v-if="confirming"
       :title="t('conversationClear')"
-      :message="t('conversationClearConfirm')"
+      :message="hasArchived ? t('conversationClearAllConfirm', { archives: archivedCount }) : t('conversationClearConfirm')"
       :confirm-label="t('conversationClear')"
       :cancel-label="t('cancel')"
       tone="danger"

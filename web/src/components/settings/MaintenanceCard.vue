@@ -6,9 +6,15 @@
  * this exists for a stuck config, a post-upgrade restart, or an explicit
  * request. The page reconnects through the normal status poll.
  */
-import { onBeforeUnmount, ref } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { factoryReset, getMode, getStatus, restartCore } from '../../api'
-import { refresh as refreshDevices } from '../../stores/devices'
+import { clearAuthToken, markUnauthorized } from '../../auth'
+import {
+  deviceName,
+  devices,
+  selected,
+  selectedId,
+} from '../../stores/devices'
 import { t } from '../../i18n'
 import { useSave } from '../../hooks/useSave'
 import { advancedMode } from '../../stores/advanced'
@@ -16,6 +22,7 @@ import Panel from '../Panel.vue'
 import AppIcon from '../AppIcon.vue'
 import ConfirmDialog from '../ConfirmDialog.vue'
 
+const props = defineProps<{ deviceId?: string | null }>()
 const emit = defineEmits<{ reset: [] }>()
 const confirming = ref(false)
 const confirmingReset = ref(false)
@@ -23,6 +30,32 @@ const requested = ref(false)
 const { busy, message, tone, run } = useSave()
 let timer: number | null = null
 let epochBefore: number | null = null
+
+const targetDeviceId = ref('')
+const preferredDeviceId = computed(() => {
+  const fromProp = props.deviceId?.trim()
+  if (fromProp) return fromProp
+  return selected.value?.device ?? selectedId.value ?? ''
+})
+
+watch(
+  [devices, preferredDeviceId],
+  ([list, pref], [, prevPref]) => {
+    const prefChanged = prevPref !== undefined && pref !== prevPref
+    const currentValid =
+      Boolean(targetDeviceId.value) &&
+      (!list.length || list.some((d) => d.device === targetDeviceId.value))
+    if (pref && (!list.length || list.some((d) => d.device === pref)) && (prefChanged || !currentValid)) {
+      targetDeviceId.value = pref
+      return
+    }
+    if (currentValid) {
+      return
+    }
+    targetDeviceId.value = list.length > 0 ? list[0].device : ''
+  },
+  { immediate: true },
+)
 
 function clearTimer(): void {
   if (timer !== null) {
@@ -38,8 +71,12 @@ function clearTimer(): void {
  */
 async function currentEpoch(): Promise<number | null> {
   try {
-    const mode = await getMode({ timeoutMs: 2000 })
-    return mode.devices[0]?.kws?.core_epoch ?? null
+    const dev = targetDeviceId.value.trim() || undefined
+    const mode = await getMode(dev ? { device: dev, timeoutMs: 2000 } : { timeoutMs: 2000 })
+    const matched = dev
+      ? mode.devices.find((d) => d.device === dev)
+      : mode.devices.find((d) => typeof d.kws?.core_epoch === 'number')
+    return matched?.kws?.core_epoch ?? null
   } catch {
     return null
   }
@@ -94,24 +131,31 @@ function pollRecovery(attempt = 0): void {
 }
 
 async function restart(): Promise<void> {
-  await run(async () => {
-    epochBefore = await currentEpoch()
-    await restartCore()
-    requested.value = true
+  try {
+    await run(async () => {
+      epochBefore = await currentEpoch()
+      await restartCore()
+      requested.value = true
+      pollRecovery()
+      return t('restarting')
+    })
+  } finally {
     confirming.value = false
-    pollRecovery()
-    return t('restarting')
-  })
+  }
 }
 
 async function runFactoryReset(): Promise<void> {
-  await run(async () => {
-    await factoryReset('FACTORY_RESET')
-    await refreshDevices()
-    emit('reset')
+  try {
+    await run(async () => {
+      await factoryReset('FACTORY_RESET')
+      clearAuthToken()
+      markUnauthorized()
+      emit('reset')
+      return t('factoryResetDone')
+    })
+  } finally {
     confirmingReset.value = false
-    return t('factoryResetDone')
-  })
+  }
 }
 
 onBeforeUnmount(clearTimer)
@@ -119,6 +163,16 @@ onBeforeUnmount(clearTimer)
 
 <template>
   <Panel icon="power" :title="t('maintenanceTitle')" :hint="t('maintenanceHint')">
+    <template v-if="devices.length > 1" #actions>
+      <label class="maint__device-pick">
+        <span>{{ t('maintenanceEpochDevice') }}</span>
+        <select v-model="targetDeviceId" class="maint__select mono" :aria-label="t('maintenanceEpochDevice')">
+          <option v-for="d in devices" :key="d.device" :value="d.device">
+            {{ deviceName(d.device) }} ({{ d.device }})
+          </option>
+        </select>
+      </label>
+    </template>
     <div class="maint">
       <button type="button" class="btn btn--danger" :disabled="busy || requested" @click="confirming = true">
         <AppIcon name="power" :size="13" /> {{ busy ? t('restarting') : t('restartCore') }}
@@ -207,6 +261,23 @@ onBeforeUnmount(clearTimer)
 
 .maint__reset-hint {
   color: var(--muted);
+  font-size: var(--fs-xs);
+}
+
+.maint__device-pick {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-xs);
+  color: var(--muted);
+}
+
+.maint__select {
+  border: 1px solid var(--line-strong);
+  background: var(--surface-2);
+  color: var(--ink);
+  border-radius: var(--r-sm);
+  padding: 0.16rem var(--sp-2);
   font-size: var(--fs-xs);
 }
 </style>

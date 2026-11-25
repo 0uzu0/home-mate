@@ -9,7 +9,7 @@
  */
 import { computed, ref } from 'vue'
 import { getAuthStatus, provisionAuth, rotateAuth, setLanGatewayExempt } from '../../api'
-import { authToken, clearAuthToken, setAuthToken } from '../../auth'
+import { authToken, clearAuthToken, markUnauthorized, setAuthToken } from '../../auth'
 import { formatDateTime, formatRelative } from '../../format'
 import { t } from '../../i18n'
 import { usePoll } from '../../hooks/usePoll'
@@ -84,8 +84,7 @@ async function rotate(): Promise<void> {
 async function forget(): Promise<void> {
   await run(async () => {
     clearAuthToken()
-    // The next request 401s and the shell hands over to the pairing card.
-    await auth.load().catch(() => undefined)
+    markUnauthorized()
     return t('authClearDone')
   })
 }

@@ -63,6 +63,23 @@ pub struct SecretVault {
     undecryptable: AtomicU64,
 }
 
+/// Overwrite sensitive key bytes with volatile zero writes followed by a
+/// sequentially consistent compiler fence so dead-store elimination cannot
+/// remove the wipe.
+fn zeroize_bytes(buf: &mut [u8]) {
+    for byte in buf.iter_mut() {
+        // Safety: `byte` is a valid, aligned, exclusively borrowed `&mut u8`.
+        unsafe { std::ptr::write_volatile(byte, 0) };
+    }
+    std::sync::atomic::compiler_fence(Ordering::SeqCst);
+}
+
+impl Drop for SecretVault {
+    fn drop(&mut self) {
+        zeroize_bytes(&mut self.key);
+    }
+}
+
 impl SecretVault {
     /// Load `data/secret.key`, creating it (0600, exclusive) when absent.
     pub fn load_or_create(data_dir: &Path) -> Result<Self, VaultError> {
@@ -70,16 +87,19 @@ impl SecretVault {
         // A key file that exists but has the wrong size is a hard error: the
         // alternative — overwriting it — would silently destroy every stored
         // secret the device still needs.
-        if let Ok(bytes) = std::fs::read(&path) {
+        if let Ok(mut bytes) = std::fs::read(&path) {
             if bytes.len() != KEY_LEN {
+                let len = bytes.len();
+                zeroize_bytes(&mut bytes);
                 return Err(VaultError::BadKeyFile(format!(
                     "{} has {} bytes, expected {KEY_LEN}",
                     path.display(),
-                    bytes.len()
+                    len
                 )));
             }
             let mut key = [0u8; KEY_LEN];
             key.copy_from_slice(&bytes);
+            zeroize_bytes(&mut bytes);
             tighten(&path);
             return Ok(Self {
                 key,
@@ -90,7 +110,7 @@ impl SecretVault {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| VaultError::Io(e.to_string()))?;
         }
-        let key = random_key()?;
+        let mut key = random_key()?;
         // `create_new` is the race guard: two cores starting together must end
         // up with ONE key, so the loser re-reads the winner's file.
         let written = {
@@ -104,13 +124,17 @@ impl SecretVault {
             }
             match opts.open(&path) {
                 Ok(mut f) => {
-                    f.write_all(&key)
-                        .and_then(|_| f.sync_all())
-                        .map_err(|e| VaultError::Io(e.to_string()))?;
+                    if let Err(e) = f.write_all(&key).and_then(|_| f.sync_all()) {
+                        zeroize_bytes(&mut key);
+                        return Err(VaultError::Io(e.to_string()));
+                    }
                     true
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
-                Err(e) => return Err(VaultError::Io(e.to_string())),
+                Err(e) => {
+                    zeroize_bytes(&mut key);
+                    return Err(VaultError::Io(e.to_string()));
+                }
             }
         };
         if written {
@@ -121,6 +145,7 @@ impl SecretVault {
                 undecryptable: AtomicU64::new(0),
             });
         }
+        zeroize_bytes(&mut key);
         Self::load_or_create(data_dir)
     }
 
@@ -318,5 +343,27 @@ mod tests {
             "the file must be left exactly as found"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn secret_vault_drop_zeroizes_key_material() {
+        let mut buf = [0xA5u8; KEY_LEN];
+        zeroize_bytes(&mut buf);
+        assert_eq!(buf, [0u8; KEY_LEN]);
+
+        let mut vault = std::mem::ManuallyDrop::new(SecretVault {
+            key: [0x5Au8; KEY_LEN],
+            path: None,
+            undecryptable: AtomicU64::new(0),
+        });
+        // Safety: we drop the ManuallyDrop contents in place exactly once and
+        // inspect the still-allocated backing key bytes before leaving scope.
+        unsafe {
+            std::ptr::drop_in_place(&mut *vault);
+        }
+        assert_eq!(
+            vault.key, [0u8; KEY_LEN],
+            "SecretVault::drop must wipe key bytes to zero"
+        );
     }
 }

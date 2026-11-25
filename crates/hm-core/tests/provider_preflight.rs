@@ -66,7 +66,7 @@ impl App {
         let app = router(state.clone()).layer(axum::middleware::from_fn(
             |mut req: axum::extract::Request, next: axum::middleware::Next| async move {
                 req.extensions_mut().insert(axum::extract::ConnectInfo(
-                    "192.0.2.10:5000".parse::<SocketAddr>().unwrap(),
+                    "192.168.1.10:5000".parse::<SocketAddr>().unwrap(),
                 ));
                 next.run(req).await
             },

@@ -53,6 +53,7 @@ export default {
   setupVerifySend: 'Send test sentence',
   setupVerifySending: 'Waiting for reply…',
   setupVerifyReplyLabel: 'Assistant reply:',
+  setupVerifyFailed: 'Model verification failed without a valid reply.',
   wifiProvisioningBannerTitle: 'Wi-Fi setup requested (Mute hold)',
   wifiProvisioningBannerHint: 'Device {device} requested Wi-Fi setup via mute-hold (configuration was not reset). Complete Wi-Fi setup below.',
   wifiProvisioningGoSetup: 'Open Wi-Fi setup',

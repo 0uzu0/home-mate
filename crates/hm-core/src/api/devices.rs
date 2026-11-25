@@ -23,8 +23,10 @@ pub(super) struct DeviceConversationQuery {
 pub(super) async fn device_conversation(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    lan_exempt: Option<axum::Extension<super::LanExemptUnauthenticated>>,
     Query(query): Query<DeviceConversationQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    super::reject_lan_exempt_loopback_device(&state, lan_exempt.as_ref(), &id)?;
     if !state.hub.device_exists(&id) {
         return Err((
             StatusCode::NOT_FOUND,
@@ -86,12 +88,16 @@ pub(super) async fn device_conversation(
 #[serde(deny_unknown_fields)]
 pub(super) struct ClearDeviceConversation {
     expected_session_id: String,
+    #[serde(default)]
+    include_archived: bool,
 }
 pub(super) async fn device_conversation_clear(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    lan_exempt: Option<axum::Extension<super::LanExemptUnauthenticated>>,
     Json(body): Json<ClearDeviceConversation>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    super::reject_lan_exempt_loopback_device(&state, lan_exempt.as_ref(), &id)?;
     if !state.hub.device_exists(&id) {
         return Err((
             StatusCode::NOT_FOUND,
@@ -100,7 +106,11 @@ pub(super) async fn device_conversation_clear(
     }
     let cleared = state
         .sessions
-        .clear_device_conversation(&id, &body.expected_session_id)
+        .clear_device_conversation_with_archives(
+            &id,
+            &body.expected_session_id,
+            body.include_archived,
+        )
         .map_err(|e| {
             (
                 StatusCode::CONFLICT,
@@ -110,14 +120,16 @@ pub(super) async fn device_conversation_clear(
             )
         })?;
     Ok(Json(
-        json!({"session_id":body.expected_session_id,"cleared":cleared}),
+        json!({"session_id":body.expected_session_id,"cleared":cleared,"include_archived":body.include_archived}),
     ))
 }
 
 pub(super) async fn device_stop(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    lan_exempt: Option<axum::Extension<super::LanExemptUnauthenticated>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    super::reject_lan_exempt_loopback_device(&state, lan_exempt.as_ref(), &id)?;
     if !state.hub.device_exists(&id) {
         return Err((
             StatusCode::NOT_FOUND,
@@ -187,33 +199,141 @@ pub(super) async fn device_mic_capture_wav(
 pub(super) async fn device_program_pause(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    lan_exempt: Option<axum::Extension<super::LanExemptUnauthenticated>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    super::reject_lan_exempt_loopback_device(&state, lan_exempt.as_ref(), &id)?;
     if !state.hub.device_exists(&id) {
         return Err((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": format!("unknown device '{id}'") })),
         ));
     }
-    let paused = state.voice.pause_program(&id, "console");
+    if state.voice.pause_program(&id, "console") {
+        return Ok(Json(json!({
+            "paused": true,
+            "target": "program",
+            "bookmark": state.voice.paused_bookmark(&id),
+        })));
+    }
+    if state.music.media_present(&id) {
+        if let Ok(outcome) = state.music.control(&id, "pause", Some("media")).await {
+            return Ok(Json(json!({
+                "paused": outcome.confirmed && !outcome.no_op,
+                "target": outcome.target,
+                "title": outcome.subject,
+                "detail": outcome.detail,
+                "confirmed": outcome.confirmed,
+                "no_op": outcome.no_op,
+                "bookmark": state.voice.paused_bookmark(&id),
+            })));
+        }
+    }
     Ok(Json(
-        json!({ "paused": paused, "bookmark": state.voice.paused_bookmark(&id) }),
+        json!({ "paused": false, "bookmark": state.voice.paused_bookmark(&id) }),
     ))
 }
 
 pub(super) async fn device_program_resume(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    lan_exempt: Option<axum::Extension<super::LanExemptUnauthenticated>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    super::reject_lan_exempt_loopback_device(&state, lan_exempt.as_ref(), &id)?;
     if !state.hub.device_exists(&id) {
         return Err((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": format!("unknown device '{id}'") })),
         ));
     }
-    let resumed = state.voice.resume_program(&id);
+    if state.voice.resume_program(&id) {
+        return Ok(Json(json!({
+            "resumed": true,
+            "target": "program",
+            "bookmark": state.voice.paused_bookmark(&id),
+        })));
+    }
+    if state.music.media_present(&id) {
+        if let Ok(outcome) = state.music.control(&id, "resume", Some("media")).await {
+            return Ok(Json(json!({
+                "resumed": outcome.confirmed && !outcome.no_op,
+                "target": outcome.target,
+                "title": outcome.subject,
+                "detail": outcome.detail,
+                "confirmed": outcome.confirmed,
+                "no_op": outcome.no_op,
+                "bookmark": state.voice.paused_bookmark(&id),
+            })));
+        }
+    }
     Ok(Json(
-        json!({ "resumed": resumed, "bookmark": state.voice.paused_bookmark(&id) }),
+        json!({ "resumed": false, "bookmark": state.voice.paused_bookmark(&id) }),
     ))
+}
+
+#[derive(Deserialize)]
+pub(super) struct MediaControlBody {
+    action: String,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+/// Direct playback control (`pause` | `resume` | `next` | `previous` | `stop` | `repeat`)
+/// for a specific device without invoking an LLM turn.
+pub(super) async fn device_media_control(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    lan_exempt: Option<axum::Extension<super::LanExemptUnauthenticated>>,
+    Json(body): Json<MediaControlBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    super::reject_lan_exempt_loopback_device(&state, lan_exempt.as_ref(), &id)?;
+    if !state.hub.device_exists(&id) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("unknown device '{id}'") })),
+        ));
+    }
+    let action = body.action.trim().to_ascii_lowercase();
+    if !matches!(
+        action.as_str(),
+        "pause" | "resume" | "next" | "previous" | "stop" | "repeat"
+    ) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("unsupported media action '{}'", body.action) })),
+        ));
+    }
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    match state
+        .music
+        .control_with_mode(
+            &id,
+            &action,
+            body.target.as_deref(),
+            body.mode.as_deref(),
+            cancel,
+            None,
+        )
+        .await
+    {
+        Ok(outcome) => Ok(Json(json!({
+            "ok": outcome.confirmed || outcome.no_op,
+            "action": outcome.action,
+            "target": outcome.target,
+            "title": outcome.subject,
+            "detail": outcome.detail,
+            "confirmed": outcome.confirmed,
+            "no_op": outcome.no_op,
+        }))),
+        Err(e) => {
+            let status = match e {
+                crate::tool::music::MusicError::InvalidRepeatMode => StatusCode::BAD_REQUEST,
+                _ => StatusCode::CONFLICT,
+            };
+            Err((status, Json(json!({ "ok": false, "error": e.to_string() }))))
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -224,8 +344,10 @@ pub(super) struct VolumeBody {
 pub(super) async fn device_volume(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    lan_exempt: Option<axum::Extension<super::LanExemptUnauthenticated>>,
     Json(body): Json<VolumeBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    super::reject_lan_exempt_loopback_device(&state, lan_exempt.as_ref(), &id)?;
     if !state.hub.device_exists(&id) {
         return Err((
             StatusCode::NOT_FOUND,
@@ -322,8 +444,10 @@ pub struct DeviceMuteBody {
 pub(super) async fn device_mute(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    lan_exempt: Option<axum::Extension<super::LanExemptUnauthenticated>>,
     Json(body): Json<DeviceMuteBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    super::reject_lan_exempt_loopback_device(&state, lan_exempt.as_ref(), &id)?;
     if !state.hub.device_exists(&id) {
         return Err((
             StatusCode::NOT_FOUND,
@@ -784,18 +908,30 @@ pub(super) async fn device_profile_put(
     let has_led = has_led_obj || has_flat_led;
     let mut led_pushed = false;
     if has_led {
-        led_pushed = state
+        let has_v2 = state.hub.device_supports(&id, "config_apply_v2");
+        if state
             .hub
-            .send_led_config(
-                &id,
-                led.night_enabled,
-                led.night_start_minute,
-                led.night_end_minute,
-                led.night_brightness_pct,
-                led.orientation_rotation,
-                led.orientation_reverse,
-            )
-            .is_ok();
+            .supports_config_apply_v2(&id, crate::gateway::ConfigBlock::Led)
+            .is_ok()
+        {
+            let outcome =
+                crate::config_delivery::dispatch_led_v2(&state.store, &state.hub, &id, &led).await;
+            led_pushed = outcome.state == "applied";
+        } else if !has_v2 {
+            led_pushed = state
+                .hub
+                .send_led_config(
+                    &id,
+                    led.night_enabled,
+                    led.night_start_minute,
+                    led.night_end_minute,
+                    led.night_brightness_pct,
+                    led.orientation_rotation,
+                    led.orientation_reverse,
+                )
+                .is_ok();
+        }
+        // V2 devices without `config_block_led` (e.g. Android) skip cleanly with `led_pushed: false`.
     }
 
     let overall_state = if has_acoustic && matches!(acoustics_state, "failed" | "superseded") {

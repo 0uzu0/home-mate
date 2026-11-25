@@ -9,6 +9,7 @@ import { putMode, type ModeDevice, type ModeSnapshot } from '../../api'
 import { t } from '../../i18n'
 import { useSave } from '../../hooks/useSave'
 import Panel from '../Panel.vue'
+import Pill from '../Pill.vue'
 import NumberField from '../NumberField.vue'
 import Slider from '../Slider.vue'
 import SectionLabel from '../SectionLabel.vue'
@@ -28,6 +29,9 @@ const { busy, message, tone, run } = useSave()
 
 /** The live detector view for THIS device (absent until it has been fed). */
 const micVad = computed(() => props.device?.mic?.vad ?? null)
+const currentVad = computed(() => micVad.value ?? props.mode?.vad ?? null)
+const currentTailBlind = computed(() => props.device?.tail_blind_ms ?? props.mode?.tail_blind_ms)
+const currentMediaTrim = computed(() => props.device?.media_trim_db ?? props.mode?.media_trim_db)
 const closeCounts = computed(() => {
   const c = props.device?.mic?.counters
   if (!c || (c.close_quiet === undefined && c.close_cap === undefined)) return ''
@@ -41,19 +45,22 @@ function fmtDb(v: number | null | undefined): string {
 }
 
 watch(
-  () => props.mode,
-  (mode) => {
+  [() => props.mode, () => props.device?.device],
+  ([mode], [, prevDevice]) => {
     if (!mode) return
-    const vad = mode.devices?.[0]?.mic?.vad ?? mode.vad
-    if (vad && vadStart.value === null) {
+    const switchedDevice = prevDevice !== undefined && prevDevice !== props.device?.device
+    const vad = props.device?.mic?.vad ?? mode.vad
+    if (vad && (vadStart.value === null || switchedDevice)) {
       vadStart.value = vad.start_db
       vadEnd.value = vad.end_db
     }
-    if (tailBlind.value === null && mode.tail_blind_ms !== undefined) {
-      tailBlind.value = mode.tail_blind_ms
+    const tail = props.device?.tail_blind_ms ?? mode.tail_blind_ms
+    if (tail !== undefined && (tailBlind.value === null || switchedDevice)) {
+      tailBlind.value = tail
     }
-    if (mediaTrim.value === null && mode.media_trim_db !== undefined) {
-      mediaTrim.value = mode.media_trim_db
+    const trim = props.device?.media_trim_db ?? mode.media_trim_db
+    if (trim !== undefined && (mediaTrim.value === null || switchedDevice)) {
+      mediaTrim.value = trim
     }
   },
   { immediate: true },
@@ -89,6 +96,9 @@ async function saveTrim(): Promise<void> {
 <template>
   <Panel
     icon="audioGate" apply="immediate" :title="t('audioGateTitle')" :hint="t('audioGateHint')">
+    <template v-if="device" #actions>
+      <Pill size="sm" tone="accent" mono>{{ t('scopeThisDevice', { device: device.device }) }}</Pill>
+    </template>
     <EmptyState v-if="!device" :title="t('noDevice')" />
 
     <template v-else>
@@ -99,9 +109,14 @@ async function saveTrim(): Promise<void> {
         <div class="gate__row">
           <NumberField v-if="vadStart !== null" v-model="vadStart" :label="t('vadStart')" :min="-80" :max="0" unit="dBFS" />
           <NumberField v-if="vadEnd !== null" v-model="vadEnd" :label="t('vadEnd')" :min="-80" :max="0" unit="dBFS" />
-          <button type="button" class="btn" :disabled="busy" @click="saveVad">{{ t('vadSave') }}</button>
-          <span v-if="mode?.vad" class="gate__current mono">
-            {{ t('current') }}: {{ mode.vad.start_db }} / {{ mode.vad.end_db }}
+          <button
+            type="button"
+            class="btn"
+            :disabled="busy || vadStart === null || vadEnd === null"
+            @click="saveVad"
+          >{{ t('vadSave') }}</button>
+          <span v-if="currentVad" class="gate__current mono">
+            {{ t('current') }}: {{ currentVad.start_db }} / {{ currentVad.end_db }}
           </span>
         </div>
         <!-- R2: what the detector is ACTUALLY using. When the room is louder
@@ -125,9 +140,9 @@ async function saveTrim(): Promise<void> {
         <p class="gate__hint">{{ t('tailBlindHint') }}</p>
         <div class="gate__row">
           <NumberField v-if="tailBlind !== null" v-model="tailBlind" :label="t('tailBlindMs')" :min="0" :max="2000" unit="ms" />
-          <button type="button" class="btn" :disabled="busy" @click="saveTailBlind">{{ t('tailBlindSave') }}</button>
-          <span v-if="mode?.tail_blind_ms !== undefined" class="gate__current mono">
-            {{ t('current') }}: {{ mode.tail_blind_ms }} ms
+          <button type="button" class="btn" :disabled="busy || tailBlind === null" @click="saveTailBlind">{{ t('tailBlindSave') }}</button>
+          <span v-if="currentTailBlind !== undefined" class="gate__current mono">
+            {{ t('current') }}: {{ currentTailBlind }} ms
           </span>
         </div>
       </section>
@@ -145,9 +160,9 @@ async function saveTrim(): Promise<void> {
             :step="1"
             unit="dB"
           />
-          <button type="button" class="btn" :disabled="busy" @click="saveTrim">{{ t('mediaTrimSave') }}</button>
-          <span v-if="mode?.media_trim_db !== undefined" class="gate__current mono">
-            {{ t('current') }}: {{ mode.media_trim_db }} dB
+          <button type="button" class="btn" :disabled="busy || mediaTrim === null" @click="saveTrim">{{ t('mediaTrimSave') }}</button>
+          <span v-if="currentMediaTrim !== undefined" class="gate__current mono">
+            {{ t('current') }}: {{ currentMediaTrim }} dB
           </span>
         </div>
       </section>

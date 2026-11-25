@@ -4,17 +4,21 @@
  * re-sent state), so each action is a separate button with its own honest
  * result — no probe is fired automatically on page load.
  */
-import { ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import {
+  isDeviceRequiredError,
   reapplyModeRepair,
+  runMicArrayTest,
   runPlayAssetTest,
   runPlaybackLoopbackTest,
   runVoicePlayTest,
   type LoopbackResult,
+  type MicArrayResult,
   type ModeDevice,
   type PlayAssetResult,
   type VoicePlayTestResult,
 } from '../../api'
+import { deviceName, selectedId as storeSelectedId } from '../../stores/devices'
 import { t, type Key } from '../../i18n'
 import { errorDetail, formatDuration } from '../../format'
 import Panel from '../Panel.vue'
@@ -22,15 +26,54 @@ import Pill from '../Pill.vue'
 import SectionLabel from '../SectionLabel.vue'
 import EmptyState from '../EmptyState.vue'
 
-defineProps<{ devices: ModeDevice[] }>()
+const props = defineProps<{
+  devices: ModeDevice[]
+  selectedDeviceId?: string | null
+}>()
 
 type ProbeState = { ok: boolean; detail: string }
+
+const preferredDeviceId = computed(() =>
+  props.selectedDeviceId !== undefined ? props.selectedDeviceId ?? '' : storeSelectedId.value ?? '',
+)
+
+const selectedDevice = ref('')
+watch(
+  [() => props.devices, preferredDeviceId],
+  ([list, pref], [, prevPref]) => {
+    if (!list.length) {
+      selectedDevice.value = ''
+      return
+    }
+    const prefChanged = prevPref !== undefined && pref !== prevPref
+    if (pref && list.some((d) => d.device === pref) && (prefChanged || !selectedDevice.value || !list.some((d) => d.device === selectedDevice.value))) {
+      selectedDevice.value = pref
+      return
+    }
+    if (selectedDevice.value && list.some((d) => d.device === selectedDevice.value)) {
+      return
+    }
+    selectedDevice.value = list.length === 1 ? list[0].device : ''
+  },
+  { immediate: true },
+)
 
 const voice = ref<ProbeState | null>(null)
 const asset = ref<ProbeState | null>(null)
 const loopback = ref<ProbeState | null>(null)
+const mics = ref<ProbeState | null>(null)
 const repair = ref<ProbeState | null>(null)
 const busy = ref('')
+
+function probeErrorMessage(err: unknown): string {
+  return isDeviceRequiredError(err) ? t('deviceRequiredError') : errorDetail(err)
+}
+
+function targetOrGuard(): string | null {
+  const target = selectedDevice.value.trim()
+  if (!target && props.devices.length > 1) return null
+  return target
+}
 
 const LOOP_KEYS: Record<string, Key> = {
   loopback_intact: 'lbIntact',
@@ -48,46 +91,79 @@ function loopText(result: LoopbackResult): string {
 }
 
 async function runVoice(): Promise<void> {
+  const target = targetOrGuard()
+  if (target === null) {
+    voice.value = { ok: false, detail: t('deviceRequiredError') }
+    return
+  }
   busy.value = 'voice'
   voice.value = null
   try {
-    const result: VoicePlayTestResult = await runVoicePlayTest()
+    const result: VoicePlayTestResult = await runVoicePlayTest(target || undefined)
     voice.value = result.ok
       ? {
           ok: true,
           detail: `${result.device ?? ''} · ${result.stage ?? ''} · ${formatDuration(result.synth_ms)} / ${formatDuration(result.total_ms)} · ${result.provider ?? ''} ${result.voice ?? ''}`,
         }
-      : { ok: false, detail: result.error || result.stage || 'failed' }
+      : {
+          ok: false,
+          detail: isDeviceRequiredError(result)
+            ? t('deviceRequiredError')
+            : result.error || result.stage || 'failed',
+        }
   } catch (err) {
-    voice.value = { ok: false, detail: errorDetail(err) }
+    voice.value = { ok: false, detail: probeErrorMessage(err) }
   } finally {
     busy.value = ''
   }
 }
 
 async function runAsset(): Promise<void> {
+  const target = targetOrGuard()
+  if (target === null) {
+    asset.value = { ok: false, detail: t('deviceRequiredError') }
+    return
+  }
   busy.value = 'asset'
   asset.value = null
   try {
-    const result: PlayAssetResult = await runPlayAssetTest('erle-stimulus.wav')
+    const result: PlayAssetResult = await runPlayAssetTest(
+      'erle-stimulus.wav',
+      undefined,
+      target || undefined,
+    )
     asset.value = result.ok
       ? {
           ok: true,
           detail: `${result.device ?? ''} · ${result.asset ?? ''} · ${result.stage ?? ''} · ${formatDuration(result.duration_ms)} / ${formatDuration(result.total_ms)}`,
         }
-      : { ok: false, detail: result.error || result.stage || 'failed' }
+      : {
+          ok: false,
+          detail: isDeviceRequiredError(result)
+            ? t('deviceRequiredError')
+            : result.error || result.stage || 'failed',
+        }
   } catch (err) {
-    asset.value = { ok: false, detail: errorDetail(err) }
+    asset.value = { ok: false, detail: probeErrorMessage(err) }
   } finally {
     busy.value = ''
   }
 }
 
 async function runLoopback(): Promise<void> {
+  const target = targetOrGuard()
+  if (target === null) {
+    loopback.value = { ok: false, detail: t('deviceRequiredError') }
+    return
+  }
   busy.value = 'loopback'
   loopback.value = null
   try {
-    const result = await runPlaybackLoopbackTest()
+    const result = await runPlaybackLoopbackTest(undefined, target || undefined)
+    if (!result.ok && (isDeviceRequiredError(result) || isDeviceRequiredError(result.play))) {
+      loopback.value = { ok: false, detail: t('deviceRequiredError') }
+      return
+    }
     const report = result.loopback
     loopback.value = {
       ok: result.ok,
@@ -98,7 +174,34 @@ async function runLoopback(): Promise<void> {
       }`,
     }
   } catch (err) {
-    loopback.value = { ok: false, detail: errorDetail(err) }
+    loopback.value = { ok: false, detail: probeErrorMessage(err) }
+  } finally {
+    busy.value = ''
+  }
+}
+
+async function runMics(): Promise<void> {
+  const target = targetOrGuard()
+  if (target === null) {
+    mics.value = { ok: false, detail: t('deviceRequiredError') }
+    return
+  }
+  busy.value = 'mics'
+  mics.value = null
+  try {
+    const result: MicArrayResult = await runMicArrayTest(undefined, target || undefined)
+    if (!result.ok && (isDeviceRequiredError(result) || isDeviceRequiredError(result.play))) {
+      mics.value = { ok: false, detail: t('deviceRequiredError') }
+      return
+    }
+    mics.value = result.ok
+      ? {
+          ok: true,
+          detail: `${result.play?.device ?? target} · frames ${result.mics?.frames ?? 0} · active ${formatDuration(result.mics?.active_ms)}`,
+        }
+      : { ok: false, detail: result.error || result.play?.error || 'failed' }
+  } catch (err) {
+    mics.value = { ok: false, detail: probeErrorMessage(err) }
   } finally {
     busy.value = ''
   }
@@ -124,6 +227,21 @@ async function reapply(device: string): Promise<void> {
 <template>
   <Panel
     icon="probes" :title="t('probesTitle')" :hint="t('probesHint')">
+    <template v-if="devices.length > 1" #actions>
+      <select
+        v-model="selectedDevice"
+        class="btn mono"
+        :aria-label="t('probeTargetLabel')"
+      >
+        <option value="" disabled>{{ t('selectTargetDevice') }}</option>
+        <option v-for="d in devices" :key="d.device" :value="d.device">
+          {{ deviceName(d.device) === d.device ? d.device : `${deviceName(d.device)} (${d.device})` }}
+        </option>
+      </select>
+    </template>
+    <template v-else-if="selectedDevice" #actions>
+      <Pill size="sm" tone="accent" mono>{{ t('scopeThisDevice', { device: selectedDevice }) }}</Pill>
+    </template>
     <section class="probe">
       <div class="probe__row">
         <button type="button" class="btn" :disabled="busy !== ''" @click="runVoice">
@@ -158,6 +276,18 @@ async function reapply(device: string): Promise<void> {
         </Pill>
       </div>
       <p class="probe__hint">{{ t('loopbackTestHint') }}</p>
+    </section>
+
+    <section class="probe">
+      <div class="probe__row">
+        <button type="button" class="btn" :disabled="busy !== ''" @click="runMics">
+          {{ busy === 'mics' ? t('probeRunning') : t('micArrayTest') }}
+        </button>
+        <Pill v-if="mics" :tone="mics.ok ? 'ok' : 'danger'" size="sm">
+          {{ mics.ok ? '✓' : '✗' }} {{ mics.detail }}
+        </Pill>
+      </div>
+      <p class="probe__hint">{{ t('micArrayTestHint') }}</p>
     </section>
 
     <section class="probe">

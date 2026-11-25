@@ -423,6 +423,62 @@ pub fn fields() -> Vec<FieldDescriptor> {
             false,
         ),
         ("mode", "vad", "object", "unit", false),
+        ("mode", "vad_by_device", "object", "unit", false),
+        ("mode.vad_by_device", "*", "object", "unit", false),
+        (
+            "mode.vad_by_device.*",
+            "start_db end_db",
+            "number",
+            "unit",
+            false,
+        ),
+        ("mode", "media_trim_db_by_device", "object", "unit", false),
+        ("mode.media_trim_db_by_device", "*", "number", "unit", false),
+        ("mode", "device_overrides", "object", "unit", false),
+        ("mode.device_overrides", "*", "object", "unit", false),
+        (
+            "mode.device_overrides.*",
+            "kws_threshold kws_score tail_blind_ms barge_protect_ms follow_window_ms context_window_ms followup_credits",
+            "number",
+            "unit",
+            false,
+        ),
+        (
+            "mode.device_overrides.*",
+            "barge_in keyword_interrupt proactive_speech follow_window_enabled follow_window_tone retreat_intent asr_wake_fallback proactive_asr_wake",
+            "boolean",
+            "unit",
+            false,
+        ),
+        (
+            "mode.device_overrides.*",
+            "wake_words retreat_words",
+            "array",
+            "unit",
+            false,
+        ),
+        ("mode.device_overrides.*", "wake_ack", "object", "unit", false),
+        (
+            "mode.device_overrides.*.wake_ack",
+            "enabled resynth",
+            "boolean",
+            "unit",
+            false,
+        ),
+        (
+            "mode.device_overrides.*.wake_ack",
+            "phrases",
+            "array",
+            "unit",
+            false,
+        ),
+        (
+            "mode.device_overrides.*",
+            "wake_arbitration",
+            "string",
+            "unit",
+            false,
+        ),
         ("mode.duplex_requested", "*", "string", "node", true),
         ("mode.wake_ack", "resynth", "boolean", "runtime", false),
         ("mode.filler", "resynth", "boolean", "runtime", false),
@@ -509,10 +565,12 @@ pub fn fields() -> Vec<FieldDescriptor> {
                 | "mode.followup_credits"
                 | "mode.vad"
                 | "mode.wake_ack.resynth"
+                | "mode.device_overrides.*.wake_ack.resynth"
                 | "mode.filler.resynth"
                 | "openapi.operations[].verification"
                 | "unit_acoustic_profiles.*.onset_threshold_dbfs"
-        );
+        ) || (field.path.starts_with("mode.device_overrides.*.")
+            && !field.path.starts_with("mode.device_overrides.*.wake_ack."));
         if field.path == "openapi.operations[].verification.expected"
             || field.path.ends_with(".parameters")
         {
@@ -528,9 +586,14 @@ pub fn fields() -> Vec<FieldDescriptor> {
                         | "weather.places[].longitude"
                         | "mode.kws_threshold"
                         | "mode.kws_score"
+                        | "mode.device_overrides.*.kws_threshold"
+                        | "mode.device_overrides.*.kws_score"
                         | "mode.media_trim_db"
+                        | "mode.media_trim_db_by_device.*"
                         | "mode.vad.start_db"
                         | "mode.vad.end_db"
+                        | "mode.vad_by_device.*.start_db"
+                        | "mode.vad_by_device.*.end_db"
                 ))
         {
             field.kind = "integer".into();

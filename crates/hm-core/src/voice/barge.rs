@@ -24,6 +24,7 @@ pub enum Barge {
 
 impl Barge {
     /// Transition to `Stopped` with the retained preroll head.
+    #[cfg(test)]
     pub fn stop(
         &mut self,
         until_ms: u64,

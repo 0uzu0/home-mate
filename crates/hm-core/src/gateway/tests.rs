@@ -88,6 +88,9 @@ mod tests {
                     state_revision: None,
                     capability_fingerprint: None,
                     config_blocks: HashMap::new(),
+                    reserved_loopback: false,
+                    reserved_authenticated: false,
+                    last_unauth_lan: false,
                 },
             );
             // An API task is attributed through volume_pending, even though
@@ -177,6 +180,9 @@ mod tests {
                         state_revision: None,
                         capability_fingerprint: None,
                         config_blocks: HashMap::new(),
+                        reserved_loopback: false,
+                        reserved_authenticated: false,
+                        last_unauth_lan: false,
                     },
                 );
             }
@@ -548,6 +554,9 @@ mod d0_source_tests {
                 state_revision: None,
                 capability_fingerprint: None,
                 config_blocks: HashMap::new(),
+                reserved_loopback: false,
+                reserved_authenticated: false,
+                last_unauth_lan: false,
             };
             slot.config_blocks.insert(
                 ConfigBlock::Kws,
@@ -667,6 +676,9 @@ mod d0_source_tests {
                     state_revision: None,
                     capability_fingerprint: None,
                     config_blocks: HashMap::new(),
+                    reserved_loopback: false,
+                    reserved_authenticated: false,
+                    last_unauth_lan: false,
                 },
             );
         }
@@ -834,5 +846,617 @@ mod d0_source_tests {
             resolve_gateway_bind(http_lo, None, false, false, true).unwrap(),
             gw_lo
         );
+    }
+
+    #[tokio::test]
+    async fn outbound_three_tier_priority_control_over_voice_over_media() {
+        use super::transport_metrics::OUTBOUND_PLAY_CAP;
+        let hub = DeviceHub::new();
+        let (tx, mut rx) =
+            outbound::outbound_channel_with_metrics(hub.transport_tasks.outbound.clone());
+        hub.attach_test_outbound(1, tx);
+        {
+            let mut st = hub.lock_state();
+            st.device_to_conn.insert("android-2".into(), 1);
+            st.devices.insert(
+                "android-2".into(),
+                DeviceSlot {
+                    descriptor: HelloDevice {
+                        stable_id: "android-2".into(),
+                        model: "android".into(),
+                        firmware: Some("2.4.0".into()),
+                        capabilities: vec!["audio_out".into(), "play_stream".into()],
+                        audio_profile: "default".into(),
+                        wifi_ssid: None,
+                    },
+                    generation: 1,
+                    last_seq: 0,
+                    online: true,
+                    volume: None,
+                    volume_at_ms: None,
+                    volume_seq: 0,
+                    aec_enabled: None,
+                    aec_tail_ms: None,
+                    aec_tail_samples: None,
+                    aec_sample_rate: None,
+                    aec_provenance: None,
+                    profile_version: Some("android-v2".into()),
+                    echo_health: None,
+                    echo_degraded_ms: None,
+                    echo_health_reason: None,
+                    northbound: None,
+                    gateway_boot_id: None,
+                    state_revision: None,
+                    capability_fingerprint: None,
+                    config_blocks: HashMap::new(),
+                    reserved_loopback: false,
+                    reserved_authenticated: false,
+                    last_unauth_lan: false,
+                },
+            );
+        }
+
+        // 1. Saturate the lowest-priority `media` queue completely (640 frames).
+        let media = hub
+            .play_begin("android-2", "media", 24_000, Some("song".into()))
+            .expect("media play_begin");
+        for seq in 0..(OUTBOUND_PLAY_CAP - 1) as u64 {
+            hub.play_chunk(&media.play_id, seq, &[0x11u8; 64])
+                .expect("fill media tier");
+        }
+        assert!(hub.play_chunk(&media.play_id, 999, &[0x22u8; 64]).is_err());
+
+        // 2. While `media` is 100% full, `voice` (`wake_ack` / TTS + AssistantState)
+        //    AND `control` (`Stop`) MUST still enqueue cleanly without blocking.
+        let voice = hub
+            .play_begin("android-2", "voice", 16_000, Some("来了".into()))
+            .expect("voice PlayBegin must bypass full media queue");
+        hub.play_chunk(&voice.play_id, 0, &[0x33u8; 32])
+            .expect("voice PlayChunk must route to voice tier");
+        hub.play_end(&voice.play_id)
+            .expect("voice PlayEnd must route to voice tier");
+        hub.assistant_state("android-2", "speaking")
+            .expect("AssistantState must route to voice tier");
+        hub.stop(&media.play_id)
+            .expect("Stop must route to control tier");
+
+        let snap = hub.snapshot();
+        assert_eq!(snap["outbound_queue"]["control_queued"], json!(1));
+        assert_eq!(snap["outbound_queue"]["voice_queued"], json!(4));
+        assert_eq!(
+            snap["outbound_queue"]["media_queued"],
+            json!(OUTBOUND_PLAY_CAP)
+        );
+        assert_eq!(
+            snap["outbound_queue"]["play_queued"],
+            json!(4 + OUTBOUND_PLAY_CAP)
+        );
+
+        // 3. Strict drain order: Control (Stop) -> Voice (PlayBegin, PlayChunk,
+        //    PlayEnd, AssistantState) -> Media (PlayBegin, PlayChunk...).
+        let f0 = rx.recv().await.unwrap();
+        assert!(matches!(f0, CoreFrame::Stop { ref task_id, .. } if task_id == &media.play_id));
+        let f1 = rx.recv().await.unwrap();
+        assert!(
+            matches!(f1, CoreFrame::PlayBegin { ref task_id, .. } if task_id == &voice.play_id)
+        );
+        let f2 = rx.recv().await.unwrap();
+        assert!(
+            matches!(f2, CoreFrame::PlayChunk { ref task_id, seq: 0, .. } if task_id == &voice.play_id)
+        );
+        let f3 = rx.recv().await.unwrap();
+        assert!(matches!(f3, CoreFrame::PlayEnd { ref task_id } if task_id == &voice.play_id));
+        let f4 = rx.recv().await.unwrap();
+        assert!(matches!(
+            f4,
+            CoreFrame::AssistantState { ref state, .. } if state == "speaking"
+        ));
+        let f5 = rx.recv().await.unwrap();
+        assert!(
+            matches!(f5, CoreFrame::PlayBegin { ref task_id, .. } if task_id == &media.play_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_socket_enables_tcp_nodelay() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // 1. Non-loopback gateway socket: must enable TCP_NODELAY AND set TCP_NOTSENT_LOWAT = 24 KiB.
+        let accept_remote = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let _client_remote = TcpStream::connect(addr).await.unwrap();
+        let server_remote = accept_remote.await.unwrap();
+        let remote_peer: std::net::SocketAddr = "100.64.0.42:41001".parse().unwrap();
+        DeviceHub::configure_gateway_socket(&server_remote, Some(remote_peer));
+        assert!(
+            server_remote.nodelay().unwrap(),
+            "gateway TCP socket must enable TCP_NODELAY to avoid Nagle stalls on 40 ms audio frames"
+        );
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert_eq!(
+            crate::net::tcp_notsent_lowat(&server_remote),
+            Some(GATEWAY_REMOTE_NOTSENT_LOWAT_BYTES),
+            "configure_gateway_socket must apply 24 KiB TCP_NOTSENT_LOWAT on non-loopback sockets"
+        );
+
+        // 2. Loopback gateway socket: must enable TCP_NODELAY and leave TCP_NOTSENT_LOWAT at OS default.
+        let listener_lb = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_lb = listener_lb.local_addr().unwrap();
+        let accept_lb = tokio::spawn(async move { listener_lb.accept().await.unwrap().0 });
+        let _client_lb = TcpStream::connect(addr_lb).await.unwrap();
+        let server_lb = accept_lb.await.unwrap();
+        let lb_peer: std::net::SocketAddr = "127.0.0.1:41002".parse().unwrap();
+        DeviceHub::configure_gateway_socket(&server_lb, Some(lb_peer));
+        assert!(server_lb.nodelay().unwrap());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert_ne!(
+            crate::net::tcp_notsent_lowat(&server_lb),
+            Some(GATEWAY_REMOTE_NOTSENT_LOWAT_BYTES),
+            "configure_gateway_socket must leave loopback TCP_NOTSENT_LOWAT untouched"
+        );
+    }
+
+    struct RecordingWriter {
+        writes: Vec<Vec<u8>>,
+    }
+
+    impl tokio::io::AsyncWrite for RecordingWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.writes.push(buf.to_vec());
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_writer_coalesces_without_split_newline_writes_and_preserves_priority() {
+        let (tx, rx) = outbound::outbound_channel();
+        let mut writer = RecordingWriter { writes: Vec::new() };
+
+        // Enqueue media first, then voice, then control — plus drop sender so
+        // the writer drains and flushes everything cleanly without losing the tail.
+        for seq in 0..8u64 {
+            tx.send_tier(
+                outbound::OutboundTier::Media,
+                CoreFrame::PlayChunk {
+                    task_id: "media-1".into(),
+                    seq,
+                    audio_b64: "AAAA".repeat(1200),
+                },
+            )
+            .unwrap();
+        }
+        tx.send_tier(
+            outbound::OutboundTier::Voice,
+            CoreFrame::AssistantState {
+                device: "android-1".into(),
+                state: "speaking".into(),
+            },
+        )
+        .unwrap();
+        tx.send_tier(
+            outbound::OutboundTier::Control,
+            CoreFrame::Stop {
+                task_id: "media-1".into(),
+                flush: true,
+            },
+        )
+        .unwrap();
+        drop(tx);
+
+        DeviceHub::run_outbound_writer(rx, &mut writer).await;
+
+        assert!(
+            !writer.writes.is_empty(),
+            "writer must flush queued frames before exiting"
+        );
+        assert!(
+            writer.writes.len() < 10,
+            "10 queued frames (~40 KB) must coalesce into fewer syscalls (got {})",
+            writer.writes.len()
+        );
+        for w in &writer.writes {
+            assert_ne!(
+                w.as_slice(),
+                b"\n",
+                "writer must never emit a standalone 1-byte newline write"
+            );
+            assert_eq!(
+                w.last().copied(),
+                Some(b'\n'),
+                "each coalesced write must end cleanly on a frame newline boundary"
+            );
+        }
+
+        let joined = writer.writes.concat();
+        let text = String::from_utf8(joined).unwrap();
+        let frames: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(frames.len(), 10, "all 10 frames must arrive intact");
+        assert_eq!(
+            frames[0]["type"], "stop",
+            "Control tier must be serialized before Voice and Media"
+        );
+        assert_eq!(
+            frames[1]["type"], "assistant_state",
+            "Voice tier must be serialized before Media"
+        );
+        for (idx, frame) in frames[2..].iter().enumerate() {
+            assert_eq!(frame["type"], "play_chunk");
+            assert_eq!(frame["seq"], idx as u64);
+        }
+    }
+
+    #[test]
+    fn append_ndjson_frame_rolls_back_partial_bytes_on_serialize_error() {
+        struct PartialFail;
+        impl serde::Serialize for PartialFail {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("partial", "written_before_error")?;
+                Err(serde::ser::Error::custom("simulated mid-frame error"))
+            }
+        }
+
+        let mut batch = Vec::new();
+        assert!(DeviceHub::append_ndjson_frame(
+            &mut batch,
+            &json!({"type": "time_set", "ts_ms": 1})
+        ));
+        let good_len = batch.len();
+        assert!(!DeviceHub::append_ndjson_frame(&mut batch, &PartialFail));
+        assert_eq!(
+            batch.len(),
+            good_len,
+            "failed serialization must truncate partial bytes back to prior frame boundary"
+        );
+        assert_eq!(batch.last().copied(), Some(b'\n'));
+        let parsed: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&batch).unwrap().trim()).unwrap();
+        assert_eq!(parsed["type"], "time_set");
+    }
+
+    #[tokio::test]
+    async fn serve_connection_streams_media_burst_over_real_tcp_without_framing_loss() {
+        use tokio::io::AsyncBufReadExt;
+
+        let hub = DeviceHub::new();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hub_srv = hub.clone();
+        let srv = tokio::spawn(async move {
+            let (sock, peer) = listener.accept().await.unwrap();
+            let _ = hub_srv.serve_connection_from(sock, Some(peer)).await;
+        });
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        client.set_nodelay(true).unwrap();
+        let (rd, mut wr) = client.into_split();
+        let hello = json!({
+            "type": "hello",
+            "protocol": 2,
+            "min_protocol": 0,
+            "gateway": "android-burst-test",
+            "gateway_version": "2.3.12",
+            "devices": [{
+                "stable_id": "android-burst-1",
+                "model": "android-phone",
+                "capabilities": ["audio_out", "stop", "play_stream"],
+                "audio_profile": "android_farfield_v1"
+            }]
+        });
+        wr.write_all(format!("{hello}\n").as_bytes()).await.unwrap();
+
+        let mut lines = BufReader::new(rd).lines();
+        // Expect hello_ack + time_set
+        let mut saw_ack = false;
+        for _ in 0..2 {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(2), lines.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if v["type"] == "hello_ack" {
+                saw_ack = true;
+            }
+        }
+        assert!(saw_ack, "gateway must receive hello_ack");
+
+        // Open a media stream and push 120 realistic 44.1 kHz / 40 ms PCM chunks (~4.8 KB JSON each)
+        let _ticket = hub
+            .play_begin_ref(
+                "android-burst-1",
+                "media",
+                44_100,
+                None,
+                Some("music:test:burst".into()),
+            )
+            .unwrap();
+        let play_id = _ticket.play_id.clone();
+        let pcm = vec![0x12u8; 3528]; // 40 ms @ 44.1 kHz mono s16le (1764 samples * 2 B)
+        for seq in 0..120u64 {
+            hub.play_chunk(&play_id, seq, &pcm).unwrap();
+        }
+        hub.play_end(&play_id).unwrap();
+
+        let mut received_seqs = Vec::with_capacity(120);
+        let mut saw_end = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline && !saw_end {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(2), lines.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            match v["type"].as_str() {
+                Some("play_chunk") => received_seqs.push(v["seq"].as_u64().unwrap()),
+                Some("play_end") => saw_end = true,
+                _ => {}
+            }
+        }
+        assert!(saw_end, "must receive play_end after burst");
+        assert_eq!(
+            received_seqs,
+            (0..120u64).collect::<Vec<_>>(),
+            "all 120 media chunks must arrive intact and in exact order"
+        );
+
+        drop(wr);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), srv).await;
+    }
+
+    #[tokio::test]
+    async fn outbound_writer_yields_media_during_streaming_voice_tts_and_resumes_on_play_end() {
+        let (tx, rx) = outbound::outbound_channel();
+        let (done_tx, done_rx) = oneshot::channel();
+        let writer_task = tokio::spawn(async move {
+            let mut writer = RecordingWriter { writes: Vec::new() };
+            DeviceHub::run_outbound_writer(rx, &mut writer).await;
+            let _ = done_tx.send(writer.writes);
+        });
+
+        // Enqueue a voice stream whose 5 chunks arrive staggered over ~125 ms
+        // (matching streaming TTS `"正在播放..."`) while bulk media chunks
+        // sit queued in `media_tx`.
+        tx.send_tier(
+            outbound::OutboundTier::Media,
+            CoreFrame::PlayBegin {
+                task_id: "media-1".into(),
+                device: "android-1".into(),
+                content_ref: "music:online:1".into(),
+                audio: AudioMeta {
+                    format: "pcm_s16le".into(),
+                    sample_rate: 24_000,
+                    channels: 1,
+                },
+                channel: Some("media".into()),
+                text: None,
+                barge_in: None,
+            },
+        )
+        .unwrap();
+        for seq in 0..10u64 {
+            tx.send_tier(
+                outbound::OutboundTier::Media,
+                CoreFrame::PlayChunk {
+                    task_id: "media-1".into(),
+                    seq,
+                    audio_b64: "AAAA".repeat(600),
+                },
+            )
+            .unwrap();
+        }
+
+        tx.send_tier(
+            outbound::OutboundTier::Voice,
+            CoreFrame::PlayBegin {
+                task_id: "voice-1".into(),
+                device: "android-1".into(),
+                content_ref: "tts:stream-1".into(),
+                audio: AudioMeta {
+                    format: "pcm_s16le".into(),
+                    sample_rate: 16_000,
+                    channels: 1,
+                },
+                channel: Some("voice".into()),
+                text: Some("正在播放".into()),
+                barge_in: None,
+            },
+        )
+        .unwrap();
+        for seq in 0..5u64 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            // Push fresh media chunks during the TTS gap — they MUST wait until PlayEnd(voice-1).
+            tx.send_tier(
+                outbound::OutboundTier::Media,
+                CoreFrame::PlayChunk {
+                    task_id: "media-1".into(),
+                    seq: 10 + seq,
+                    audio_b64: "BBBB".repeat(600),
+                },
+            )
+            .unwrap();
+            tx.send_tier(
+                outbound::OutboundTier::Voice,
+                CoreFrame::PlayChunk {
+                    task_id: "voice-1".into(),
+                    seq,
+                    audio_b64: "CCCC".repeat(300),
+                },
+            )
+            .unwrap();
+        }
+        tx.send_tier(
+            outbound::OutboundTier::Voice,
+            CoreFrame::PlayEnd {
+                task_id: "voice-1".into(),
+            },
+        )
+        .unwrap();
+        drop(tx);
+
+        let writes = done_rx.await.unwrap();
+        let _ = writer_task.await;
+        let frames: Vec<serde_json::Value> = String::from_utf8(writes.concat())
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
+        let voice_begin_idx = frames
+            .iter()
+            .position(|f| f["type"] == "play_begin" && f["task_id"] == "voice-1")
+            .expect("voice play_begin present");
+        let voice_end_idx = frames
+            .iter()
+            .position(|f| f["type"] == "play_end" && f["task_id"] == "voice-1")
+            .expect("voice play_end present");
+        assert_eq!(
+            voice_end_idx - voice_begin_idx,
+            6,
+            "all 5 voice chunks must emit contiguously between voice play_begin and play_end without interleaved media: {:?}",
+            &frames[voice_begin_idx..=voice_end_idx]
+        );
+        for f in &frames[voice_begin_idx..=voice_end_idx] {
+            assert_eq!(
+                f["task_id"], "voice-1",
+                "no media frame may interleave while voice stream is actively transmitting"
+            );
+        }
+        let resumed_media_after_voice = frames[voice_end_idx + 1..]
+            .iter()
+            .filter(|f| f["task_id"] == "media-1")
+            .count();
+        assert!(
+            resumed_media_after_voice >= 5,
+            "media chunks held during voice TTS must resume immediately after play_end (got {resumed_media_after_voice})"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn outbound_receiver_releases_media_yield_after_bounded_cap() {
+        let (tx, mut rx) = outbound::outbound_channel();
+        tx.send_tier(
+            outbound::OutboundTier::Voice,
+            CoreFrame::PlayBegin {
+                task_id: "voice-long".into(),
+                device: "android-1".into(),
+                content_ref: "tts:long".into(),
+                audio: AudioMeta {
+                    format: "pcm_s16le".into(),
+                    sample_rate: 16_000,
+                    channels: 1,
+                },
+                channel: Some("voice".into()),
+                text: None,
+                barge_in: None,
+            },
+        )
+        .unwrap();
+        tx.send_tier(
+            outbound::OutboundTier::Media,
+            CoreFrame::PlayChunk {
+                task_id: "media-1".into(),
+                seq: 0,
+                audio_b64: "AAAA".into(),
+            },
+        )
+        .unwrap();
+
+        let first = rx.recv().await.unwrap();
+        assert!(
+            matches!(first, CoreFrame::PlayBegin { ref task_id, .. } if task_id == "voice-long")
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let started = tokio::time::Instant::now();
+        let resumed = rx.recv().await.unwrap();
+        assert!(
+            matches!(resumed, CoreFrame::PlayChunk { ref task_id, seq: 0, .. } if task_id == "media-1")
+        );
+        assert!(
+            started.elapsed() >= outbound::VOICE_STREAM_MEDIA_YIELD_MAX,
+            "media must wait until yield cap elapses when voice PlayEnd is not sent"
+        );
+
+        // Also verify Control Stop for an active voice stream immediately releases
+        // the media yield without waiting for the 1.5s cap.
+        tx.send_tier(
+            outbound::OutboundTier::Voice,
+            CoreFrame::PlayBegin {
+                task_id: "voice-stop".into(),
+                device: "android-1".into(),
+                content_ref: "tts:stop".into(),
+                audio: AudioMeta {
+                    format: "pcm_s16le".into(),
+                    sample_rate: 16_000,
+                    channels: 1,
+                },
+                channel: Some("voice".into()),
+                text: None,
+                barge_in: None,
+            },
+        )
+        .unwrap();
+        tx.send_tier(
+            outbound::OutboundTier::Media,
+            CoreFrame::PlayChunk {
+                task_id: "media-1".into(),
+                seq: 1,
+                audio_b64: "BBBB".into(),
+            },
+        )
+        .unwrap();
+        let began = rx.recv().await.unwrap();
+        assert!(
+            matches!(began, CoreFrame::PlayBegin { ref task_id, .. } if task_id == "voice-stop")
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        tx.send_tier(
+            outbound::OutboundTier::Control,
+            CoreFrame::Stop {
+                task_id: "voice-stop".into(),
+                flush: true,
+            },
+        )
+        .unwrap();
+        let stop_frame = rx.recv().await.unwrap();
+        assert!(
+            matches!(stop_frame, CoreFrame::Stop { ref task_id, .. } if task_id == "voice-stop")
+        );
+        let resumed_immediately = rx.try_recv().expect(
+            "Stop for active voice stream must immediately release media yield without waiting 1.5s",
+        );
+        assert!(
+            matches!(resumed_immediately, CoreFrame::PlayChunk { ref task_id, seq: 1, .. } if task_id == "media-1")
+        );
+        drop(tx);
     }
 }

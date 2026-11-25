@@ -45,7 +45,7 @@ impl AnnouncePriority {
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "" | "normal" => Some(Self::Normal),
-            "high" => Some(Self::High),
+            "high" | "urgent" => Some(Self::High),
             _ => None,
         }
     }
@@ -162,6 +162,23 @@ impl VoicePipeline {
         self: &Arc<Self>,
         req: AnnounceRequest,
     ) -> Result<serde_json::Value, AnnounceError> {
+        let task_known = req
+            .task_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_some_and(|tid| self.tasks.exists(tid));
+        self.enqueue_announce_checked(req, task_known)
+    }
+
+    /// Variant accepting a caller-verified `task_known` flag (e.g. HTTP API
+    /// verifying `task_id` against `TaskRegistry` OR `MasterBrainRuntime`, or
+    /// internal `MasterBrainRuntime` callbacks for tracked delegated tasks).
+    pub fn enqueue_announce_checked(
+        self: &Arc<Self>,
+        req: AnnounceRequest,
+        task_known: bool,
+    ) -> Result<serde_json::Value, AnnounceError> {
         let text = req.text.trim();
         if text.is_empty() {
             return Err(AnnounceError::new(
@@ -233,24 +250,54 @@ impl VoicePipeline {
             ));
         }
 
-        // Unsolicited announcements (no user-originated task_id) obey the
+        // Unsolicited announcements (no valid user-originated task_id) obey the
         // household `proactive_speech` toggle. Task callbacks are the user's
-        // own delegated work, matching how reminders are not blocked by it.
-        let proactive_enabled =
-            crate::lock_or_recover(&self.settings, "voice.settings").proactive_speech;
-        if task_id.is_none() && !proactive_enabled {
+        // own delegated work, matching how reminders are not blocked by it —
+        // but arbitrary unknown task_ids cannot bypass `proactive_speech=false`.
+        let proactive_enabled = {
+            let s = crate::lock_or_recover(&self.settings, "voice.settings");
+            let target_dev = req
+                .device
+                .as_deref()
+                .map(str::trim)
+                .filter(|d| !d.is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    self.hub
+                        .resolve_default_audio_out()
+                        .ok()
+                        .flatten()
+                        .map(|d| d.stable_id)
+                });
+            match target_dev.as_deref() {
+                Some(dev) => s.effective_for(dev).proactive_speech,
+                None => s.proactive_speech,
+            }
+        };
+        let verified_task_callback = task_id.is_some() && task_known;
+        if !verified_task_callback && !proactive_enabled {
+            let reason = if task_id.is_some() {
+                "unknown_task_id"
+            } else {
+                "proactive_speech_disabled"
+            };
             self.note(
                 "voice_announce_rejected",
                 json!({
-                    "reason": "proactive_speech_disabled",
+                    "reason": reason,
                     "source": source,
                     "priority": priority.as_str(),
+                    "task_id": task_id,
                 }),
             );
             return Err(AnnounceError::new(
                 409,
                 "PROACTIVE_SPEECH_DISABLED",
-                "proactive_speech is disabled for unsolicited announcements (set task_id for user-requested task callbacks or enable proactive_speech)",
+                if task_id.is_some() {
+                    "proactive_speech is disabled and task_id does not match a known Core or Master Brain task"
+                } else {
+                    "proactive_speech is disabled for unsolicited announcements (set a known task_id for user-requested task callbacks or enable proactive_speech)"
+                },
             ));
         }
 
@@ -445,6 +492,14 @@ impl VoicePipeline {
             return Ok(raw.to_string());
         }
 
+        if online_ids.len() > 1 {
+            return Err(AnnounceError::new(
+                400,
+                "ANNOUNCE_DEVICE_REQUIRED",
+                "multiple devices are online; specify target device explicitly",
+            ));
+        }
+
         self.hub
             .primary_audio_out()
             .map(|d| d.stable_id)
@@ -496,9 +551,9 @@ impl VoicePipeline {
         if session_open {
             return Some("listening_session");
         }
-        let speaking_now = crate::lock_or_recover(&self.mic, "voice.mic")
-            .get(device)
-            .map(|p| p.in_speech())
+        let speaking_now = self
+            .mic_arc(device)
+            .map(|arc| crate::lock_or_recover(&arc, "voice.mic.dev").in_speech())
             .unwrap_or(false);
         if speaking_now {
             return Some("user_speaking");
@@ -746,7 +801,9 @@ impl VoicePipeline {
         let now = id::now_ms();
         let base_window_ms = {
             let s = crate::lock_or_recover(&self.settings, "voice.settings");
-            s.follow_window_ms.clamp(5_000, 30_000)
+            s.effective_for(device)
+                .follow_window_ms
+                .clamp(5_000, 30_000)
         };
         let policy = FollowWindowPolicy {
             enabled: true,
@@ -833,7 +890,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn priority_parsing_accepts_normal_and_high_only() {
+    fn priority_parsing_accepts_normal_high_and_urgent_alias_only() {
         assert_eq!(AnnouncePriority::parse(""), Some(AnnouncePriority::Normal));
         assert_eq!(
             AnnouncePriority::parse("normal"),
@@ -843,6 +900,10 @@ mod tests {
             AnnouncePriority::parse("HIGH"),
             Some(AnnouncePriority::High)
         );
-        assert_eq!(AnnouncePriority::parse("urgent"), None);
+        assert_eq!(
+            AnnouncePriority::parse("urgent"),
+            Some(AnnouncePriority::High)
+        );
+        assert_eq!(AnnouncePriority::parse("critical"), None);
     }
 }

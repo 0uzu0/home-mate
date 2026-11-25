@@ -137,6 +137,19 @@ impl AuthStore {
         Ok(enabled)
     }
 
+    /// Synchronize in-memory auth state after factory reset clears `config_kv`:
+    /// reset `lan_gateway_exempt` back to fail-closed (`false`), clear auth
+    /// rate-limit buckets, and re-persist this instance's stable `core_id`.
+    pub fn reset_after_factory_reset(&self) -> Result<(), AuthError> {
+        let _guard = crate::lock_or_recover(&self.write, "auth.write");
+        self.lan_gateway_exempt.store(false, Ordering::Release);
+        crate::lock_or_recover(&self.failures, "auth.failures").clear();
+        self.store
+            .config_set(CORE_ID_KEY, &self.core_id)
+            .map_err(|e| AuthError::Store(e.to_string()))?;
+        Ok(())
+    }
+
     /// Check whether `ip` has exceeded [`AUTH_FAIL_THRESHOLD`] failures within
     /// [`AUTH_FAIL_WINDOW_MS`]. Loopback is never rate-limited.
     pub fn is_rate_limited(&self, ip: IpAddr) -> Option<u64> {

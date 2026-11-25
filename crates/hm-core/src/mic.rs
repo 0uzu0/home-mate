@@ -90,6 +90,8 @@ pub struct SourceSpan {
     pub control_only: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub wake_ack_overlap: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tail_blind_only: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub speech: bool,
 }
@@ -108,23 +110,61 @@ impl CaptureProvenance {
                 samples,
                 control_only: false,
                 wake_ack_overlap: false,
+                tail_blind_only: false,
                 speech: false,
             }],
         }
     }
 
-    /// A wake cue may prefix a real question, but a protected answer or a
-    /// cue followed only by silence cannot authorize a follow-up.
+    /// A wake cue (and any immediately following post-ack `tail_blind_only`
+    /// window) may prefix a real question, but a protected answer, a pure
+    /// post-answer `tail_blind_only` run without `wake_ack_overlap`, or a cue
+    /// followed only by silence cannot authorize a follow-up.
     pub fn allows_wake_ack_followup(&self) -> bool {
-        self.spans
-            .iter()
-            .filter(|s| s.control_only)
-            .all(|s| s.wake_ack_overlap)
+        let mut has_wake_ack = false;
+        for s in &self.spans {
+            if s.control_only {
+                if s.wake_ack_overlap {
+                    has_wake_ack = true;
+                } else if !(has_wake_ack && s.tail_blind_only) {
+                    return false;
+                }
+            }
+        }
+        has_wake_ack
             && self
                 .spans
                 .rsplit(|s| s.control_only)
                 .next()
                 .is_some_and(|spans| spans.iter().any(|s| s.speech))
+    }
+
+    /// Whether this captured segment must be restricted to control-only commands.
+    ///
+    /// Any span captured during live voice or media playback (`control_only && !tail_blind_only`)
+    /// keeps the whole segment control-only. If ONLY up to 3 leading preroll/onset spans grazed
+    /// the post-playback `tail_blind_ms` guard while nothing was playing, and the remainder is
+    /// strictly clean speech (`>= 3` clean speech spans and strictly more clean speech than
+    /// leading grazed spans), treat the segment as a normal user utterance rather than echo.
+    pub fn effective_control_only(&self) -> bool {
+        if !self.spans.iter().any(|s| s.control_only) {
+            return false;
+        }
+        if self
+            .spans
+            .iter()
+            .any(|s| s.control_only && !s.tail_blind_only)
+        {
+            return true;
+        }
+        let leading = self.spans.iter().take_while(|s| s.control_only).count();
+        if leading <= 3 && self.spans[leading..].iter().all(|s| !s.control_only) {
+            let clean_speech = self.spans[leading..].iter().filter(|s| s.speech).count();
+            if clean_speech >= 3 && clean_speech > leading {
+                return false;
+            }
+        }
+        true
     }
 
     pub fn legacy(samples: usize) -> Self {
@@ -157,6 +197,7 @@ impl CaptureProvenance {
                     samples,
                     control_only: span.control_only,
                     wake_ack_overlap: span.wake_ack_overlap,
+                    tail_blind_only: span.tail_blind_only,
                     speech: span.speech,
                 });
             }
@@ -270,9 +311,14 @@ pub struct MicProcessor {
     /// exact instant `in_speech` flips to `false` on segment close, closing the
     /// cross-lock race window with `on_keyword_at` (`bare_wake_closed`).
     last_close_ms: Option<u64>,
-    /// Armed `wakeup_end` block cursor (`blocks_seen` units) for XiaoAi-style
+    /// Armed `wakeup_end` block cursor (`blocks_seen` units), whether a speech
+    /// segment or onset was already active when armed, when it was armed
+    /// (`Instant`), and optional acoustic `wake_dur_ms`, for XiaoAi-style
     /// physical timeline slicing on the currently active wake capture (#261).
-    wake_cut_cursor: Option<u64>,
+    wake_cut_cursor: Option<(u64, bool, std::time::Instant, Option<u64>)>,
+    /// Arrival timestamp of the previous audio block, used to flush stale idle
+    /// `preroll` / `lead_pcm` / Silero LSTM state across idle-gate discontinuities.
+    last_feed_at: Option<std::time::Instant>,
 }
 
 /// How many recent block levels the telemetry ring keeps (~8 s at 12.5/s).
@@ -280,6 +326,12 @@ const LEVEL_RING: usize = 100;
 /// Clean pre-onset blocks (`160 ms` at `80 ms/block`) retained before the
 /// `start_blocks` trigger for ASR WAV encoding (`#216`).
 const PRE_ONSET_LEAD_BLOCKS: usize = 2;
+/// Idle discontinuity threshold (ms): when no segment is open and the gap since
+/// the last chunk reaches this bound, drop stale preroll/lead PCM and reset Silero.
+pub const IDLE_GAP_RESET_MS: u64 = 500;
+/// Maximum block-cursor gap (`25 * 80 ms = 2.0 s`) tolerated when a gateway delivers
+/// `keyword` just before flushing preroll PCM during wake arbitration.
+const MAX_WAKE_CURSOR_GAP_BLOCKS: u64 = 25;
 
 pub enum FeedOutcome {
     /// Nothing to report (still inside silence or speech).
@@ -312,6 +364,7 @@ impl MicProcessor {
             last_close: None,
             last_close_ms: None,
             wake_cut_cursor: None,
+            last_feed_at: None,
         }
     }
 
@@ -408,9 +461,61 @@ impl MicProcessor {
     }
 
     /// Arm physical wake-word timeline slicing at `end_block_cursor` (`blocks_seen`
+    /// coordinates captured at KWS arrival, before any arbitration delay), optionally
+    /// bounded by acoustic `wake_dur_ms` when Zipformer right-context lookahead
+    /// overshoots the wake-word end into a tight one-shot command (#261).
+    pub fn arm_wake_slice_with_dur(&mut self, end_block_cursor: u64, wake_dur_ms: Option<u64>) {
+        let active = self.in_speech || self.onset_pending();
+        self.wake_cut_cursor = Some((
+            end_block_cursor,
+            active,
+            std::time::Instant::now(),
+            wake_dur_ms,
+        ));
+    }
+
+    /// Arm physical wake-word timeline slicing at `end_block_cursor` (`blocks_seen`
     /// coordinates captured at KWS arrival, before any arbitration delay) (#261).
     pub fn arm_wake_slice(&mut self, end_block_cursor: u64) {
-        self.wake_cut_cursor = Some(end_block_cursor);
+        self.arm_wake_slice_with_dur(end_block_cursor, None);
+    }
+
+    /// Clear stale idle `preroll`, `lead_pcm`, pending onset, and Silero LSTM state
+    /// if the elapsed wall gap since the previous chunk reached `IDLE_GAP_RESET_MS`
+    /// while no speech segment is open (e.g. across gateway idle-gate pauses).
+    /// Freshly armed `wake_cut_cursor`s (< 5 s old) are preserved so post-idle PCM
+    /// arriving after an idle-gated KWS wake does not wipe the armed slice cursor.
+    pub fn reset_stale_preroll_if_gap(&mut self, now: std::time::Instant) -> bool {
+        let prev = self.last_feed_at.replace(now);
+        let Some(prev) = prev else {
+            return false;
+        };
+        if self.in_speech {
+            return false;
+        }
+        if now.saturating_duration_since(prev) < std::time::Duration::from_millis(IDLE_GAP_RESET_MS)
+        {
+            return false;
+        }
+        let preserve_wake_cut = self.wake_cut_cursor.is_some_and(|(_, _, armed_at, _)| {
+            now.saturating_duration_since(armed_at) < std::time::Duration::from_secs(5)
+        });
+        let had_state = !self.preroll.is_empty()
+            || !self.lead_pcm.is_empty()
+            || self.above_run > 0
+            || self.onset.is_some()
+            || (!preserve_wake_cut && self.wake_cut_cursor.is_some());
+        self.preroll.clear();
+        self.lead_pcm.clear();
+        self.above_run = 0;
+        self.onset = None;
+        if !preserve_wake_cut {
+            self.wake_cut_cursor = None;
+        }
+        if let Endpoint::Silero(d) = &mut self.endpoint {
+            d.reset();
+        }
+        had_state
     }
 
     /// The tracked room floor (dBFS), from NON-speech blocks only. `None`
@@ -562,6 +667,7 @@ impl MicProcessor {
         remote_vad: Option<bool>,
     ) -> FeedOutcome {
         debug_assert_eq!(block.len(), provenance.samples());
+        self.reset_stale_preroll_if_gap(std::time::Instant::now());
         self.blocks_seen += 1;
         let db = block_db(&block);
         self.levels.push_back(db);
@@ -644,6 +750,9 @@ impl MicProcessor {
                 }
                 self.above_run += 1;
             } else {
+                if self.above_run > 0 {
+                    self.wake_cut_cursor = None;
+                }
                 self.above_run = 0;
             }
             if self.above_run >= self.cfg.start_blocks {
@@ -701,7 +810,9 @@ impl MicProcessor {
         let blocks = self.speech_blocks;
         self.last_close = Some((close_reason, blocks));
         let mut wake_slice = WakeSliceOutcome::None;
-        if let Some(cut_cursor) = self.wake_cut_cursor.take() {
+        if let Some((cut_cursor, armed_active, _armed_at, wake_dur_ms)) =
+            self.wake_cut_cursor.take()
+        {
             // `blocks` is the pre-trim block count of `self.speech`, so `self.speech[0]`
             // corresponds to 1-indexed `blocks_seen` value `blocks_seen - blocks + 1`.
             let speech_start_cursor = self.blocks_seen.saturating_sub(blocks as u64) + 1;
@@ -710,31 +821,44 @@ impl MicProcessor {
                     .saturating_add(1)
                     .saturating_sub(speech_start_cursor)
                     .min(self.speech.len() as u64) as usize;
-                let post_wake_speech_blocks = self.speech[cut_idx..]
+                let valid_wake_dur = wake_dur_ms.filter(|dur| (240..=1800).contains(dur));
+                let effective_cut = if let Some(dur) = valid_wake_dur {
+                    let first_speech_idx = self
+                        .speech
+                        .iter()
+                        .position(|b| b.provenance.spans.iter().any(|s| s.speech))
+                        .unwrap_or(0);
+                    let wake_blocks = dur.div_ceil(80) as usize;
+                    let acoustic_end_idx = (first_speech_idx + wake_blocks).min(self.speech.len());
+                    cut_idx.min(acoustic_end_idx)
+                } else {
+                    cut_idx
+                };
+                let post_wake_speech_blocks = self.speech[effective_cut..]
                     .iter()
                     .filter(|b| b.provenance.spans.iter().any(|s| s.speech))
                     .count();
                 // `cut_cursor` already steps back `lag_blocks` (~1 block at 94 ms) before
-                // KWS arrival, so `self.speech[cut_idx]` may still carry the wake word's
-                // final block plus up to 2 blocks (160 ms) of near-field room reverb.
-                // Tolerating <= 3 speech blocks from `cut_idx` keeps bare wakes at 0 ASR
-                // in both mid-field and near-field rooms while commands (>= 4 blocks)
-                // stay `CommandSliced`.
+                // KWS arrival, and `effective_cut` caps it by `first_speech_idx + ceil(wake_dur_ms/80)`
+                // when Zipformer chunk-16 right-context lookahead overshoots into a tight
+                // one-shot command. Tolerating <= 3 speech blocks from `effective_cut`
+                // keeps bare wakes at 0 ASR in both mid-field and near-field rooms while
+                // commands (>= 4 blocks) stay `CommandSliced`.
                 if close_reason == CloseReason::Quiet && post_wake_speech_blocks <= 3 {
                     wake_slice = WakeSliceOutcome::BareWake;
                 } else {
                     // Pause-aware physical slicing: if a clear post-wake quiet gap
                     // (>= 2 consecutive non-speech blocks = 160 ms) begins at/near
-                    // `cut_idx` and is followed by command speech, start right after the
-                    // pause (keeping 1 quiet lead-in block) instead of backing off across
-                    // the silence into the wake word's final syllable. Otherwise (0 ms
-                    // tight one-shot), back off 5 blocks (400 ms) to cover Zipformer
-                    // chunk-16 algorithmic right-context buffering delay (~320-400 ms).
+                    // `effective_cut` and is followed by command speech, start right after
+                    // the pause (keeping 1 quiet lead-in block) instead of backing off across
+                    // the silence into the wake word's final syllable. Otherwise (0 ms tight
+                    // one-shot), keep a bounded safety overlap when `wake_dur_ms` anchored
+                    // the cut, or back off 5 blocks (400 ms) when `wake_dur_ms` is absent.
                     let is_speech = |b: &CapturedBlock| b.provenance.spans.iter().any(|s| s.speech);
                     let pause_cmd_start = {
-                        let scan_end = (cut_idx + 2).min(self.speech.len());
+                        let scan_end = (effective_cut + 3).min(self.speech.len());
                         let mut found = None;
-                        let mut i = cut_idx;
+                        let mut i = effective_cut.saturating_sub(1);
                         while i <= scan_end && i < self.speech.len() {
                             if !is_speech(&self.speech[i]) {
                                 let mut j = i;
@@ -752,7 +876,17 @@ impl MicProcessor {
                         }
                         found
                     };
-                    let slice_idx = pause_cmd_start.unwrap_or_else(|| cut_idx.saturating_sub(5));
+                    let slice_idx = pause_cmd_start.unwrap_or_else(|| {
+                        if valid_wake_dur.is_some() {
+                            if effective_cut < cut_idx {
+                                effective_cut.saturating_sub(1)
+                            } else {
+                                effective_cut.saturating_sub(2)
+                            }
+                        } else {
+                            cut_idx.saturating_sub(5)
+                        }
+                    });
                     if slice_idx > 0 && slice_idx < self.speech.len() {
                         self.speech = self.speech.split_off(slice_idx);
                         self.lead_pcm.clear();
@@ -761,6 +895,25 @@ impl MicProcessor {
                         self.lead_pcm.clear();
                         wake_slice = WakeSliceOutcome::CommandSliced;
                     }
+                }
+            } else if armed_active
+                && !self.speech.is_empty()
+                && speech_start_cursor.saturating_sub(cut_cursor) <= MAX_WAKE_CURSOR_GAP_BLOCKS
+            {
+                // Gateway sent `keyword` slightly before flushed preroll PCM so the
+                // captured segment began just after `wake_end_cursor` within the same
+                // wake transfer (e.g. during 200 ms wake arbitration). Classify it
+                // cleanly without truncating post-wake command PCM.
+                let total_speech_blocks = self
+                    .speech
+                    .iter()
+                    .filter(|b| b.provenance.spans.iter().any(|s| s.speech))
+                    .count();
+                if close_reason == CloseReason::Quiet && total_speech_blocks <= 3 {
+                    wake_slice = WakeSliceOutcome::BareWake;
+                } else {
+                    self.lead_pcm.clear();
+                    wake_slice = WakeSliceOutcome::CommandSliced;
                 }
             }
         }
@@ -862,6 +1015,7 @@ impl MicProcessor {
         self.speech_blocks = 0;
         self.last_close_ms = None;
         self.wake_cut_cursor = None;
+        self.last_feed_at = None;
         // The model's LSTM state and the half-frame carry must not survive a
         // gated stretch: the next frame would splice audio from both sides.
         if let Endpoint::Silero(d) = &mut self.endpoint {
@@ -2112,6 +2266,397 @@ mod wake_ack_capture_tests {
             seg3.wake_slice,
             WakeSliceOutcome::None,
             "stale cursor must not slice a subsequent follow-up segment"
+        );
+    }
+
+    #[test]
+    fn wake_slice_cursor_race_when_keyword_precedes_flushed_pcm() {
+        let cfg = VadConfig {
+            start_db: -37.0,
+            end_db: -42.0,
+            start_blocks: 3,
+            end_blocks: 6,
+            preroll_blocks: 2,
+            min_blocks: 3,
+            ..VadConfig::default()
+        };
+        let quiet = vec![0i16; 1280];
+        let cmd_blk = vec![22220i16; 1280];
+
+        // Case A: gateway sends Keyword before flushed PCM (`cut_cursor = 1`),
+        // then during 200ms arbitration preroll + command PCM opens speech at
+        // `speech_start_cursor = 4` (`> cut_cursor + 1`). `arm_wake_slice(1)`
+        // fires while `in_speech` is true -> must classify as `CommandSliced`
+        // without truncating post-wake command PCM.
+        let mut p = MicProcessor::new(cfg.clone());
+        let _ = p.feed(quiet.clone(), 16_000); // block 1
+        let wake_end_before_flush = p.current_block_cursor(); // 1
+        for _ in 0..2 {
+            let _ = p.feed(quiet.clone(), 16_000); // blocks 2..3
+        }
+        for _ in 0..6 {
+            let _ = p.feed(cmd_blk.clone(), 16_000); // blocks 4..9 -> opens speech
+        }
+        assert!(p.in_speech());
+        p.arm_wake_slice(wake_end_before_flush);
+        let mut seg = None;
+        for _ in 0..10 {
+            if let FeedOutcome::Segment(Some(s)) = p.feed(quiet.clone(), 16_000) {
+                seg = Some(s);
+                break;
+            }
+        }
+        let seg = seg.expect("post-wake command segment must close");
+        assert_eq!(seg.wake_slice, WakeSliceOutcome::CommandSliced);
+        assert!(seg.lead_pcm.is_empty());
+        assert!(seg.pcm.contains(&22220));
+        assert_eq!(seg.provenance.samples(), seg.pcm.len());
+
+        // Case B: short bare wake (<= 3 speech blocks) after early cursor -> BareWake.
+        let mut p_bare = MicProcessor::new(cfg.clone());
+        let _ = p_bare.feed(quiet.clone(), 16_000);
+        let cut = p_bare.current_block_cursor();
+        for _ in 0..3 {
+            let _ = p_bare.feed(quiet.clone(), 16_000);
+        }
+        for _ in 0..3 {
+            let _ = p_bare.feed(cmd_blk.clone(), 16_000);
+        }
+        assert!(p_bare.in_speech());
+        p_bare.arm_wake_slice(cut);
+        let mut bare_seg = None;
+        for _ in 0..10 {
+            if let FeedOutcome::Segment(Some(s)) = p_bare.feed(quiet.clone(), 16_000) {
+                bare_seg = Some(s);
+                break;
+            }
+        }
+        assert_eq!(bare_seg.unwrap().wake_slice, WakeSliceOutcome::BareWake);
+
+        // Case C: cursor > 25 blocks behind even when active -> WakeSliceOutcome::None.
+        let mut p_far = MicProcessor::new(cfg);
+        for _ in 0..30 {
+            let _ = p_far.feed(quiet.clone(), 16_000);
+        }
+        for _ in 0..6 {
+            let _ = p_far.feed(cmd_blk.clone(), 16_000);
+        }
+        p_far.arm_wake_slice(1);
+        let mut far_seg = None;
+        for _ in 0..10 {
+            if let FeedOutcome::Segment(Some(s)) = p_far.feed(quiet.clone(), 16_000) {
+                far_seg = Some(s);
+                break;
+            }
+        }
+        assert_eq!(far_seg.unwrap().wake_slice, WakeSliceOutcome::None);
+    }
+
+    #[test]
+    fn idle_gap_resets_stale_preroll_and_lead_pcm() {
+        let cfg = VadConfig {
+            start_db: -37.0,
+            end_db: -42.0,
+            start_blocks: 3,
+            end_blocks: 6,
+            preroll_blocks: 3,
+            min_blocks: 3,
+            ..VadConfig::default()
+        };
+        let mut p = MicProcessor::new(cfg);
+        let old_marker = vec![333i16; 1280]; // quiet (~ -40 dBFS) distinct marker
+        let new_speech = vec![20_000i16; 1280];
+        let quiet = vec![0i16; 1280];
+        let t0 = std::time::Instant::now();
+
+        // Populate preroll + lead_pcm before idle-gate pause.
+        for _ in 0..5 {
+            let _ = p.feed(old_marker.clone(), 16_000);
+        }
+        // Short gap (< 500ms) must NOT flush preroll.
+        p.last_feed_at = Some(t0);
+        assert!(!p.reset_stale_preroll_if_gap(t0 + std::time::Duration::from_millis(200)));
+        assert!(!p.preroll.is_empty());
+
+        // Long idle gap (>= 500ms) MUST flush stale preroll and lead_pcm.
+        assert!(p.reset_stale_preroll_if_gap(t0 + std::time::Duration::from_millis(800)));
+        assert!(p.preroll.is_empty());
+        assert!(p.lead_pcm.is_empty());
+
+        // Now feed a fresh utterance; stale old_marker must NOT appear in pcm or lead_pcm.
+        for _ in 0..4 {
+            let _ = p.feed(new_speech.clone(), 16_000);
+        }
+        let mut seg = None;
+        for _ in 0..10 {
+            if let FeedOutcome::Segment(Some(s)) = p.feed(quiet.clone(), 16_000) {
+                seg = Some(s);
+                break;
+            }
+        }
+        let seg = seg.expect("fresh segment must close");
+        assert!(
+            !seg.pcm.contains(&333) && !seg.lead_pcm.contains(&333),
+            "stale pre-gap preroll must never leak into post-gap utterance"
+        );
+    }
+
+    #[test]
+    fn effective_control_only_allows_leading_tail_blind_grazing_only() {
+        let mk = |control_only: bool, tail_blind_only: bool, speech: bool| SourceSpan {
+            provenance: crate::gateway::InputProvenance::default(),
+            offset_samples: 0,
+            samples: 1280,
+            control_only,
+            wake_ack_overlap: false,
+            tail_blind_only,
+            speech,
+        };
+
+        // 2 leading tail_blind_only preroll blocks + 5 clean speech blocks -> NOT control_only.
+        let clean_followup = CaptureProvenance {
+            spans: vec![
+                mk(true, true, false),
+                mk(true, true, true),
+                mk(false, false, true),
+                mk(false, false, true),
+                mk(false, false, true),
+                mk(false, false, true),
+                mk(false, false, true),
+                mk(false, false, false),
+            ],
+        };
+        assert!(!clean_followup.effective_control_only());
+
+        // Pure echo inside tail_blind (no clean speech after) -> stays control_only.
+        let pure_tail_echo = CaptureProvenance {
+            spans: vec![
+                mk(true, true, true),
+                mk(true, true, true),
+                mk(true, true, true),
+                mk(false, false, false),
+            ],
+        };
+        assert!(pure_tail_echo.effective_control_only());
+
+        // Even 1 live voice/media span (`control_only && !tail_blind_only`) -> stays control_only.
+        let live_overlap = CaptureProvenance {
+            spans: vec![
+                mk(true, false, true),
+                mk(false, false, true),
+                mk(false, false, true),
+                mk(false, false, true),
+                mk(false, false, true),
+                mk(false, false, true),
+            ],
+        };
+        assert!(live_overlap.effective_control_only());
+
+        // Too many leading tail_blind blocks (> 3) -> stays control_only.
+        let long_tail = CaptureProvenance {
+            spans: vec![
+                mk(true, true, true),
+                mk(true, true, true),
+                mk(true, true, true),
+                mk(true, true, true),
+                mk(false, false, true),
+                mk(false, false, true),
+                mk(false, false, true),
+                mk(false, false, true),
+                mk(false, false, true),
+            ],
+        };
+        assert!(long_tail.effective_control_only());
+    }
+
+    #[test]
+    fn allows_wake_ack_followup_accepts_post_ack_tail_blind_bridge_and_rejects_answer_overlap() {
+        let mk =
+            |control_only: bool, wake_ack_overlap: bool, tail_blind_only: bool, speech: bool| {
+                SourceSpan {
+                    provenance: crate::gateway::InputProvenance::default(),
+                    offset_samples: 0,
+                    samples: 1280,
+                    control_only,
+                    wake_ack_overlap,
+                    tail_blind_only,
+                    speech,
+                }
+            };
+
+        let ack = mk(true, true, false, true);
+        let tail = mk(true, false, true, true);
+        let answer = mk(true, false, false, true);
+        let clean_speech = mk(false, false, false, true);
+        let clean_quiet = mk(false, false, false, false);
+
+        // [wake_ack_overlap, tail_blind_only, clean_speech] -> true
+        assert!(CaptureProvenance {
+            spans: vec![ack.clone(), tail.clone(), clean_speech.clone()],
+        }
+        .allows_wake_ack_followup());
+
+        // [control_only (answer voice), clean_speech] -> false
+        assert!(!CaptureProvenance {
+            spans: vec![answer.clone(), clean_speech.clone()],
+        }
+        .allows_wake_ack_followup());
+
+        // Mixed wake_ack_overlap + answer voice control_only -> false
+        assert!(!CaptureProvenance {
+            spans: vec![ack.clone(), answer, clean_speech.clone()],
+        }
+        .allows_wake_ack_followup());
+
+        // Pure post-answer tail_blind_only (zero wake_ack_overlap) -> false
+        assert!(!CaptureProvenance {
+            spans: vec![
+                tail.clone(),
+                tail.clone(),
+                tail.clone(),
+                tail.clone(),
+                clean_speech.clone(),
+            ],
+        }
+        .allows_wake_ack_followup());
+
+        // Pre-ack tail_blind_only before wake_ack_overlap -> false
+        assert!(!CaptureProvenance {
+            spans: vec![tail.clone(), ack.clone(), clean_speech],
+        }
+        .allows_wake_ack_followup());
+
+        // [wake_ack_overlap, tail_blind_only] (no trailing clean speech) -> false
+        assert!(!CaptureProvenance {
+            spans: vec![ack.clone(), tail.clone()],
+        }
+        .allows_wake_ack_followup());
+
+        // Trailing quiet only (no clean speech) -> false
+        assert!(!CaptureProvenance {
+            spans: vec![ack, tail, clean_quiet],
+        }
+        .allows_wake_ack_followup());
+    }
+
+    #[test]
+    fn wake_slice_with_dur_handles_zipformer_lookahead_oneshot_bare_wake_and_paused_oneshot() {
+        let cfg = VadConfig::default();
+        let wake_blk = vec![11110i16; 1280];
+        let cmd_blk = vec![22220i16; 1280];
+        let quiet = vec![0i16; 1280];
+
+        // 1) Tight oneshot ("你好小智，几点了？"): wake_dur_ms = Some(640) (8 blocks),
+        //    15 total speech blocks (8 wake + 7 command), cut_cursor arrives late at
+        //    block 14 due to Zipformer chunk-16 right-context lookahead -> MUST classify
+        //    as CommandSliced and preserve the post-wake command blocks (blocks ~7..15).
+        let mut p1 = MicProcessor::new(cfg.clone());
+        for _ in 0..8 {
+            let _ = p1.feed(wake_blk.clone(), 16_000);
+        }
+        for _ in 0..6 {
+            let _ = p1.feed(cmd_blk.clone(), 16_000);
+        }
+        let late_cursor = p1.current_block_cursor(); // block 14
+        assert_eq!(late_cursor, 14);
+        p1.arm_wake_slice_with_dur(late_cursor, Some(640));
+        let _ = p1.feed(cmd_blk.clone(), 16_000); // block 15
+        let mut seg1 = None;
+        for _ in 0..12 {
+            if let FeedOutcome::Segment(Some(s)) = p1.feed(quiet.clone(), 16_000) {
+                seg1 = Some(s);
+                break;
+            }
+        }
+        let seg1 = seg1.expect("tight oneshot segment must close");
+        assert_eq!(
+            seg1.wake_slice,
+            WakeSliceOutcome::CommandSliced,
+            "late Zipformer lookahead cursor must not misclassify tight oneshot as BareWake"
+        );
+        assert!(seg1.lead_pcm.is_empty());
+        assert_eq!(seg1.provenance.samples(), seg1.pcm.len());
+        let cmd_samples = seg1.pcm.iter().filter(|&&s| s == 22220).count();
+        let wake_samples = seg1.pcm.iter().filter(|&&s| s == 11110).count();
+        assert_eq!(
+            cmd_samples,
+            7 * 1280,
+            "all 7 post-wake command blocks must be preserved"
+        );
+        assert_eq!(
+            wake_samples, 1280,
+            "effective_cut < cut_idx must retain exactly 1 block (80 ms) safety overlap"
+        );
+
+        // 2a) Genuine bare wake: wake_dur_ms = Some(680) with 8 speech blocks -> BareWake.
+        let mut p2a = MicProcessor::new(cfg.clone());
+        for _ in 0..8 {
+            let _ = p2a.feed(wake_blk.clone(), 16_000);
+        }
+        p2a.arm_wake_slice_with_dur(p2a.current_block_cursor(), Some(680));
+        let mut seg2a = None;
+        for _ in 0..12 {
+            if let FeedOutcome::Segment(Some(s)) = p2a.feed(quiet.clone(), 16_000) {
+                seg2a = Some(s);
+                break;
+            }
+        }
+        assert_eq!(
+            seg2a.expect("bare wake 680ms closes").wake_slice,
+            WakeSliceOutcome::BareWake
+        );
+
+        // 2b) Genuine bare wake: wake_dur_ms = Some(840) with 10 speech blocks -> BareWake.
+        let mut p2b = MicProcessor::new(cfg.clone());
+        for _ in 0..10 {
+            let _ = p2b.feed(wake_blk.clone(), 16_000);
+        }
+        p2b.arm_wake_slice_with_dur(p2b.current_block_cursor(), Some(840));
+        let mut seg2b = None;
+        for _ in 0..12 {
+            if let FeedOutcome::Segment(Some(s)) = p2b.feed(quiet.clone(), 16_000) {
+                seg2b = Some(s);
+                break;
+            }
+        }
+        assert_eq!(
+            seg2b.expect("bare wake 840ms closes").wake_slice,
+            WakeSliceOutcome::BareWake
+        );
+
+        // 3) Paused oneshot: wake_dur_ms = Some(640) (8 wake blocks), 2 quiet blocks,
+        //    6 command blocks, late cut_cursor -> CommandSliced starting right before command.
+        let mut p3 = MicProcessor::new(cfg);
+        for _ in 0..8 {
+            let _ = p3.feed(wake_blk.clone(), 16_000);
+        }
+        for _ in 0..2 {
+            let _ = p3.feed(quiet.clone(), 16_000);
+        }
+        for _ in 0..5 {
+            let _ = p3.feed(cmd_blk.clone(), 16_000);
+        }
+        let late_paused_cursor = p3.current_block_cursor(); // block 15
+        p3.arm_wake_slice_with_dur(late_paused_cursor, Some(640));
+        let _ = p3.feed(cmd_blk.clone(), 16_000); // block 16
+        let mut seg3 = None;
+        for _ in 0..12 {
+            if let FeedOutcome::Segment(Some(s)) = p3.feed(quiet.clone(), 16_000) {
+                seg3 = Some(s);
+                break;
+            }
+        }
+        let seg3 = seg3.expect("paused oneshot closes");
+        assert_eq!(seg3.wake_slice, WakeSliceOutcome::CommandSliced);
+        assert_eq!(seg3.provenance.samples(), seg3.pcm.len());
+        assert!(
+            !seg3.pcm.contains(&11110),
+            "paused oneshot must slice cleanly past the pause with zero wake PCM"
+        );
+        assert_eq!(
+            seg3.pcm.iter().filter(|&&s| s == 22220).count(),
+            6 * 1280,
+            "paused oneshot must preserve all 6 command blocks"
         );
     }
 }

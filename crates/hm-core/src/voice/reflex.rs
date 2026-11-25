@@ -86,10 +86,17 @@ impl VoicePipeline {
         lag_ms: Option<u64>,
         rms_dbfs: Option<f32>,
     ) -> Option<crate::arbitration::Claim> {
-        if self.arbiter.peer_count() == 0 {
-            // A node alone in the house has nothing to arbitrate: behave
-            // exactly as before arbitration existed, and do not fill the log
-            // with decisions that could only ever be "me".
+        if !self.device_in_household_acoustic_domain(device) {
+            // Portable/mobile gateways (e.g. non-loopback `android-v2`) sit outside
+            // the fixed household speaker acoustic domain: never block them on
+            // household arbitration or submit their claims into the arbiter.
+            return None;
+        }
+        if self.arbiter.peer_count() == 0 && self.hub.online_household_acoustic_device_count() <= 1
+        {
+            // A node alone in the house with a single online household speaker has
+            // nothing to arbitrate: behave exactly as before arbitration existed, and
+            // do not fill the log with decisions that could only ever be "me".
             return None;
         }
         let heard = ts.saturating_sub(lag_ms.unwrap_or(0)) as i64;
@@ -109,13 +116,7 @@ impl VoicePipeline {
     /// therefore costs nothing audible: the window closes, the verdict is
     /// recorded as lost, and the transcript path is vetoed by
     /// [`Self::asr_wake_arbitrated_out`].
-    pub(super) fn spawn_late_check(
-        self: &Arc<Self>,
-        id: String,
-        me: String,
-        device: String,
-        _deferred_takeover: bool,
-    ) {
+    pub(super) fn spawn_late_check(self: &Arc<Self>, id: String, me: String, device: String) {
         let pipe = self.clone();
         tokio::spawn(async move {
             let started = std::time::Instant::now();
@@ -138,12 +139,13 @@ impl VoicePipeline {
             }
             // A late claim took it. Record the verdict first: the ASR path
             // reads it when the transcript of this utterance arrives.
-            *crate::lock_or_recover(&pipe.last_arbitration, "voice.last_arbitration") = Some((
+            pipe.record_last_arbitration(
+                &me,
                 false,
                 crate::id::now_ms(),
                 decision.winner.device.clone(),
                 false,
-            ));
+            );
             pipe.note(
                 "arbitration_lost",
                 json!({ "device": me, "late": true, "claims": claims,
@@ -159,6 +161,34 @@ impl VoicePipeline {
         });
     }
 
+    /// Record a per-device arbitration verdict with bounded map growth so
+    /// long-running multi-gateway Cores never accumulate unbounded device keys.
+    pub(super) fn record_last_arbitration(
+        &self,
+        device: &str,
+        won: bool,
+        at_ms: u64,
+        winner: String,
+        consumed: bool,
+    ) {
+        const MAX_LAST_ARBITRATION_DEVICES: usize = 64;
+        const STALE_ARBITRATION_MS: u64 = 30_000;
+        let mut slots = crate::lock_or_recover(&self.last_arbitration, "voice.last_arbitration");
+        if slots.len() >= MAX_LAST_ARBITRATION_DEVICES && !slots.contains_key(device) {
+            slots.retain(|_, (_, ts, _, _)| at_ms.saturating_sub(*ts) <= STALE_ARBITRATION_MS);
+            if slots.len() >= MAX_LAST_ARBITRATION_DEVICES {
+                if let Some(oldest_key) = slots
+                    .iter()
+                    .min_by_key(|(_, (_, ts, _, _))| *ts)
+                    .map(|(k, _)| k.clone())
+                {
+                    slots.remove(&oldest_key);
+                }
+            }
+        }
+        slots.insert(device.to_string(), (won, at_ms, winner, consumed));
+    }
+
     /// Did the spotter path already decide that ANOTHER speaker owns the
     /// utterance this transcript belongs to?
     ///
@@ -167,15 +197,21 @@ impl VoicePipeline {
     /// a node whose spotter missed the word (or a house with arbitration off)
     /// must keep waking from the transcript exactly as before.
     pub(super) fn asr_wake_arbitrated_out(&self, device: &str) -> bool {
-        if crate::lock_or_recover(&self.settings, "voice.settings").wake_arbitration
+        if !self.device_in_household_acoustic_domain(device) {
+            return false;
+        }
+        if crate::lock_or_recover(&self.settings, "voice.settings")
+            .effective_for(device)
+            .wake_arbitration
             != WakeArbitration::Enforce
         {
             return false;
         }
         const ASR_ARBITRATION_GRACE_MS: u64 = 4000;
         let winner = {
-            let mut slot = crate::lock_or_recover(&self.last_arbitration, "voice.last_arbitration");
-            let Some((won, at_ms, winner, consumed)) = slot.as_mut() else {
+            let mut slots =
+                crate::lock_or_recover(&self.last_arbitration, "voice.last_arbitration");
+            let Some((won, at_ms, winner, consumed)) = slots.get_mut(device) else {
                 return false;
             };
             if *won
@@ -203,8 +239,12 @@ impl VoicePipeline {
     /// `Arbiter`'s sliding window of recent peer claims), or if the spotter
     /// (`Keyword` wake) already fired within `REFLEX_DEDUPE_MS`.
     pub(super) async fn admit_asr_wake(&self, device: &str, wake: &str, text: &str) -> bool {
-        let arbitration = crate::lock_or_recover(&self.settings, "voice.settings").wake_arbitration;
-        if arbitration == WakeArbitration::Enforce {
+        let arbitration = crate::lock_or_recover(&self.settings, "voice.settings")
+            .effective_for(device)
+            .wake_arbitration;
+        if arbitration == WakeArbitration::Enforce
+            && self.device_in_household_acoustic_domain(device)
+        {
             let deadline = std::time::Instant::now()
                 + std::time::Duration::from_millis(crate::arbitration::WINDOW_MS + 50);
             while self.arbiter.is_exchanging(device) && std::time::Instant::now() < deadline {
@@ -214,8 +254,9 @@ impl VoicePipeline {
                 return false;
             }
             let recently_won = {
-                let slot = crate::lock_or_recover(&self.last_arbitration, "voice.last_arbitration");
-                slot.as_ref().is_some_and(|(won, at_ms, winner, _)| {
+                let slots =
+                    crate::lock_or_recover(&self.last_arbitration, "voice.last_arbitration");
+                slots.get(device).is_some_and(|(won, at_ms, winner, _)| {
                     *won && winner == device
                         && id::now_ms().saturating_sub(*at_ms)
                             <= (crate::arbitration::COALESCE_MS as u64) * 2
@@ -226,7 +267,9 @@ impl VoicePipeline {
                     .arbiter
                     .passive_presence_for(device)
                     .unwrap_or_else(|| self.build_claim(device, id::now_ms() as i64, None, ""));
-                let all = if self.arbiter.peer_count() > 0 {
+                let all = if self.arbiter.peer_count() > 0
+                    || self.hub.online_household_acoustic_device_count() > 1
+                {
                     let round_id = self.arbiter.begin(local.clone());
                     let (claims, _answered, _peers) = self
                         .arbiter
@@ -247,10 +290,13 @@ impl VoicePipeline {
                 if all.len() > 1 {
                     if let Some(d) = crate::arbitration::decide_around(&local, &all, &[]) {
                         if d.winner.device != device {
-                            *crate::lock_or_recover(
-                                &self.last_arbitration,
-                                "voice.last_arbitration",
-                            ) = Some((false, id::now_ms(), d.winner.device.clone(), true));
+                            self.record_last_arbitration(
+                                device,
+                                false,
+                                id::now_ms(),
+                                d.winner.device.clone(),
+                                true,
+                            );
                             self.revoke_arbitration_loser(
                                 device,
                                 &d.winner.device,
@@ -264,10 +310,13 @@ impl VoicePipeline {
                             );
                             return false;
                         } else {
-                            *crate::lock_or_recover(
-                                &self.last_arbitration,
-                                "voice.last_arbitration",
-                            ) = Some((true, id::now_ms(), device.to_string(), false));
+                            self.record_last_arbitration(
+                                device,
+                                true,
+                                id::now_ms(),
+                                device.to_string(),
+                                false,
+                            );
                             self.arbiter.record_win(device);
                             self.claim_sovereignty(device, id::now_ms());
                         }
@@ -290,11 +339,30 @@ impl VoicePipeline {
         true
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(super) fn effective_retreat_policy(&self) -> (bool, Vec<String>) {
-        let (enabled, settings_words) = {
+        self.effective_retreat_policy_for("global")
+    }
+
+    pub(super) fn effective_retreat_policy_for(&self, device: &str) -> (bool, Vec<String>) {
+        let (enabled, has_override, settings_words) = {
             let s = crate::lock_or_recover(&self.settings, "voice.settings");
-            (s.retreat_intent, s.retreat_words.clone())
+            let eff = s.effective_for(device);
+            let has_ov = s
+                .device_overrides
+                .get(device)
+                .is_some_and(|ov| ov.retreat_words.is_some());
+            (eff.retreat_intent, has_ov, eff.retreat_words)
         };
+        if has_override {
+            let words: Vec<String> = settings_words
+                .into_iter()
+                .map(|w| w.trim().to_string())
+                .filter(|w| !w.is_empty())
+                .collect();
+            return (enabled, words);
+        }
         let cfg = crate::config::ConfigService::new(self.store.clone())
             .reflex()
             .unwrap_or_default();
@@ -314,7 +382,24 @@ impl VoicePipeline {
         (enabled, words)
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(super) fn effective_wake_words(&self) -> Vec<String> {
+        self.effective_wake_words_for("global")
+    }
+
+    pub(super) fn effective_wake_words_for(&self, device: &str) -> Vec<String> {
+        let override_words = crate::lock_or_recover(&self.settings, "voice.settings")
+            .device_overrides
+            .get(device)
+            .and_then(|ov| ov.wake_words.clone());
+        if let Some(ov_words) = override_words {
+            return ov_words
+                .into_iter()
+                .map(|w| w.trim().to_string())
+                .filter(|w| !w.is_empty())
+                .collect();
+        }
         let cfg = crate::config::ConfigService::new(self.store.clone())
             .reflex()
             .unwrap_or_default();
@@ -407,7 +492,6 @@ impl VoicePipeline {
                     lag_ms,
                     acoustics.clone(),
                     true,
-                    false,
                 );
             }
             let (claims, answered, peers) = pipe
@@ -445,10 +529,10 @@ impl VoicePipeline {
                 );
                 return;
             }
-            if answered == 0 {
+            if peers > 0 && answered == 0 && claims.len() < 2 {
                 pipe.arbiter.finish(&id);
-                // No peer could be reached (or none has a token): this node is
-                // on its own, exactly as before. Said out loud, never silent.
+                // No remote peer could be reached and no local sibling contended:
+                // this node is on its own, exactly as before. Said out loud, never silent.
                 pipe.note(
                     "arbitration_unavailable",
                     json!({ "device": me, "peers": peers, "why": "no peer answered the claim",
@@ -456,7 +540,7 @@ impl VoicePipeline {
                 );
                 pipe.on_keyword_at(
                     &device, &keyword, ts, fed_ms, self_heard, provenance, rms_dbfs, lag_ms,
-                    acoustics, true, false,
+                    acoustics, true,
                 );
                 return;
             }
@@ -468,8 +552,7 @@ impl VoicePipeline {
                     .as_ref()
                     .map(|d| d.winner.device.clone())
                     .unwrap_or_else(|| me.clone());
-                *crate::lock_or_recover(&pipe.last_arbitration, "voice.last_arbitration") =
-                    Some((won, crate::id::now_ms(), winner, false));
+                pipe.record_last_arbitration(&me, won, crate::id::now_ms(), winner, false);
             }
             let (winner_dev, winner_room, sov_reason) = match decision.as_ref() {
                 Some(d) => {
@@ -502,14 +585,9 @@ impl VoicePipeline {
                 pipe.claim_sovereignty(&device, crate::id::now_ms());
                 // Claims keep arriving for up to COALESCE_MS after ours (the
                 // same phrase was measured 757 ms apart on two speakers), so
-                // "won" here is provisional. If margin < 6.0 dB (or solo with
-                // reachable peers), defer media takeover & wake_ack until
-                // COALESCE_MS confirms.
-                let defer_takeover = decision
-                    .as_ref()
-                    .and_then(|d| d.margin_db)
-                    .is_none_or(|m| m < 6.0);
-                pipe.spawn_late_check(id.clone(), me.clone(), device.clone(), defer_takeover);
+                // "won" here is provisional and `spawn_late_check` revokes if a
+                // stronger peer claim arrives within COALESCE_MS.
+                pipe.spawn_late_check(id.clone(), me.clone(), device.clone());
                 pipe.note(
                     if decision
                         .as_ref()
@@ -524,21 +602,11 @@ impl VoicePipeline {
                         "arbitration_won"
                     },
                     json!({ "device": me, "answered": answered, "peers": peers,
-                            "defer_takeover": defer_takeover,
                             "claims": claims, "decision": detail }),
                 );
                 pipe.on_keyword_at(
-                    &device,
-                    &keyword,
-                    ts,
-                    fed_ms,
-                    self_heard,
-                    provenance,
-                    rms_dbfs,
-                    lag_ms,
-                    acoustics,
-                    true,
-                    defer_takeover,
+                    &device, &keyword, ts, fed_ms, self_heard, provenance, rms_dbfs, lag_ms,
+                    acoustics, true,
                 );
             } else {
                 pipe.arbiter.finish(&id);
@@ -716,7 +784,6 @@ impl VoicePipeline {
             None,
             WakeAcoustics::default(),
             false,
-            false,
         )
     }
 
@@ -733,7 +800,6 @@ impl VoicePipeline {
         lag_ms: Option<u64>,
         mut acoustics: WakeAcoustics,
         arbitrated: bool,
-        defer_takeover: bool,
     ) {
         if !arbitrated {
             if self.check_fleet_bleed(device, keyword, self_heard, fed_ms) {
@@ -744,7 +810,7 @@ impl VoicePipeline {
         let Some(identity) = self.source_identity(device, &provenance, "keyword") else {
             return;
         };
-        if self.reflex_intent(keyword) == Some(interaction::KeywordIntent::Retreat) {
+        if self.reflex_intent_for(device, keyword) == Some(interaction::KeywordIntent::Retreat) {
             let suppress_own_retreat =
                 if matches!(&provenance.origin, crate::gateway::InputOrigin::Legacy) {
                     let cal_rms = self.calibrated_keyword_rms(device, rms_dbfs);
@@ -796,7 +862,9 @@ impl VoicePipeline {
             }
             return;
         }
-        let enabled = crate::lock_or_recover(&self.settings, "voice.settings").keyword_interrupt;
+        let enabled = crate::lock_or_recover(&self.settings, "voice.settings")
+            .effective_for(device)
+            .keyword_interrupt;
         let muted = crate::lock_or_recover(&self.states, "voice.states")
             .get(device)
             .and_then(|st| st.muted)
@@ -825,7 +893,7 @@ impl VoicePipeline {
         // the only place a spotted string is mapped to an intent. A word the
         // device still spots but the table no longer has (a stale file) is a
         // no-action fact, never a guess.
-        let Some(intent) = self.reflex_intent(keyword) else {
+        let Some(intent) = self.reflex_intent_for(device, keyword) else {
             self.bump_reflex(device, keyword, false);
             if let Some(st) = crate::lock_or_recover(&self.states, "voice.states").get_mut(device) {
                 st.keyword_ignored += 1;
@@ -852,7 +920,7 @@ impl VoicePipeline {
                 .map(|text| {
                     mic::wake_span(&text, keyword).is_some()
                         || self
-                            .effective_wake_words()
+                            .effective_wake_words_for(device)
                             .iter()
                             .any(|w| mic::wake_span(&text, w).is_some())
                 })
@@ -893,8 +961,9 @@ impl VoicePipeline {
                 || self.media_state(device) == Some(crate::tool::music::MediaState::Playing);
             if acoustics.tier.as_deref() == Some("suspect") && !playback_active {
                 self.bump_reflex(device, keyword, false);
-                let proactive =
-                    crate::lock_or_recover(&self.settings, "voice.settings").proactive_asr_wake;
+                let proactive = crate::lock_or_recover(&self.settings, "voice.settings")
+                    .effective_for(device)
+                    .proactive_asr_wake;
                 if let Some(st) =
                     crate::lock_or_recover(&self.states, "voice.states").get_mut(device)
                 {
@@ -919,19 +988,21 @@ impl VoicePipeline {
                 // Capture the exact `wakeup_end` block cursor BEFORE any 200 ms
                 // arbitration delay so Tier-2 timeline slicing does not drift
                 // into a one-shot command spoken during arbitration.
-                acoustics.wake_end_cursor = crate::lock_or_recover(&self.mic, "voice.mic")
-                    .get(device)
-                    .map(|p| {
-                        p.current_block_cursor()
-                            .saturating_sub(lag_ms.unwrap_or(0) / 80)
-                    });
+                let cursor = self
+                    .mic_arc(device)
+                    .map(|arc| crate::lock_or_recover(&arc, "voice.mic.dev").current_block_cursor())
+                    .unwrap_or(0);
+                acoustics.wake_end_cursor = Some(cursor.saturating_sub(lag_ms.unwrap_or(0) / 80));
                 let session_open_now = crate::lock_or_recover(&self.states, "voice.states")
                     .get(device)
                     .is_some_and(|st| st.session_open(now));
                 if !playback_active && !session_open_now {
-                    let (elapsed_ms, control_only) = crate::lock_or_recover(&self.mic, "voice.mic")
-                        .get(device)
-                        .map(|p| (p.open_speech_elapsed_ms(), p.open_is_control_only()))
+                    let (elapsed_ms, control_only) = self
+                        .mic_arc(device)
+                        .map(|arc| {
+                            let p = crate::lock_or_recover(&arc, "voice.mic.dev");
+                            (p.open_speech_elapsed_ms(), p.open_is_control_only())
+                        })
                         .unwrap_or((0, false));
                     if !control_only {
                         let wake_span_ms = acoustics
@@ -943,6 +1014,7 @@ impl VoicePipeline {
                             self.bump_reflex(device, keyword, false);
                             let proactive =
                                 crate::lock_or_recover(&self.settings, "voice.settings")
+                                    .effective_for(device)
                                     .proactive_asr_wake;
                             if let Some(st) =
                                 crate::lock_or_recover(&self.states, "voice.states").get_mut(device)
@@ -974,7 +1046,10 @@ impl VoicePipeline {
         // wait for another room's opinion.
         if !arbitrated && intent == interaction::KeywordIntent::Wake {
             if let Some(claim) = self.wake_claim_for(device, keyword, ts, lag_ms, rms_dbfs) {
-                match crate::lock_or_recover(&self.settings, "voice.settings").wake_arbitration {
+                match crate::lock_or_recover(&self.settings, "voice.settings")
+                    .effective_for(device)
+                    .wake_arbitration
+                {
                     WakeArbitration::Off => {}
                     WakeArbitration::Observe => {
                         // Record what WOULD have happened, then answer as
@@ -1042,7 +1117,7 @@ impl VoicePipeline {
         let epoch = match intent {
             interaction::KeywordIntent::Wake => {
                 // M3 / serial 91-A: pause media OUTSIDE `voice.states` and strictly BEFORE stop-all.
-                let (policy, context_ms) = self.context_policy();
+                let (policy, context_ms) = self.context_policy_for(device);
                 if !crate::lock_or_recover(&self.states, "voice.states")
                     .get(device)
                     .is_some_and(|st| st.participation.identity() == identity)
@@ -1054,15 +1129,7 @@ impl VoicePipeline {
                 } else {
                     None
                 };
-                let _ = defer_takeover;
-                let (
-                    result,
-                    epoch,
-                    permit,
-                    bookmark,
-                    bare_wake_closed_during_arbitration,
-                    arm_slice_cursor,
-                ) = {
+                let (result, epoch, permit, bookmark, bare_wake_closed_during_arbitration) = {
                     let mut states = crate::lock_or_recover(&self.states, "voice.states");
                     let Some(st) = states.get_mut(device) else {
                         return;
@@ -1095,9 +1162,9 @@ impl VoicePipeline {
                         return;
                     };
                     self.restore_wake_capture_locked(device, st, capture, &provenance, context);
-                    let mic_closed_ms = crate::lock_or_recover(&self.mic, "voice.mic")
-                        .get(device)
-                        .and_then(|p| p.last_close_ms());
+                    let mic_closed_ms = self.mic_arc(device).and_then(|arc| {
+                        crate::lock_or_recover(&arc, "voice.mic.dev").last_close_ms()
+                    });
                     let last_close_ms = match (st.mic_last_close_ms, mic_closed_ms) {
                         (Some(a), Some(b)) => Some(a.max(b)),
                         (a, b) => a.or(b),
@@ -1121,38 +1188,28 @@ impl VoicePipeline {
                     } else {
                         Some("keyword")
                     };
-                    // Arm Tier-2 physical timeline slicing ONLY when a capture lease was
-                    // actually transferred (never on a closed segment or media interrupt,
-                    // which would risk slicing a subsequent follow-up utterance).
-                    let arm_slice_cursor = if !content.media
+                    // Arm Tier-2 physical timeline slicing while still holding `voice.states`
+                    // (respecting `voice.states -> voice.mic -> voice.mic.dev` lock order) so
+                    // the `spawn_blocking` VAD worker cannot close the segment before arming.
+                    if !content.media
                         && st.input.is_some()
                         && acoustics.tier.as_deref() == Some("real")
                         && wake_timeline_slice_enabled()
                     {
-                        acoustics.wake_end_cursor
-                    } else {
-                        None
-                    };
+                        if let Some(end_cursor) = acoustics.wake_end_cursor {
+                            if let Some(arc) = self.mic_arc(device) {
+                                crate::lock_or_recover(&arc, "voice.mic.dev")
+                                    .arm_wake_slice_with_dur(end_cursor, acoustics.wake_dur_ms);
+                            }
+                        }
+                    }
                     let permit = OutputPermit {
                         generation: st.participation.generation(),
                         stop_epoch: st.stop_epoch,
                         request: None,
                     };
-                    (
-                        result,
-                        st.kws_epoch,
-                        permit,
-                        bookmark,
-                        bare_wake_closed,
-                        arm_slice_cursor,
-                    )
+                    (result, st.kws_epoch, permit, bookmark, bare_wake_closed)
                 };
-                if let Some(end_cursor) = arm_slice_cursor {
-                    if let Some(p) = crate::lock_or_recover(&self.mic, "voice.mic").get_mut(device)
-                    {
-                        p.arm_wake_slice(end_cursor);
-                    }
-                }
                 self.claim_sovereignty(device, now);
                 if !bookmark.is_null() {
                     self.note(
@@ -1270,25 +1327,34 @@ impl VoicePipeline {
     /// file the device ends up with is the device's fact (receipt + hash);
     /// this only says the frame left.
     ///
+    /// Resolve effective `(kws_threshold, kws_score)` for `device` using live
+    /// hardware-family classification from `DeviceHub` plus per-device overrides.
+    pub fn effective_kws_for(&self, device: &str) -> (f64, f64) {
+        let kws_class = self.hub.kws_device_class(device);
+        crate::lock_or_recover(&self.settings, "voice.settings")
+            .effective_kws_for(device, kws_class)
+    }
+
     /// Contract v2 §2.5 (#5, 2026-11-16): the same frame also carries the
     /// words whose intent is `retreat` and a hash of the word→intent map, so
     /// the device can cut its own audio on an exit word without waiting for
     /// this core. It still reports the hit north; `close_session` remains the
     /// single authority over the session.
     pub fn deploy_reflex(&self, device: &str) -> Result<serde_json::Value, String> {
-        let cfg = crate::config::ConfigService::new(self.store.clone())
-            .reflex()
-            .map_err(|e| e.to_string())?;
+        let settings_snap = self.settings_snapshot();
+        let cfg = crate::config_delivery::resolve_reflex_config_for_device(
+            &self.store,
+            &settings_snap,
+            device,
+        )?;
         let compiled = crate::config::compile_keywords(&cfg)?;
         let hash = crate::config::fnv1a_hex(compiled.as_bytes());
         let words = compiled.lines().count() as u64;
         let (retreat_words, intents_hash) = crate::config::reflex_intent_map(&cfg);
         // Contract v2 #4 (2026-11-16): the spotter's sensitivity rides every
         // deploy, so "save the slider" and "the device uses it" are one path.
-        let settings = crate::lock_or_recover(&self.settings, "voice.settings");
-        let kws_threshold = settings.kws_threshold;
-        let kws_score = settings.kws_score;
-        drop(settings);
+        let (kws_threshold, kws_score) =
+            settings_snap.effective_kws_for(device, self.hub.kws_device_class(device));
         let sent_ms = id::now_ms();
         if let Some(st) = crate::lock_or_recover(&self.states, "voice.states").get_mut(device) {
             st.reflex_deploy = Some(ReflexDeploy {
@@ -1519,13 +1585,39 @@ impl VoicePipeline {
     /// word (whole last sentence, so a story containing the word is not a
     /// command)? The spotter and the text layer share the TABLE, not the
     /// matching mechanism.
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(super) fn reflex_text_command(
         &self,
+        text: &str,
+    ) -> Option<(String, interaction::KeywordIntent)> {
+        self.reflex_text_command_for("global", text)
+    }
+
+    pub(super) fn reflex_text_command_for(
+        &self,
+        device: &str,
         text: &str,
     ) -> Option<(String, interaction::KeywordIntent)> {
         let said = normalize_utterance(last_sentence(text));
         if said.is_empty() || said.chars().count() > 12 {
             return None;
+        }
+        if let Some(w) = self
+            .effective_wake_words_for(device)
+            .into_iter()
+            .find(|w| normalize_utterance(w) == said)
+        {
+            return Some((w, interaction::KeywordIntent::Wake));
+        }
+        let retreat_ov = crate::lock_or_recover(&self.settings, "voice.settings")
+            .device_overrides
+            .get(device)
+            .and_then(|o| o.retreat_words.clone());
+        if let Some(words) = &retreat_ov {
+            if let Some(w) = words.iter().find(|w| normalize_utterance(w) == said) {
+                return Some((w.clone(), interaction::KeywordIntent::Retreat));
+            }
         }
         let cfg = crate::config::ConfigService::new(self.store.clone())
             .reflex()
@@ -1534,27 +1626,70 @@ impl VoicePipeline {
             .words
             .iter()
             .find(|w| w.enabled && normalize_utterance(&w.text) == said)?;
-        let intent = self.reflex_intent(&w.text)?;
+        let intent = self.reflex_intent_for(device, &w.text)?;
         Some((w.text.clone(), intent))
     }
 
     /// R1j/P1: one lookup from a spotted string to the intent the reflex
     /// table assigns it. Disabled words and unknown words are None.
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(super) fn reflex_intent(&self, keyword: &str) -> Option<interaction::KeywordIntent> {
+        self.reflex_intent_for("global", keyword)
+    }
+
+    pub(super) fn reflex_intent_for(
+        &self,
+        device: &str,
+        keyword: &str,
+    ) -> Option<interaction::KeywordIntent> {
+        let (wake_ov, retreat_ov) = {
+            let s = crate::lock_or_recover(&self.settings, "voice.settings");
+            let ov = s.device_overrides.get(device);
+            (
+                ov.and_then(|o| o.wake_words.clone()),
+                ov.and_then(|o| o.retreat_words.clone()),
+            )
+        };
+        if let Some(words) = &wake_ov {
+            if words.iter().any(|w| w.trim() == keyword) {
+                return Some(interaction::KeywordIntent::Wake);
+            }
+        }
+        if let Some(words) = &retreat_ov {
+            if words.iter().any(|w| w.trim() == keyword) {
+                return Some(interaction::KeywordIntent::Retreat);
+            }
+        }
         let cfg = crate::config::ConfigService::new(self.store.clone())
             .reflex()
             .ok()?;
         if let Some(w) = cfg.words.iter().find(|w| w.enabled && w.text == keyword) {
-            return Some(match w.intent {
-                crate::config::ReflexIntent::Wake => interaction::KeywordIntent::Wake,
-                crate::config::ReflexIntent::Retreat => interaction::KeywordIntent::Retreat,
-                crate::config::ReflexIntent::Pause => interaction::KeywordIntent::Pause,
-                crate::config::ReflexIntent::Continue => interaction::KeywordIntent::Continue,
-                crate::config::ReflexIntent::Next => interaction::KeywordIntent::Next,
-                crate::config::ReflexIntent::Stop => interaction::KeywordIntent::Stop,
-            });
+            return match w.intent {
+                crate::config::ReflexIntent::Wake => {
+                    if wake_ov.is_some() {
+                        None
+                    } else {
+                        Some(interaction::KeywordIntent::Wake)
+                    }
+                }
+                crate::config::ReflexIntent::Retreat => {
+                    if retreat_ov.is_some() {
+                        None
+                    } else {
+                        Some(interaction::KeywordIntent::Retreat)
+                    }
+                }
+                crate::config::ReflexIntent::Pause => Some(interaction::KeywordIntent::Pause),
+                crate::config::ReflexIntent::Continue => Some(interaction::KeywordIntent::Continue),
+                crate::config::ReflexIntent::Next => Some(interaction::KeywordIntent::Next),
+                crate::config::ReflexIntent::Stop => Some(interaction::KeywordIntent::Stop),
+            };
         }
-        self.effective_wake_words()
+        if wake_ov.is_some() {
+            return None;
+        }
+        self.effective_wake_words_for(device)
             .iter()
             .any(|w| w == keyword)
             .then_some(interaction::KeywordIntent::Wake)
@@ -1639,8 +1774,11 @@ impl VoicePipeline {
         residual_db: f32,
         ref_locked: bool,
     ) {
-        let enabled = crate::lock_or_recover(&self.settings, "voice.settings").barge_in;
-        let protect_ms = crate::lock_or_recover(&self.settings, "voice.settings").barge_protect_ms;
+        let (enabled, protect_ms) = {
+            let s = crate::lock_or_recover(&self.settings, "voice.settings");
+            let eff = s.effective_for(device);
+            (eff.barge_in, eff.barge_protect_ms)
+        };
         let now = id::now_ms();
         // M6b: the diagnostic fields carry `null` for the device's "no
         // measurement" sentinel instead of -3.4e38 (see gateway::valid_db).
@@ -1869,7 +2007,7 @@ impl VoicePipeline {
         ts: u64,
     ) {
         let now = id::now_ms();
-        let (result, epoch, dropped_for_close) = {
+        let (result, epoch) = {
             let mut states = crate::lock_or_recover(&self.states, "voice.states");
             let Some(st) = states.get_mut(device) else {
                 return;
@@ -1893,31 +2031,15 @@ impl VoicePipeline {
             // being read. Keep it as a bookmark (RUI-local: a story
             // keeps its place and is never auto-resumed) instead of
             // leaving it "live" in the console for ever.
-            //
-            // R1f object model: while a close (退下) is in flight the
-            // program is being discarded, not paused — a bookmark here
-            // is the amber the user saw after saying 退下.
-            let mut dropped = false;
             if let Some(mut p) = live_program {
-                if st.participation.session.state == SessionState::Closing {
-                    dropped = true;
-                } else {
-                    p.created_ms = now;
-                    p.system_cut = false; // the person stopped it
-                    if st.paused_program.is_none() {
-                        st.paused_program = Some(p);
-                    }
+                p.created_ms = now;
+                p.system_cut = false; // the person stopped it
+                if st.paused_program.is_none() {
+                    st.paused_program = Some(p);
                 }
             }
-            (result, Some(st.stop_epoch), dropped)
+            (result, Some(st.stop_epoch))
         };
-        if dropped_for_close {
-            self.note(
-                "program_dropped_for_close",
-                json!({ "device": device, "task_id": task_id,
-                        "why": "a local stop during 退下 must not revive the bookmark" }),
-            );
-        }
         self.note(
             "stopped_locally",
             json!({ "device": device, "task_id": task_id, "reason": reason,
@@ -1971,10 +2093,11 @@ impl VoicePipeline {
         reason: &str,
         expected: Identity,
         admitted_input: Option<u64>,
+        pre_paused_media: Option<serde_json::Value>,
     ) -> Option<(interaction::Decision, Identity)> {
         let hub_live = self.effective_hub_live(device);
-        let media_playing =
-            self.media_state(device) == Some(crate::tool::music::MediaState::Playing);
+        let media_playing = pre_paused_media.is_some()
+            || self.media_state(device) == Some(crate::tool::music::MediaState::Playing);
         let (content, decision) = {
             let states = crate::lock_or_recover(&self.states, "voice.states");
             let st = states.get(device)?;
@@ -2006,7 +2129,9 @@ impl VoicePipeline {
             (content, decision)
         };
         // Serial 91-A: pause media OUTSIDE `voice.states` and strictly BEFORE stop-all.
-        let media_paused = if content.media {
+        let media_paused = if let Some(paused) = pre_paused_media {
+            Some(paused)
+        } else if content.media {
             self.pause_media_for_takeover(device)
         } else {
             None

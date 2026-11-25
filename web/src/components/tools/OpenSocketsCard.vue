@@ -6,7 +6,7 @@
  * toggle, or delete declarative socket contracts with explicit Query/Mutate
  * side-effect and JSON parameter schema.
  */
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import {
   createOpenSocket,
   deleteOpenSocket,
@@ -98,6 +98,15 @@ const methodOptions = computed(() => {
   }
   return base
 })
+
+watch(
+  () => draft.value?.effect,
+  (effect) => {
+    if (draft.value && effect === 'Query' && draft.value.method !== 'GET' && draft.value.method !== 'POST') {
+      draft.value.method = 'GET'
+    }
+  },
+)
 
 function startCreate(): void {
   formError.value = ''

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 pub type Fields = BTreeMap<String, Value>;
@@ -8,22 +9,22 @@ pub type Result<T> = std::result::Result<T, DeliveryError>;
 
 #[derive(Debug, Serialize)]
 pub struct DeliveryError {
-    pub code: &'static str,
+    pub code: Cow<'static, str>,
     pub detail: String,
     pub pointer: Option<String>,
     #[serde(skip)]
     pub status: u16,
 }
 impl DeliveryError {
-    pub fn new(code: &'static str, detail: impl Into<String>) -> Self {
+    pub fn new(code: impl Into<Cow<'static, str>>, detail: impl Into<String>) -> Self {
         Self {
-            code,
+            code: code.into(),
             detail: detail.into(),
             pointer: None,
             status: 400,
         }
     }
-    pub fn conflict(code: &'static str, detail: impl Into<String>) -> Self {
+    pub fn conflict(code: impl Into<Cow<'static, str>>, detail: impl Into<String>) -> Self {
         Self {
             status: 409,
             ..Self::new(code, detail)

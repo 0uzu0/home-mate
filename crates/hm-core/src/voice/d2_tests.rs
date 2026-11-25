@@ -700,12 +700,15 @@ fn the_asr_path_respects_a_lost_arbitration_only_while_enforcing() {
     p.set_wake_arbitration("dot2-d", WakeArbitration::Enforce, "test")
         .unwrap();
     // This node lost the same utterance to dot2-e 200 ms ago.
-    *p.last_arbitration.lock().unwrap() = Some((
-        false,
-        id::now_ms().saturating_sub(200),
-        "dot2-e".into(),
-        false,
-    ));
+    p.last_arbitration.lock().unwrap().insert(
+        "dot2-d".into(),
+        (
+            false,
+            id::now_ms().saturating_sub(200),
+            "dot2-e".into(),
+            false,
+        ),
+    );
     assert!(
         p.asr_wake_arbitrated_out("dot2-d"),
         "a loser must not wake from the transcript"
@@ -726,22 +729,42 @@ fn the_asr_path_respects_a_lost_arbitration_only_while_enforcing() {
     );
 
     // The winner's own transcript is not vetoed.
-    *p.last_arbitration.lock().unwrap() = Some((true, id::now_ms(), "dot2-d".into(), false));
+    p.last_arbitration.lock().unwrap().insert(
+        "dot2-d".into(),
+        (true, id::now_ms(), "dot2-d".into(), false),
+    );
     assert!(!p.asr_wake_arbitrated_out("dot2-d"));
 
     // A verdict older than the grace window belongs to an earlier utterance.
-    *p.last_arbitration.lock().unwrap() = Some((
-        false,
-        id::now_ms().saturating_sub(30_000),
-        "dot2-e".into(),
-        false,
-    ));
+    p.last_arbitration.lock().unwrap().insert(
+        "dot2-d".into(),
+        (
+            false,
+            id::now_ms().saturating_sub(30_000),
+            "dot2-e".into(),
+            false,
+        ),
+    );
     assert!(!p.asr_wake_arbitrated_out("dot2-d"));
+
+    // Per-device isolation: dot2-d losing arbitration must NOT veto android-2.
+    p.record_last_arbitration("dot2-d", false, id::now_ms(), "dot2-e".into(), false);
+    assert!(
+        !p.asr_wake_arbitrated_out("android-2"),
+        "a loss on dot2-d must not veto android-2"
+    );
+    assert!(
+        p.asr_wake_arbitrated_out("dot2-d"),
+        "dot2-d itself is still vetoed once"
+    );
 
     // And with arbitration off the memory is inert.
     p.set_wake_arbitration("dot2-d", WakeArbitration::Off, "test")
         .unwrap();
-    *p.last_arbitration.lock().unwrap() = Some((false, id::now_ms(), "dot2-e".into(), false));
+    p.last_arbitration.lock().unwrap().insert(
+        "dot2-d".into(),
+        (false, id::now_ms(), "dot2-e".into(), false),
+    );
     assert!(!p.asr_wake_arbitrated_out("dot2-d"));
 }
 
@@ -790,7 +813,6 @@ async fn rc2_rc3_rc4_serial94_field_audit_regressions() {
         Some(90),
         WakeAcoustics::default(),
         false,
-        false,
     );
     assert_eq!(
         p.states.lock().unwrap()[dev].participation.close_reason,
@@ -817,7 +839,6 @@ async fn rc2_rc3_rc4_serial94_field_audit_regressions() {
         Some(90),
         WakeAcoustics::default(),
         false,
-        false,
     );
     assert_eq!(
         p.states.lock().unwrap()[dev].participation.close_reason,
@@ -825,9 +846,9 @@ async fn rc2_rc3_rc4_serial94_field_audit_regressions() {
         "near-end human retreat (-17.63 dBFS) must close session"
     );
 
-    // RC-2: waking while media is playing with `defer_takeover = true` must still
-    // pause the media session before `stop_device_locked` so the MediaSession is
-    // preserved in `MediaState::Paused` instead of destroyed.
+    // RC-2: waking while media is playing must pause the media session before
+    // `stop_device_locked` so the MediaSession is preserved in
+    // `MediaState::Paused` instead of destroyed.
     let store = Arc::new(Store::open_in_memory().unwrap());
     let hub = DeviceHub::new();
     let music = crate::tool::music::MusicRuntime::new(store.clone(), hub.clone());
@@ -872,12 +893,11 @@ async fn rc2_rc3_rc4_serial94_field_audit_regressions() {
         Some(90),
         WakeAcoustics::default(),
         true,
-        true, // defer_takeover = true (Solo / < 6 dB margin)
     );
     assert_eq!(
         p_media.media_state(dev),
         Some(crate::tool::music::MediaState::Paused),
-        "media session must be cleanly paused on wake even when defer_takeover is true"
+        "media session must be cleanly paused on wake"
     );
 
     // RC-3b: `MicProcessor::promote_wake_capture` must keep `wake_ack_overlap = true`
@@ -970,7 +990,7 @@ async fn d2_rc8_in_flight_background_or_prior_asr_does_not_starve_new_wake_or_sp
         st.mic_counters.asr_inflight = 1;
         input.id
     };
-    p.mic.lock().unwrap().get_mut(dev).unwrap().reset();
+    p.mic_arc(dev).unwrap().lock().unwrap().reset();
 
     // 2) User speaks 3 confirmed blocks of "你好小智" while bg_input_id is still recognizing=true.
     for _ in 0..3 {
@@ -1014,7 +1034,7 @@ async fn d2_rc8_in_flight_background_or_prior_asr_does_not_starve_new_wake_or_sp
 
     // 4) Even if an in-flight "session" recognition was still occupying st.input when a new
     //    utterance only had 1 pending onset block at KWS wake time, KWS adopts the live onset.
-    p.mic.lock().unwrap().get_mut(dev).unwrap().reset();
+    p.mic_arc(dev).unwrap().lock().unwrap().reset();
     {
         let mut states = p.states.lock().unwrap();
         let st = states.get_mut(dev).unwrap();
@@ -1048,7 +1068,7 @@ async fn d2_rc8_in_flight_background_or_prior_asr_does_not_starve_new_wake_or_sp
     // 5) When a prior "session" recognition is in flight while a new in-session speech
     //    segment starts, and the prior recognition finishes mid-speech (`revoke_input("consumed")`),
     //    the next audio block of the ongoing speech segment automatically acquires a session lease.
-    p.mic.lock().unwrap().get_mut(dev).unwrap().reset();
+    p.mic_arc(dev).unwrap().lock().unwrap().reset();
     let prior_session_input_id = {
         let mut states = p.states.lock().unwrap();
         let st = states.get_mut(dev).unwrap();
@@ -1068,7 +1088,7 @@ async fn d2_rc8_in_flight_background_or_prior_asr_does_not_starve_new_wake_or_sp
             prov.clone(),
         );
     }
-    assert!(p.mic.lock().unwrap().get(dev).unwrap().in_speech());
+    assert!(p.mic_arc(dev).unwrap().lock().unwrap().in_speech());
     assert_eq!(
         p.states
             .lock()

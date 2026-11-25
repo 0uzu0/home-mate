@@ -106,6 +106,9 @@ export default {
   assetTestHint: '播放归档的 ERLE 刺激信号，走真实播放通路。',
   loopbackTest: 'ch8 播放自检（DAC 写入 vs 环回）',
   loopbackTestHint: '播放测试音并比较 DAC 写入与 ch8 环回：相关、延迟、满幅/静音段。',
+  micArrayTest: '7 麦阵列测量（播放探针音）',
+  micArrayTestHint: '播放测试音并分析各麦克风电平、底噪、信噪比与到达时差。',
+  probeTargetLabel: '探针目标设备',
   repairTitle: '修复',
   reapply: '重发模式请求',
   reapplyHint: '把已保存的双工请求重新下发给设备；协商结果以设备回报为准。',
@@ -167,6 +170,7 @@ export default {
   chatScopeRequired: '请先填写此范围需要的人物和设备 ID。',
   chatScopeReadbackMismatch: '无法核实已保存的范围选择，消息与选择草稿均已保留。',
   chatScopeUnavailable: '范围选择已过期或不可用。请明确重新应用或移除后继续，消息草稿已保留。',
+  chatTurnFailed: '本轮对话执行失败，未能生成回答。',
   chatScopeLegacy: '此对话不能使用请求的记忆范围。请新建会话或明确应用范围选择；旧对话历史没有被带入。',
   conversationChanged: '设备当前对话已变化，请刷新后重新确认；没有清理旧归档。',
 

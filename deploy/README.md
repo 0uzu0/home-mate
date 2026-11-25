@@ -1,6 +1,6 @@
 # 部署
 
-当前形态是每台音箱一个核心。网关只连本机回环 `127.0.0.1:8932`。不要安装 `deploy/home-mate.service`：里面的 `HM_GATEWAY_BIND` 是局域网地址，现在的核心会拒绝并退出。
+当前形态是每台音箱一个核心（本机回环 `127.0.0.1:8932` 默认开启，亦可通过 `HM_GATEWAY_ALLOW_LAN=1` 或运行时管理开关接受局域网/手机多网关并发接入），也可通过根目录 `Dockerfile` / `docker-compose.yml` 在 NAS 上以容器运行独立核心。不要安装 `deploy/home-mate.service`：它是早期 NAS systemd 存档，不再受支持。
 
 ## 音箱（当前）
 

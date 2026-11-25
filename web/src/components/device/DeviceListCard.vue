@@ -45,10 +45,6 @@ function name(id: string): string {
   return props.meta[id]?.name?.trim() || id
 }
 
-function room(id: string): string {
-  return props.meta[id]?.room?.trim() || ''
-}
-
 function gatewayFor(id: string): GatewayDevice | null {
   return props.gatewayDevices.find((device) => device.stable_id === id) ?? null
 }

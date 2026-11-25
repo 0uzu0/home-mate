@@ -27,12 +27,17 @@ const protectS = ref<number | null>(null)
 const { busy, message, tone, run } = useSave()
 
 watch(
-  () => props.mode,
-  (mode) => {
-    if (!mode) return
-    if (enabled.value === null) enabled.value = mode.barge_in !== false
-    if (protectS.value === null && mode.barge_protect_ms !== undefined) {
-      protectS.value = Math.round(mode.barge_protect_ms / 100) / 10
+  [() => props.mode, () => props.device],
+  ([mode, device], [, prevDevice]) => {
+    if (!mode && !device) return
+    const switchedDevice = prevDevice?.device !== undefined && prevDevice.device !== device?.device
+    const bargeEnabled = device?.barge_in ?? mode?.barge_in
+    if (enabled.value === null || switchedDevice) {
+      enabled.value = bargeEnabled !== false
+    }
+    const protectMs = device?.barge_protect_ms ?? mode?.barge_protect_ms
+    if ((protectS.value === null || switchedDevice) && protectMs !== undefined) {
+      protectS.value = Math.round(protectMs / 100) / 10
     }
   },
   { immediate: true },
@@ -54,6 +59,9 @@ async function save(): Promise<void> {
   <Panel
     icon="barge" apply="immediate" :title="t('bargeTitle')" :hint="t('bargeHint')">
     <template #actions>
+      <Pill v-if="device" size="sm" tone="accent" mono>
+        {{ t('scopeThisDevice', { device: device.device }) }}
+      </Pill>
       <Pill v-if="device?.barge" size="sm" :tone="device.barge.protected ? 'warn' : 'neutral'">
         {{ t('bargeProtect') }}: {{ ((device.barge.protect_ms ?? 0) / 1000).toFixed(1) }} s
         <template v-if="device.barge.protected"> · {{ t('bargeProtected') }}</template>
@@ -82,7 +90,12 @@ async function save(): Promise<void> {
       />
 
       <div class="barge__actions">
-        <button type="button" class="btn btn--primary" :disabled="busy || enabled === null" @click="save">
+        <button
+          type="button"
+          class="btn btn--primary"
+          :disabled="busy || enabled === null || protectS === null"
+          @click="save"
+        >
           {{ busy ? t('saving') : t('bargeSave') }}
         </button>
         <span v-if="message" class="barge__msg" :class="`barge__msg--${tone}`">{{ message }}</span>

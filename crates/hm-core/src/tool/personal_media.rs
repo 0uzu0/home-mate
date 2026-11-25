@@ -17,7 +17,7 @@ use crate::tool::{
 };
 use serde_json::{json, Value};
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -38,21 +38,114 @@ pub struct StoryCandidate {
     pub kind: String,
 }
 
+const STORY_META_CACHE_CAP: usize = 512;
+const RADIO_TITLE_CACHE_CAP: usize = 512;
+const RECENT_SCOPE_CACHE_CAP: usize = 32;
+const UNPLAYABLE_CACHE_CAP: usize = 256;
+
+/// Bounded FIFO/oldest-entry eviction cache (`MG-P1-06`).
+#[derive(Default)]
+struct BoundedMap<V> {
+    map: HashMap<String, V>,
+    order: VecDeque<String>,
+    cap: usize,
+}
+
+impl<V> BoundedMap<V> {
+    fn new(cap: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            cap,
+        }
+    }
+
+    fn insert(&mut self, key: String, value: V) {
+        if let Some(pos) = self.order.iter().position(|k| k == &key) {
+            self.order.remove(pos);
+        } else {
+            while self.map.len() >= self.cap {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.map.remove(&oldest);
+                } else {
+                    break;
+                }
+            }
+        }
+        self.order.push_back(key.clone());
+        self.map.insert(key, value);
+    }
+
+    fn get(&self, key: &str) -> Option<&V> {
+        self.map.get(key)
+    }
+}
+
+#[derive(Default)]
+struct BoundedSet {
+    set: HashSet<String>,
+    order: VecDeque<String>,
+    cap: usize,
+}
+
+impl BoundedSet {
+    fn new(cap: usize) -> Self {
+        Self {
+            set: HashSet::new(),
+            order: VecDeque::new(),
+            cap,
+        }
+    }
+
+    fn insert(&mut self, key: String) {
+        if self.set.contains(&key) {
+            if let Some(pos) = self.order.iter().position(|k| k == &key) {
+                self.order.remove(pos);
+            }
+            self.order.push_back(key);
+            return;
+        }
+        while self.set.len() >= self.cap {
+            if let Some(oldest) = self.order.pop_front() {
+                self.set.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        self.order.push_back(key.clone());
+        self.set.insert(key);
+    }
+
+    fn snapshot(&self) -> HashSet<String> {
+        self.set.clone()
+    }
+}
+
+type EpisodeListCache = Arc<Mutex<BoundedMap<Vec<(String, String)>>>>;
+
 #[derive(Clone)]
 pub struct PersonalMediaRuntime {
     store: Arc<Store>,
     hub: Arc<GatewayHub>,
     music: Option<Arc<crate::tool::music::MusicRuntime>>,
     client: reqwest::Client,
-    titles: Arc<Mutex<HashMap<String, String>>>,
-    kinds: Arc<Mutex<HashMap<String, String>>>,
-    radio_titles: Arc<Mutex<HashMap<String, String>>>,
-    recent_search: Arc<Mutex<Vec<StoryCandidate>>>,
-    recent_episodes: Arc<Mutex<Vec<(String, String)>>>,
-    unplayable: Arc<Mutex<HashSet<String>>>,
+    /// Bounded FIFO cache of `id -> (title, kind)` so titles and kinds evict in lockstep.
+    story_meta: Arc<Mutex<BoundedMap<(String, String)>>>,
+    radio_titles: Arc<Mutex<BoundedMap<String>>>,
+    recent_search: Arc<Mutex<BoundedMap<Vec<StoryCandidate>>>>,
+    recent_episodes: EpisodeListCache,
+    unplayable: Arc<Mutex<BoundedSet>>,
 }
 
 impl PersonalMediaRuntime {
+    fn scope_key(device: Option<&str>) -> String {
+        device
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("__default__")
+            .to_string()
+    }
+
     pub fn new(store: Arc<Store>, hub: Arc<GatewayHub>) -> Self {
         let allow_loopback = store.allows_loopback_public();
         let client = crate::tool::http::apply_policy_resolver(
@@ -68,23 +161,22 @@ impl PersonalMediaRuntime {
             hub,
             music: None,
             client,
-            titles: Arc::new(Mutex::new(HashMap::new())),
-            kinds: Arc::new(Mutex::new(HashMap::new())),
-            radio_titles: Arc::new(Mutex::new(HashMap::new())),
-            recent_search: Arc::new(Mutex::new(Vec::new())),
-            recent_episodes: Arc::new(Mutex::new(Vec::new())),
-            unplayable: Arc::new(Mutex::new(HashSet::new())),
+            story_meta: Arc::new(Mutex::new(BoundedMap::new(STORY_META_CACHE_CAP))),
+            radio_titles: Arc::new(Mutex::new(BoundedMap::new(RADIO_TITLE_CACHE_CAP))),
+            recent_search: Arc::new(Mutex::new(BoundedMap::new(RECENT_SCOPE_CACHE_CAP))),
+            recent_episodes: Arc::new(Mutex::new(BoundedMap::new(RECENT_SCOPE_CACHE_CAP))),
+            unplayable: Arc::new(Mutex::new(BoundedSet::new(UNPLAYABLE_CACHE_CAP))),
         }
     }
 
+    #[cfg(test)]
     pub fn remember_story_items(&self, payload: &mut Value) {
-        let bad = crate::lock_or_recover(&self.unplayable, "story.unplayable").clone();
-        let mut titles = crate::lock_or_recover(&self.titles, "story.titles");
-        let mut kinds = crate::lock_or_recover(&self.kinds, "story.kinds");
-        if titles.len() > 512 {
-            titles.clear();
-            kinds.clear();
-        }
+        self.remember_story_items_for(None, payload);
+    }
+
+    pub fn remember_story_items_for(&self, device: Option<&str>, payload: &mut Value) {
+        let bad = crate::lock_or_recover(&self.unplayable, "story.unplayable").snapshot();
+        let mut story_meta = crate::lock_or_recover(&self.story_meta, "story.meta");
         let mut eps: Vec<(String, String)> = Vec::new();
         let mut search_hits: Vec<StoryCandidate> = Vec::new();
         for key in ["results", "episodes"] {
@@ -99,8 +191,7 @@ impl PersonalMediaRuntime {
                             .filter(|s| !s.is_empty()),
                     ) {
                         let kind = item["kind"].as_str().unwrap_or("episode").to_string();
-                        titles.insert(id.to_string(), title.to_string());
-                        kinds.insert(id.to_string(), kind.clone());
+                        story_meta.insert(id.to_string(), (title.to_string(), kind.clone()));
                         if key == "results" {
                             search_hits.push(StoryCandidate {
                                 id: id.to_string(),
@@ -115,29 +206,45 @@ impl PersonalMediaRuntime {
                 }
             }
         }
+        drop(story_meta);
+        let sk = Self::scope_key(device);
         if !search_hits.is_empty() {
-            *crate::lock_or_recover(&self.recent_search, "story.recent_search") = search_hits;
+            let mut map = crate::lock_or_recover(&self.recent_search, "story.recent_search");
+            map.insert(sk.clone(), search_hits);
         }
         if !eps.is_empty() {
-            *crate::lock_or_recover(&self.recent_episodes, "story.recent_episodes") = eps;
+            let mut map = crate::lock_or_recover(&self.recent_episodes, "story.recent_episodes");
+            map.insert(sk, eps);
         }
     }
 
     pub fn lookup_title(&self, track_id: &str) -> Option<String> {
-        crate::lock_or_recover(&self.titles, "story.titles")
+        crate::lock_or_recover(&self.story_meta, "story.meta")
             .get(track_id)
-            .cloned()
+            .map(|(t, _)| t.clone())
     }
 
     pub fn lookup_kind(&self, id: &str) -> Option<String> {
-        crate::lock_or_recover(&self.kinds, "story.kinds")
+        crate::lock_or_recover(&self.story_meta, "story.meta")
             .get(id)
-            .cloned()
+            .map(|(_, k)| k.clone())
     }
 
+    #[cfg(test)]
     pub fn match_recent_search(&self, query: &str, title: &str) -> Option<StoryCandidate> {
-        let bad = crate::lock_or_recover(&self.unplayable, "story.unplayable").clone();
-        let recent = crate::lock_or_recover(&self.recent_search, "story.recent_search");
+        self.match_recent_search_for(None, query, title)
+    }
+
+    pub fn match_recent_search_for(
+        &self,
+        device: Option<&str>,
+        query: &str,
+        title: &str,
+    ) -> Option<StoryCandidate> {
+        let bad = crate::lock_or_recover(&self.unplayable, "story.unplayable").snapshot();
+        let sk = Self::scope_key(device);
+        let recent_map = crate::lock_or_recover(&self.recent_search, "story.recent_search");
+        let recent = recent_map.get(&sk)?;
         let valid: Vec<&StoryCandidate> = recent
             .iter()
             .filter(|c| !bad.contains(&c.id) && valid_path_segment(&c.id))
@@ -178,9 +285,6 @@ impl PersonalMediaRuntime {
 
     pub fn remember_radio_items(&self, payload: &Value) {
         let mut titles = crate::lock_or_recover(&self.radio_titles, "radio.titles");
-        if titles.len() > 512 {
-            titles.clear();
-        }
         for key in ["results", "stations"] {
             if let Some(arr) = payload.get(key).and_then(Value::as_array) {
                 for item in arr {
@@ -205,23 +309,32 @@ impl PersonalMediaRuntime {
             .cloned()
     }
 
+    #[cfg(test)]
     pub fn mark_unplayable_and_next(
         &self,
         failed_id: &str,
         allow_fallback: bool,
     ) -> Option<(String, String)> {
+        self.mark_unplayable_and_next_for(None, failed_id, allow_fallback)
+    }
+
+    pub fn mark_unplayable_and_next_for(
+        &self,
+        device: Option<&str>,
+        failed_id: &str,
+        allow_fallback: bool,
+    ) -> Option<(String, String)> {
         {
             let mut bad = crate::lock_or_recover(&self.unplayable, "story.unplayable");
-            if bad.len() >= 256 {
-                bad.clear();
-            }
             bad.insert(failed_id.to_string());
         }
         if !allow_fallback {
             return None;
         }
-        let bad = crate::lock_or_recover(&self.unplayable, "story.unplayable").clone();
-        let recent = crate::lock_or_recover(&self.recent_episodes, "story.recent_episodes");
+        let bad = crate::lock_or_recover(&self.unplayable, "story.unplayable").snapshot();
+        let sk = Self::scope_key(device);
+        let recent_map = crate::lock_or_recover(&self.recent_episodes, "story.recent_episodes");
+        let recent = recent_map.get(&sk)?;
         if !recent.iter().any(|(id, _)| id == failed_id) {
             return None;
         }
@@ -464,7 +577,7 @@ impl Tool for StorySearchTool {
         }
     }
 
-    async fn execute(&self, args: Value, _ctx: &ToolCtx) -> ToolResult {
+    async fn execute(&self, args: Value, ctx: &ToolCtx) -> ToolResult {
         let (cfg, tok) = self.rt.story_config();
         if !cfg.is_ready() {
             return ToolResult::failed("STORY_UNCONFIGURED", "story-svc is not configured", false);
@@ -492,7 +605,8 @@ impl Tool for StorySearchTool {
             .await
         {
             Ok(mut v) => {
-                self.rt.remember_story_items(&mut v);
+                self.rt
+                    .remember_story_items_for(ctx.device_id.as_deref(), &mut v);
                 ToolResult::observed_ok(v)
             }
             Err(e) => ToolResult::failed("STORY_ERROR", e, true),
@@ -534,7 +648,7 @@ impl Tool for StoryAlbumTool {
         }
     }
 
-    async fn execute(&self, args: Value, _ctx: &ToolCtx) -> ToolResult {
+    async fn execute(&self, args: Value, ctx: &ToolCtx) -> ToolResult {
         let (cfg, tok) = self.rt.story_config();
         if !cfg.is_ready() {
             return ToolResult::failed("STORY_UNCONFIGURED", "story-svc is not configured", false);
@@ -552,7 +666,8 @@ impl Tool for StoryAlbumTool {
             .await
         {
             Ok(mut v) => {
-                self.rt.remember_story_items(&mut v);
+                self.rt
+                    .remember_story_items_for(ctx.device_id.as_deref(), &mut v);
                 ToolResult::observed_ok(v)
             }
             Err(e) => ToolResult::failed("STORY_ERROR", e, true),
@@ -633,7 +748,10 @@ impl Tool for StoryPlayTool {
         // candidate from the turn's `story.search` before issuing a new search with
         // a potentially raw/homophone query.
         if track_id.is_none() && album_id.is_none() {
-            if let Some(cand) = self.rt.match_recent_search(query_arg, &title) {
+            if let Some(cand) =
+                self.rt
+                    .match_recent_search_for(ctx.device_id.as_deref(), query_arg, &title)
+            {
                 if cand.kind == "album" {
                     album_id = Some(cand.id);
                 } else {
@@ -678,7 +796,8 @@ impl Tool for StoryPlayTool {
                 Ok(v) => v,
                 Err(e) => return ToolResult::failed("STORY_ERROR", e, true),
             };
-            self.rt.remember_story_items(&mut res);
+            self.rt
+                .remember_story_items_for(ctx.device_id.as_deref(), &mut res);
             let Some(hits) = res["results"].as_array() else {
                 return ToolResult::failed("STORY_NOT_FOUND", "no matching story found", false);
             };
@@ -715,7 +834,8 @@ impl Tool for StoryPlayTool {
                     .get_json(&cfg, tok.as_deref(), &format!("/v1/album/{base_aid}"), &[])
                     .await
                 {
-                    self.rt.remember_story_items(&mut a);
+                    self.rt
+                        .remember_story_items_for(ctx.device_id.as_deref(), &mut a);
                     if let Some(eps) = a["episodes"].as_array() {
                         for ep in eps {
                             if let Some(eid) = ep["id"].as_str().filter(|s| valid_path_segment(s)) {
@@ -740,13 +860,41 @@ impl Tool for StoryPlayTool {
         let Some(mut tid) = track_id.filter(|s| valid_path_segment(s)) else {
             return ToolResult::failed("STORY_NOT_FOUND", "no valid story episode found", false);
         };
-        let device = ctx
+        let device = match ctx
             .device_id
-            .clone()
-            .or_else(|| self.rt.hub.primary_audio_out().map(|d| d.stable_id));
-        let Some(device) = device else {
-            return ToolResult::failed("NO_DEVICE", "no audio output device online", false);
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(explicit) => {
+                if !self.rt.hub.device_online_with_cap(explicit, "audio_out") {
+                    return ToolResult::failed(
+                        "NO_DEVICE",
+                        format!("target device '{explicit}' is offline or lacks audio output"),
+                        false,
+                    );
+                }
+                explicit.to_string()
+            }
+            None => match self.rt.hub.resolve_default_audio_out() {
+                Ok(Some(d)) => d.stable_id,
+                Ok(None) => {
+                    return ToolResult::failed("NO_DEVICE", "no audio output device online", false);
+                }
+                Err(msg) => {
+                    return ToolResult::failed("AMBIGUOUS_DEVICE", msg, false);
+                }
+            },
         };
+        if ctx.is_lan_exempt() && !self.rt.hub.device_is_known_lan_device(&device) {
+            return ToolResult::failed(
+                "PAIRING_REQUIRED",
+                format!(
+                    "未认证的局域网访问不允许在本机音箱「{device}」播放媒体，请使用配对令牌认证"
+                ),
+                false,
+            );
+        }
         let mut label = self
             .rt
             .lookup_title(&tid)
@@ -815,7 +963,11 @@ impl Tool for StoryPlayTool {
                         }
                         if code == "MUSIC_DECODE" {
                             if let Some((next_id, next_title)) =
-                                self.rt.mark_unplayable_and_next(&tid, attempt < 2)
+                                self.rt.mark_unplayable_and_next_for(
+                                    ctx.device_id.as_deref(),
+                                    &tid,
+                                    attempt < 2,
+                                )
                             {
                                 tid = next_id;
                                 label = if next_title.is_empty() {
@@ -1067,13 +1219,41 @@ impl Tool for RadioPlayTool {
                 }
             }
         }
-        let device = ctx
+        let device = match ctx
             .device_id
-            .clone()
-            .or_else(|| self.rt.hub.primary_audio_out().map(|d| d.stable_id));
-        let Some(device) = device else {
-            return ToolResult::failed("NO_DEVICE", "no audio output device online", false);
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(explicit) => {
+                if !self.rt.hub.device_online_with_cap(explicit, "audio_out") {
+                    return ToolResult::failed(
+                        "NO_DEVICE",
+                        format!("target device '{explicit}' is offline or lacks audio output"),
+                        false,
+                    );
+                }
+                explicit.to_string()
+            }
+            None => match self.rt.hub.resolve_default_audio_out() {
+                Ok(Some(d)) => d.stable_id,
+                Ok(None) => {
+                    return ToolResult::failed("NO_DEVICE", "no audio output device online", false);
+                }
+                Err(msg) => {
+                    return ToolResult::failed("AMBIGUOUS_DEVICE", msg, false);
+                }
+            },
         };
+        if ctx.is_lan_exempt() && !self.rt.hub.device_is_known_lan_device(&device) {
+            return ToolResult::failed(
+                "PAIRING_REQUIRED",
+                format!(
+                    "未认证的局域网访问不允许在本机音箱「{device}」播放媒体，请使用配对令牌认证"
+                ),
+                false,
+            );
+        }
         let Some(music) = &self.rt.music else {
             return ToolResult::failed("MUSIC_UNAVAILABLE", "media runtime not attached", false);
         };
@@ -1434,8 +1614,9 @@ mod tests {
         // 6. story.recent_episodes must remain untouched by radio.search / radio.play
         {
             let recent = crate::lock_or_recover(&rt.recent_episodes, "story.recent_episodes");
-            assert_eq!(recent.len(), 1);
-            assert_eq!(recent[0].0, "story-ep-1");
+            let list = recent.get("__default__").expect("default recent_episodes");
+            assert_eq!(list.len(), 1);
+            assert_eq!(list[0].0, "story-ep-1");
         }
 
         // 7. music.control `next` switches sg-yes933 -> sg-love972

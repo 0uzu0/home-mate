@@ -9,7 +9,17 @@ import StatTile from '../StatTile.vue'
 
 const props = defineProps<{ status: Status | null }>()
 
-const device = computed(() => props.status?.gateway.devices[0] ?? null)
+const devices = computed(() => props.status?.gateway.devices ?? [])
+const deviceSummary = computed(() => {
+  if (!devices.value.length) return '—'
+  return devices.value.map((d) => d.stable_id).join(' · ')
+})
+const firmwareSummary = computed(() => {
+  const fws = devices.value
+    .map((d) => (d.firmware ? `${d.stable_id}: ${d.firmware}` : ''))
+    .filter(Boolean)
+  return fws.join(' / ')
+})
 
 const consoleBuild = computed(() => {
   const script = Array.from(document.scripts)
@@ -30,7 +40,7 @@ const consoleBuild = computed(() => {
     <div class="about__grid">
       <StatTile :label="t('aboutProduct')" :value="status?.product || t('brand')" tone="muted" />
       <StatTile :label="t('aboutVersion')" :value="status?.version ?? '—'" tone="accent" />
-      <StatTile :label="t('aboutDevice')" :value="device?.stable_id ?? '—'" tone="muted" :note="device?.firmware ?? ''" />
+      <StatTile :label="t('aboutDevice')" :value="deviceSummary" tone="muted" :note="firmwareSummary" />
       <StatTile :label="t('aboutConsoleBuild')" :value="consoleBuild" tone="muted" />
     </div>
   </Panel>

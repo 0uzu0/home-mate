@@ -702,6 +702,16 @@ async fn execute_contract(
     if ctx.is_cancelled() {
         return ToolResult::cancelled();
     }
+    if ctx.is_lan_exempt() && contract.effect == SideEffect::Mutate {
+        return ToolResult::failed(
+            "PAIRING_REQUIRED",
+            format!(
+                "未认证的局域网访问不允许执行写操作开放插座「{}」，请使用配对令牌认证",
+                contract.name
+            ),
+            false,
+        );
+    }
     if !contract.enabled {
         return ToolResult::failed(
             SOCKET_DISABLED,
@@ -818,19 +828,24 @@ async fn execute_contract(
     };
 
     let status = resp.status();
-    let bytes = match resp.bytes().await {
-        Ok(b) if b.len() <= MAX_RESPONSE_BODY => b,
-        Ok(_) => {
+    let mut resp = resp;
+    let mut buf = Vec::new();
+    while let Some(chunk) = match resp.chunk().await {
+        Ok(c) => c,
+        Err(e) => {
+            return ToolResult::failed(SOCKET_HTTP, format!("failed reading response: {e}"), true);
+        }
+    } {
+        if buf.len().saturating_add(chunk.len()) > MAX_RESPONSE_BODY {
             return ToolResult::failed(
                 SOCKET_RESPONSE_TOO_LARGE,
                 "open socket response exceeded 64 KiB",
                 false,
             );
         }
-        Err(e) => {
-            return ToolResult::failed(SOCKET_HTTP, format!("failed reading response: {e}"), true);
-        }
-    };
+        buf.extend_from_slice(&chunk);
+    }
+    let bytes = buf;
 
     if !status.is_success() {
         let mut r = ToolResult::failed(

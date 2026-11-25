@@ -17,9 +17,23 @@ impl VoicePipeline {
     /// report the receipt stage with timings. Exercises the whole
     /// TTS → hub → gateway → device chain with real evidence — no staging
     /// invented. Fails honestly when TTS or the device is missing.
-    pub async fn diagnostic_voice_play(&self) -> serde_json::Value {
-        let Some(device) = self.hub.primary_audio_out().map(|d| d.stable_id) else {
-            return json!({ "ok": false, "error": "没有已连接的 audio_out 设备；网关未连接或无扬声器能力" });
+    pub async fn diagnostic_voice_play(&self, device: Option<&str>) -> serde_json::Value {
+        let device = match device.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(d) => {
+                if !self.hub.device_online_with_cap(d, "audio_out") {
+                    return json!({ "ok": false, "device": d, "error": format!("设备 {d} 不在线或无 audio_out 能力") });
+                }
+                d.to_string()
+            }
+            None => match self.hub.resolve_default_audio_out() {
+                Ok(Some(d)) => d.stable_id,
+                Ok(None) => {
+                    return json!({ "ok": false, "code": "NO_AUDIO_OUT_DEVICE", "error": "没有已连接的 audio_out 设备；网关未连接或无扬声器能力" });
+                }
+                Err(e) => {
+                    return json!({ "ok": false, "code": "DEVICE_REQUIRED", "error": e });
+                }
+            },
         };
         let tts = match (self.tts_factory)() {
             Ok(t) => t,
@@ -92,12 +106,15 @@ impl VoicePipeline {
         {
             return json!({ "ok": false, "error": "asset 必须是 assets 目录下的 .wav 文件名（不含路径）" });
         }
-        let device = match device.map(|d| d.to_string()) {
-            Some(d) => d,
-            None => match self.hub.primary_audio_out().map(|d| d.stable_id) {
-                Some(d) => d,
-                None => {
-                    return json!({ "ok": false, "error": "没有已连接的 audio_out 设备；网关未连接或无扬声器能力" })
+        let device = match device.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(d) => d.to_string(),
+            None => match self.hub.resolve_default_audio_out() {
+                Ok(Some(d)) => d.stable_id,
+                Ok(None) => {
+                    return json!({ "ok": false, "code": "NO_AUDIO_OUT_DEVICE", "error": "没有已连接的 audio_out 设备；网关未连接或无扬声器能力" });
+                }
+                Err(e) => {
+                    return json!({ "ok": false, "code": "DEVICE_REQUIRED", "error": e });
                 }
             },
         };
@@ -397,16 +414,25 @@ impl VoicePipeline {
             return Err("value must be within 0..1 (linear)".into());
         }
         // This speaker's driver crackles above ~90 % (the vendor's own MBCL
-        // note and our listening tests both put it there), so voice, console
-        // and tools share one cap instead of each remembering it (user
-        // decision 2026-11-14).
-        let value = value.min(VOLUME_CAP);
+        // note and our listening tests both put it there), and each physical
+        // unit may additionally configure a stricter per-unit `volume_cap` in
+        // `unit_acoustic_profiles`. Voice, console, and tools share one cap.
+        let unit_cap = crate::config::ConfigService::new(self.store.clone())
+            .unit_acoustic_profile(device)
+            .map(|p| p.volume_cap)
+            .unwrap_or(VOLUME_CAP);
+        let effective_cap = if unit_cap.is_finite() {
+            unit_cap.clamp(0.0, VOLUME_CAP)
+        } else {
+            VOLUME_CAP
+        };
+        let value = value.min(effective_cap);
         let play_id = self.hub.volume_set(device, value)?;
         self.note(
             "volume_set",
-            json!({ "device": device, "value": value, "op_id": play_id, "cap": VOLUME_CAP }),
+            json!({ "device": device, "value": value, "op_id": play_id, "cap": effective_cap }),
         );
-        Ok(json!({ "device": device, "value": value, "state": "submitted" }))
+        Ok(json!({ "device": device, "value": value, "cap": effective_cap, "state": "submitted" }))
     }
 
     /// Update mode settings. Duplex requests validate against the device's
@@ -446,7 +472,7 @@ impl VoicePipeline {
             wake_words,
             vad,
             follow_window_tone,
-            wake_ack,
+            wake_ack.map(Into::into),
             retreat_intent,
             retreat_words,
             retreat_ack,
@@ -498,7 +524,7 @@ impl VoicePipeline {
         wake_words: Option<Vec<String>>,
         vad: Option<VadSettings>,
         follow_window_tone: Option<bool>,
-        wake_ack: Option<WakeAckSettings>,
+        wake_ack: Option<WakeAckPatch>,
         retreat_intent: Option<bool>,
         retreat_words: Option<Vec<String>>,
         retreat_ack: Option<String>,
@@ -516,9 +542,29 @@ impl VoicePipeline {
         actor: &str,
     ) -> Result<serde_json::Value, String> {
         let _edit = crate::lock_or_recover(&self.settings_edit_gate, "voice.settings_edit");
+        let is_global = device.trim().is_empty() || device == "global";
+        let before_settings = crate::lock_or_recover(&self.settings, "voice.settings").clone();
+        let before_eff = if is_global {
+            before_settings.clone()
+        } else {
+            before_settings.effective_for(device)
+        };
+        let wake_ack: Option<WakeAckSettings> = wake_ack.map(|patch| WakeAckSettings {
+            enabled: patch.enabled.unwrap_or(before_eff.wake_ack.enabled),
+            phrases: patch
+                .phrases
+                .unwrap_or_else(|| before_eff.wake_ack.phrases.clone()),
+            resynth: patch.resynth,
+        });
         follow_window.validate()?;
         let spoken = follow_window
             .spoken
+            .or_else(|| {
+                follow_window
+                    .spoken_patch
+                    .as_ref()
+                    .map(|p| p.apply_to(&before_settings.spoken))
+            })
             .map(SpokenDeliverySettings::normalized_for_console)
             .transpose()?;
 
@@ -606,36 +652,182 @@ impl VoicePipeline {
                 sp.backstop_max_chars
             ));
         }
+        let has_device_override_patch = proactive_speech.is_some()
+            || wake_words.is_some()
+            || follow_window.follow_window_enabled.is_some()
+            || follow_window.follow_window_ms.is_some()
+            || follow_window.context_window_ms.is_some()
+            || follow_window.followup_credits.is_some()
+            || follow_window.kws_threshold.is_some()
+            || follow_window.kws_score.is_some()
+            || follow_window.idle_asr_enabled.is_some()
+            || follow_window.wake_arbitration.is_some()
+            || follow_window_tone.is_some()
+            || wake_ack.is_some()
+            || retreat_intent.is_some()
+            || retreat_words.is_some()
+            || tail_blind_ms.is_some()
+            || keyword_interrupt.is_some()
+            || barge_in.is_some()
+            || barge_protect_ms.is_some();
         self.edit_settings_checked(actor, &summary, |s| {
             if let Some(req) = &duplex_requested {
-                s.duplex_requested.insert(device.to_string(), req.clone());
-            }
-            if let Some(p) = proactive_speech {
-                s.proactive_speech = p;
-            }
-            if let Some(words) = &wake_words {
-                s.wake_words = words.iter().map(|w| w.trim().to_string()).collect();
+                if !is_global {
+                    s.duplex_requested.insert(device.to_string(), req.clone());
+                }
             }
             if let Some(v) = vad {
-                s.vad = Some(v);
+                if is_global {
+                    s.vad = Some(v);
+                } else {
+                    s.vad_by_device.insert(device.to_string(), v);
+                }
             }
-            if let Some(v) = follow_window.follow_window_enabled {
-                s.follow_window_enabled = v;
+            if let Some(db) = media_trim_db {
+                if is_global {
+                    s.media_trim_db = db;
+                } else {
+                    s.media_trim_db_by_device.insert(device.to_string(), db);
+                }
             }
-            if let Some(v) = follow_window.follow_window_ms {
-                s.follow_window_ms = v;
-            }
-            if let Some(v) = follow_window.context_window_ms {
-                s.context_window_ms = v;
-            }
-            if let Some(v) = follow_window.followup_credits {
-                s.followup_credits = Some(v);
-            }
-            if let Some(v) = follow_window.kws_threshold {
-                s.kws_threshold = v;
-            }
-            if let Some(v) = follow_window.kws_score {
-                s.kws_score = v;
+            if is_global {
+                if let Some(p) = proactive_speech {
+                    s.proactive_speech = p;
+                }
+                if let Some(words) = &wake_words {
+                    s.wake_words = words.iter().map(|w| w.trim().to_string()).collect();
+                }
+                if let Some(v) = follow_window.follow_window_enabled {
+                    s.follow_window_enabled = v;
+                }
+                if let Some(v) = follow_window.follow_window_ms {
+                    s.follow_window_ms = v;
+                }
+                if let Some(v) = follow_window.context_window_ms {
+                    s.context_window_ms = v;
+                }
+                if let Some(v) = follow_window.followup_credits {
+                    s.followup_credits = Some(v);
+                }
+                if let Some(v) = follow_window.kws_threshold {
+                    s.kws_threshold = v;
+                }
+                if let Some(v) = follow_window.kws_score {
+                    s.kws_score = v;
+                }
+                if let Some(enabled) = follow_window.idle_asr_enabled {
+                    s.proactive_asr_wake = enabled;
+                    s.asr_wake_fallback = enabled;
+                }
+                if let Some(mode) = follow_window.wake_arbitration {
+                    s.wake_arbitration = mode;
+                }
+                if let Some(t) = follow_window_tone {
+                    s.follow_window_tone = t;
+                }
+                if let Some(ack) = wake_ack.clone() {
+                    s.wake_ack.phrases = ack.phrases.iter().map(|p| p.trim().to_string()).collect();
+                    s.wake_ack.enabled = ack.enabled;
+                }
+                if let Some(r) = retreat_intent {
+                    s.retreat_intent = r;
+                }
+                if let Some(words) = &retreat_words {
+                    s.retreat_words = words.iter().map(|w| w.trim().to_string()).collect();
+                }
+                if let Some(ms) = tail_blind_ms {
+                    s.tail_blind_ms = ms;
+                    for (dev_id, aec_ms) in self.hub.device_aec_tails() {
+                        if ms < u64::from(aec_ms) {
+                            tracing::warn!(
+                                device = %dev_id,
+                                tail_blind_ms = ms,
+                                aec_tail_ms = aec_ms,
+                                "tail_blind_ms is shorter than device aec_tail_ms"
+                            );
+                        }
+                    }
+                }
+                if let Some(k) = keyword_interrupt {
+                    s.keyword_interrupt = k;
+                }
+                if let Some(b) = barge_in {
+                    s.barge_in = b;
+                }
+                if let Some(ms) = barge_protect_ms {
+                    s.barge_protect_ms = ms;
+                }
+            } else if has_device_override_patch {
+                let ov = s.device_overrides.entry(device.to_string()).or_default();
+                if let Some(p) = proactive_speech {
+                    ov.proactive_speech = Some(p);
+                }
+                if let Some(words) = &wake_words {
+                    ov.wake_words = Some(words.iter().map(|w| w.trim().to_string()).collect());
+                }
+                if let Some(v) = follow_window.follow_window_enabled {
+                    ov.follow_window_enabled = Some(v);
+                }
+                if let Some(v) = follow_window.follow_window_ms {
+                    ov.follow_window_ms = Some(v);
+                }
+                if let Some(v) = follow_window.context_window_ms {
+                    ov.context_window_ms = Some(v);
+                }
+                if let Some(v) = follow_window.followup_credits {
+                    ov.followup_credits = Some(Some(v));
+                }
+                if let Some(v) = follow_window.kws_threshold {
+                    ov.kws_threshold = Some(v);
+                }
+                if let Some(v) = follow_window.kws_score {
+                    ov.kws_score = Some(v);
+                }
+                if let Some(enabled) = follow_window.idle_asr_enabled {
+                    ov.proactive_asr_wake = Some(enabled);
+                    ov.asr_wake_fallback = Some(enabled);
+                }
+                if let Some(mode) = follow_window.wake_arbitration {
+                    ov.wake_arbitration = Some(mode);
+                }
+                if let Some(t) = follow_window_tone {
+                    ov.follow_window_tone = Some(t);
+                }
+                if let Some(ack) = wake_ack.clone() {
+                    ov.wake_ack = Some(WakeAckSettings {
+                        enabled: ack.enabled,
+                        phrases: ack.phrases.iter().map(|p| p.trim().to_string()).collect(),
+                        resynth: None,
+                    });
+                }
+                if let Some(r) = retreat_intent {
+                    ov.retreat_intent = Some(r);
+                }
+                if let Some(words) = &retreat_words {
+                    ov.retreat_words = Some(words.iter().map(|w| w.trim().to_string()).collect());
+                }
+                if let Some(ms) = tail_blind_ms {
+                    ov.tail_blind_ms = Some(ms);
+                    for (dev_id, aec_ms) in self.hub.device_aec_tails() {
+                        if dev_id == device && ms < u64::from(aec_ms) {
+                            tracing::warn!(
+                                device = %dev_id,
+                                tail_blind_ms = ms,
+                                aec_tail_ms = aec_ms,
+                                "tail_blind_ms is shorter than device aec_tail_ms"
+                            );
+                        }
+                    }
+                }
+                if let Some(k) = keyword_interrupt {
+                    ov.keyword_interrupt = Some(k);
+                }
+                if let Some(b) = barge_in {
+                    ov.barge_in = Some(b);
+                }
+                if let Some(ms) = barge_protect_ms {
+                    ov.barge_protect_ms = Some(ms);
+                }
             }
             if let Some(name) = &follow_window.assistant_name {
                 s.assistant_name = name.trim().to_string();
@@ -653,26 +845,6 @@ impl VoicePipeline {
             if let Some(spoken) = &spoken {
                 s.spoken = spoken.clone();
             }
-            if let Some(enabled) = follow_window.idle_asr_enabled {
-                s.proactive_asr_wake = enabled;
-                s.asr_wake_fallback = enabled;
-            }
-            if let Some(mode) = follow_window.wake_arbitration {
-                s.wake_arbitration = mode;
-            }
-            if let Some(t) = follow_window_tone {
-                s.follow_window_tone = t;
-            }
-            if let Some(ack) = wake_ack.clone() {
-                s.wake_ack.phrases = ack.phrases.iter().map(|p| p.trim().to_string()).collect();
-                s.wake_ack.enabled = ack.enabled;
-            }
-            if let Some(r) = retreat_intent {
-                s.retreat_intent = r;
-            }
-            if let Some(words) = &retreat_words {
-                s.retreat_words = words.iter().map(|w| w.trim().to_string()).collect();
-            }
             if let Some(ack) = &retreat_ack {
                 s.retreat_ack = ack.trim().to_string();
             }
@@ -681,31 +853,6 @@ impl VoicePipeline {
             }
             if let Some(n) = &truncation_notice {
                 s.truncation_notice = n.trim().to_string();
-            }
-            if let Some(ms) = tail_blind_ms {
-                s.tail_blind_ms = ms;
-                for (dev_id, aec_ms) in self.hub.device_aec_tails() {
-                    if ms < u64::from(aec_ms) {
-                        tracing::warn!(
-                            device = %dev_id,
-                            tail_blind_ms = ms,
-                            aec_tail_ms = aec_ms,
-                            "tail_blind_ms is shorter than device aec_tail_ms"
-                        );
-                    }
-                }
-            }
-            if let Some(db) = media_trim_db {
-                s.media_trim_db = db;
-            }
-            if let Some(k) = keyword_interrupt {
-                s.keyword_interrupt = k;
-            }
-            if let Some(b) = barge_in {
-                s.barge_in = b;
-            }
-            if let Some(ms) = barge_protect_ms {
-                s.barge_protect_ms = ms;
             }
             if let Some(si) = &stop_intents {
                 s.stop_intents = StopIntentSettings {
@@ -732,55 +879,78 @@ impl VoicePipeline {
                 };
             }
             if retreat_words.is_some() || stop_intents.is_some() {
-                s.validate_lexicon_values()?;
-                s.validate_lexicon_combinations()?;
+                if is_global {
+                    s.validate_lexicon_values()?;
+                    s.validate_lexicon_combinations()?;
+                    for dev_id in s.device_overrides.keys() {
+                        let eff = s.effective_for(dev_id);
+                        eff.validate_lexicon_values()?;
+                        eff.validate_lexicon_combinations()?;
+                    }
+                } else {
+                    let eff = s.effective_for(device);
+                    eff.validate_lexicon_values()?;
+                    eff.validate_lexicon_combinations()?;
+                }
             }
             Ok(())
         })?;
         self.project_follow_window_policy();
-        // Media trim applies immediately (hub reads it at every play submit).
+        // Media trim applies immediately per device (hub reads it per device at play submit).
         if let Some(db) = media_trim_db {
-            self.hub.set_media_trim_db(db);
-        }
-        // Ack phrase changes (and forced re-synthesis) pre-build WAVs in
-        // the background so the wake path stays cloud-free.
-        if wake_ack.is_some()
-            || retreat_ack.is_some()
-            || window_close_ack.is_some()
-            || filler.is_some()
-            || truncation_notice.is_some()
-        {
-            let force = wake_ack
-                .as_ref()
-                .and_then(|a| a.resynth)
-                .or_else(|| filler.as_ref().and_then(|f| f.resynth))
-                .unwrap_or(false);
-            if force {
-                let pipe = self.clone();
-                tokio::spawn(async move { pipe.synthesize_wake_acks(true).await });
+            if is_global {
+                self.hub.set_media_trim_db(db);
             } else {
-                self.spawn_ack_synthesis();
+                self.hub.set_device_media_trim_db(device, db);
             }
         }
-        // VAD changes apply to RUNNING processors immediately (calibration
-        // must not wait for a reconnect to take effect).
+        // Ack phrase changes (and forced re-synthesis) pre-build WAVs in
+        // the background so the wake path stays cloud-free. Purely toggling
+        // `wake_ack.enabled = false` does NOT spawn cloud TTS synthesis.
+        let force_resynth = wake_ack
+            .as_ref()
+            .and_then(|a| a.resynth)
+            .or_else(|| filler.as_ref().and_then(|f| f.resynth))
+            .unwrap_or(false);
+        let after_settings = crate::lock_or_recover(&self.settings, "voice.settings").clone();
+        if force_resynth {
+            let pipe = self.clone();
+            tokio::spawn(async move { pipe.synthesize_wake_acks(true).await });
+        } else if cue_phrases_changed(&before_settings, &after_settings) {
+            self.spawn_ack_synthesis();
+        }
+        // VAD changes apply strictly to the target device's running processor
+        // (or all devices without a per-device override when `device == "global"`),
+        // never overwriting another room's measured acoustics.
         if let Some(v) = vad {
-            let mut procs = crate::lock_or_recover(&self.mic, "voice.mic");
-            for p in procs.values_mut() {
-                p.set_thresholds(v.start_db, v.end_db);
+            let overrides = crate::lock_or_recover(&self.settings, "voice.settings")
+                .vad_by_device
+                .clone();
+            if is_global {
+                for (dev, arc) in self.all_mic_arcs() {
+                    if !overrides.contains_key(&dev) {
+                        crate::lock_or_recover(&arc, "voice.mic.dev")
+                            .set_thresholds(v.start_db, v.end_db);
+                    }
+                }
+            } else if let Some(arc) = self.mic_arc(device) {
+                crate::lock_or_recover(&arc, "voice.mic.dev").set_thresholds(v.start_db, v.end_db);
             }
         }
 
         if let Some(req) = &duplex_requested {
-            // Sent for half too: the device's ModeReport then reflects the
-            // CURRENT request instead of a stale one from a previous set.
-            if self.hub.mode_set(device, req).is_err() {
-                // Recorded request stands; negotiation happens on reconnect.
+            if !is_global {
+                // Sent for half too: the device's ModeReport then reflects the
+                // CURRENT request instead of a stale one from a previous set.
+                if self.hub.mode_set(device, req).is_err() {
+                    // Recorded request stands; negotiation happens on reconnect.
+                }
             }
         }
         self.note(
             "mode_set",
-            json!({ "device": device, "duplex_requested": duplex_requested,
+            json!({ "device": device, "scope": if is_global { "global" } else { "device" },
+                    "duplex_requested": duplex_requested,
                     "proactive_speech": proactive_speech, "wake_words": wake_words,
                     "retreat_words": retreat_words, "retreat_ack": retreat_ack,
                     "window_close_ack": window_close_ack,
@@ -792,14 +962,21 @@ impl VoicePipeline {
                     "stop_intents": stop_intents,
                     "reason": reason }),
         );
-        let snapshot = self.mode_snapshot();
+        if is_global {
+            let mut snap = self.mode_snapshot_for(None);
+            snap["scope"] = json!("global");
+            snap["reason"] = json!(reason);
+            return Ok(snap);
+        }
+        let snapshot = self.mode_snapshot_for(Some(device));
         let mut entry = snapshot["devices"]
             .as_array()
             .cloned()
             .unwrap_or_default()
             .into_iter()
             .find(|d| d["device"] == json!(device))
-            .unwrap_or(json!({}));
+            .unwrap_or_else(|| json!({ "device": device }));
+        entry["scope"] = json!("device");
         entry["reason"] = json!(reason);
         Ok(entry)
     }
@@ -839,19 +1016,24 @@ impl VoicePipeline {
 
     pub(crate) fn publish_reviewed_settings(
         self: &Arc<Self>,
-        publish: impl FnOnce(&VoiceSettings) -> crate::config_delivery::Result<Option<VoiceSettings>>,
-    ) -> crate::config_delivery::Result<()> {
+        publish: impl FnOnce(
+            &VoiceSettings,
+        ) -> crate::config_delivery::Result<(Option<VoiceSettings>, bool)>,
+    ) -> crate::config_delivery::Result<bool> {
         let mut synth_cues = false;
+        let applied;
         {
             let _edit = crate::lock_or_recover(&self.settings_edit_gate, "voice.settings_edit");
             // The voice readers acquire states before settings when both are needed.
             let mut states = crate::lock_or_recover(&self.states, "voice.states");
             let mut effective = crate::lock_or_recover(&self.settings, "voice.settings");
-            if let Some(next) = publish(&effective)? {
+            let (next_opt, was_applied) = publish(&effective)?;
+            applied = was_applied;
+            if let Some(next) = next_opt {
                 synth_cues = cue_phrases_changed(&effective, &next);
-                let policy = FollowWindowPolicy::from(&next);
                 let now = id::now_ms();
-                for state in states.values_mut() {
+                for (dev, state) in states.iter_mut() {
+                    let policy = FollowWindowPolicy::for_device(&next, dev);
                     state.participation.apply_policy(policy, now);
                 }
                 *effective = next;
@@ -860,7 +1042,7 @@ impl VoicePipeline {
         if synth_cues && tokio::runtime::Handle::try_current().is_ok() {
             self.spawn_ack_synthesis();
         }
-        Ok(())
+        Ok(applied)
     }
 
     /// Validate a full VoiceSettings snapshot (restore path): the same rules
@@ -923,6 +1105,55 @@ impl VoicePipeline {
                 s.media_trim_db
             ));
         }
+        for (dev, v) in &s.vad_by_device {
+            validate_vad(v).map_err(|e| format!("invalid persisted vad_by_device[{dev}]: {e}"))?;
+        }
+        for (dev, &db) in &s.media_trim_db_by_device {
+            if !(-12.0..=0.0).contains(&db) {
+                return Err(format!(
+                    "invalid persisted media_trim_db_by_device[{dev}] {db}"
+                ));
+            }
+        }
+        for (dev, ov) in &s.device_overrides {
+            FollowWindowPatch {
+                follow_window_enabled: ov.follow_window_enabled,
+                follow_window_ms: ov.follow_window_ms,
+                context_window_ms: ov.context_window_ms,
+                followup_credits: ov.followup_credits.flatten(),
+                kws_threshold: ov.kws_threshold,
+                kws_score: ov.kws_score,
+                ..Default::default()
+            }
+            .validate()
+            .map_err(|e| format!("invalid persisted device_overrides[{dev}]: {e}"))?;
+            if let Some(ms) = ov.tail_blind_ms {
+                if ms > 2000 {
+                    return Err(format!(
+                        "invalid persisted device_overrides[{dev}].tail_blind_ms {ms}"
+                    ));
+                }
+            }
+            if let Some(ms) = ov.barge_protect_ms {
+                if ms > 3000 {
+                    return Err(format!(
+                        "invalid persisted device_overrides[{dev}].barge_protect_ms {ms}"
+                    ));
+                }
+            }
+            if let Some(words) = &ov.wake_words {
+                validate_wake_words(words)
+                    .map_err(|e| format!("invalid persisted device_overrides[{dev}]: {e}"))?;
+            }
+            if let Some(ack) = &ov.wake_ack {
+                validate_wake_ack(ack)
+                    .map_err(|e| format!("invalid persisted device_overrides[{dev}]: {e}"))?;
+            }
+            if let Some(words) = &ov.retreat_words {
+                validate_retreat_words(words)
+                    .map_err(|e| format!("invalid persisted device_overrides[{dev}]: {e}"))?;
+            }
+        }
         if s.retreat_words.is_empty() || s.retreat_words.len() > 12 {
             return Err("invalid persisted retreat_words".into());
         }
@@ -952,14 +1183,17 @@ impl VoicePipeline {
         settings.kws_threshold = current.kws_threshold;
         settings.kws_score = current.kws_score;
         settings.media_trim_db = current.media_trim_db;
+        settings.media_trim_db_by_device = current.media_trim_db_by_device.clone();
         settings.tail_blind_ms = current.tail_blind_ms;
         settings.vad = current.vad.clone();
+        settings.vad_by_device = current.vad_by_device.clone();
         settings.duplex_requested = current.duplex_requested.clone();
         settings.keyword_interrupt = current.keyword_interrupt;
         settings.barge_in = current.barge_in;
         settings.barge_protect_ms = current.barge_protect_ms;
         settings.asr_wake_fallback = current.asr_wake_fallback;
         settings.proactive_asr_wake = current.proactive_asr_wake;
+        settings.device_overrides = current.device_overrides.clone();
     }
 
     pub(crate) fn prevalidate_settings_patch(
@@ -987,9 +1221,10 @@ impl VoicePipeline {
 
     pub(crate) fn overwrite_in_memory_settings(&self, restored: VoiceSettings) {
         let trim_db = restored.media_trim_db;
+        let trim_by_dev = restored.media_trim_db_by_device.clone();
         *crate::lock_or_recover(&self.settings, "voice.settings") = restored;
         self.project_follow_window_policy();
-        self.hub.set_media_trim_db(trim_db);
+        self.hub.set_media_trim_map(trim_db, trim_by_dev);
     }
 
     pub fn restore_settings(
@@ -1077,13 +1312,16 @@ impl VoicePipeline {
             *current = settings.clone();
             (before, settings)
         };
-        self.hub.set_media_trim_db(settings.media_trim_db);
+        self.hub.set_media_trim_map(
+            settings.media_trim_db,
+            settings.media_trim_db_by_device.clone(),
+        );
         self.project_follow_window_policy();
         if patch.is_none() {
-            if let Some(vad) = settings.vad {
-                let mut processors = crate::lock_or_recover(&self.mic, "voice.mic");
-                for processor in processors.values_mut() {
-                    processor.set_thresholds(vad.start_db, vad.end_db);
+            for (dev, arc) in self.all_mic_arcs() {
+                if let Some(vad) = settings.vad_by_device.get(&dev).or(settings.vad.as_ref()) {
+                    crate::lock_or_recover(&arc, "voice.mic.dev")
+                        .set_thresholds(vad.start_db, vad.end_db);
                 }
             }
             for (device, requested) in &settings.duplex_requested {
@@ -1119,10 +1357,12 @@ impl VoicePipeline {
             *settings = VoiceSettings::default();
             states.clear();
         }
+        self.hub
+            .set_media_trim_map(VoiceSettings::default().media_trim_db, HashMap::new());
         crate::lock_or_recover(&self.log, "voice.log").clear();
         crate::lock_or_recover(&self.reminder_inflight, "voice.reminder_inflight").clear();
         crate::lock_or_recover(&self.announces, "voice.announces").clear();
-        *crate::lock_or_recover(&self.last_arbitration, "voice.last_arbitration") = None;
+        crate::lock_or_recover(&self.last_arbitration, "voice.last_arbitration").clear();
         *crate::lock_or_recover(&self.last_cue_synth, "voice.last_cue_synth") = None;
         crate::lock_or_recover(&self.foreign_cues, "voice.foreign_cues").clear();
         crate::lock_or_recover(&self.wifi_provisioning, "voice.wifi_provisioning").clear();
@@ -1134,10 +1374,11 @@ impl VoicePipeline {
 
     pub(super) fn project_follow_window_policy(&self) {
         let mut states = crate::lock_or_recover(&self.states, "voice.states");
-        let policy =
-            FollowWindowPolicy::from(&*crate::lock_or_recover(&self.settings, "voice.settings"));
-        for st in states.values_mut() {
-            st.participation.apply_policy(policy, id::now_ms());
+        let settings = crate::lock_or_recover(&self.settings, "voice.settings");
+        let now = id::now_ms();
+        for (dev, st) in states.iter_mut() {
+            let policy = FollowWindowPolicy::for_device(&settings, dev);
+            st.participation.apply_policy(policy, now);
         }
     }
 
@@ -1193,7 +1434,14 @@ impl VoicePipeline {
         let _edit = crate::lock_or_recover(&self.settings_edit_gate, "voice.settings_edit");
         let summary = format!("device {device}: wake_arbitration={}", mode.as_str());
         self.edit_settings(actor, &summary, |s| {
-            s.wake_arbitration = mode;
+            if device == "global" {
+                s.wake_arbitration = mode;
+            } else {
+                s.device_overrides
+                    .entry(device.to_string())
+                    .or_default()
+                    .wake_arbitration = Some(mode);
+            }
         })?;
         self.note(
             "wake_arbitration_set",
@@ -1220,8 +1468,14 @@ impl VoicePipeline {
         let _edit = crate::lock_or_recover(&self.settings_edit_gate, "voice.settings_edit");
         let summary = format!("device {device}: asr_wake_fallback={enabled}");
         self.edit_settings(actor, &summary, |s| {
-            s.asr_wake_fallback = enabled;
-            s.proactive_asr_wake = enabled;
+            if device == "global" {
+                s.asr_wake_fallback = enabled;
+                s.proactive_asr_wake = enabled;
+            } else {
+                let ov = s.device_overrides.entry(device.to_string()).or_default();
+                ov.asr_wake_fallback = Some(enabled);
+                ov.proactive_asr_wake = Some(enabled);
+            }
         })?;
         self.note(
             "asr_wake_fallback_set",
@@ -1232,6 +1486,10 @@ impl VoicePipeline {
     }
 
     pub fn mode_snapshot(&self) -> serde_json::Value {
+        self.mode_snapshot_for(None)
+    }
+
+    pub fn mode_snapshot_for(&self, target_device: Option<&str>) -> serde_json::Value {
         let now = id::now_ms();
         let known_devices: Vec<String> = crate::lock_or_recover(&self.states, "voice.states")
             .keys()
@@ -1264,6 +1522,7 @@ impl VoicePipeline {
         let devices: Vec<serde_json::Value> = states
             .iter()
             .map(|(device, st)| {
+                let eff = settings.effective_for(device);
                 let requested = settings
                     .duplex_requested
                     .get(device)
@@ -1313,11 +1572,19 @@ impl VoicePipeline {
                 }
                 // Mic stream telemetry (console debt, G4): achieved session
                 // state, flow liveness, block levels and lifetime counters.
+                let dev_vad_fallback = {
+                    let mut c = vad_fallback.clone();
+                    if let Some(v) = settings.vad_by_device.get(device) {
+                        c.start_db = v.start_db;
+                        c.end_db = v.end_db;
+                    }
+                    c
+                };
                 let (in_speech, level_stats, vad_cfg, blocks_seen, noise_db, effective, last_close, endpoint) = {
-                    let procs = crate::lock_or_recover(&self.mic, "voice.mic");
-                    procs
-                        .get(device)
-                        .map(|p| {
+                    let proc_arc = self.mic_arc(device);
+                    proc_arc
+                        .map(|arc| {
+                            let p = crate::lock_or_recover(&arc, "voice.mic.dev");
                             (
                                 p.in_speech(),
                                 p.level_stats(),
@@ -1340,9 +1607,9 @@ impl VoicePipeline {
                                 }),
                             )
                         })
-                        .unwrap_or((false, None, vad_fallback.clone(), 0, None, (
-                            vad_fallback.start_db,
-                            vad_fallback.end_db,
+                        .unwrap_or((false, None, dev_vad_fallback.clone(), 0, None, (
+                            dev_vad_fallback.start_db,
+                            dev_vad_fallback.end_db,
                         ), None, json!({
                             "kind": if self.silero.model.is_some() { "silero" } else { "energy" },
                             "stats": null, "fallback": null,
@@ -1388,6 +1655,12 @@ impl VoicePipeline {
                         "confirm_max_ms": confirm_max,
                     })
                 };
+                let dev_reflex_cfg = crate::config_delivery::resolve_reflex_config_for_device(
+                    &self.store,
+                    &settings,
+                    device,
+                )
+                .unwrap_or_else(|_| reflex_cfg.clone());
                 json!({
                     "device": device,
                     "duplex": duplex,
@@ -1408,12 +1681,12 @@ impl VoicePipeline {
                     "input_window_open": st.session_covers_with_live(now, now, now, hub_live),
                     "participation_since_ms": (st.participation.session.state == SessionState::Listening)
                         .then_some(st.participation.session.since_ms),
-                    "proactive_speech": settings.proactive_speech,
-                    "follow_window_tone": settings.follow_window_tone,
-                    "retreat_intent": settings.retreat_intent,
+                    "proactive_speech": eff.proactive_speech,
+                    "follow_window_tone": eff.follow_window_tone,
+                    "retreat_intent": eff.retreat_intent,
                     "wake_ack": {
-                        "enabled": settings.wake_ack.enabled,
-                        "phrases": settings.wake_ack.phrases,
+                        "enabled": eff.wake_ack.enabled,
+                        "phrases": eff.wake_ack.phrases,
                     },
                     // B-M0: the cue is a per-turn fact — the console shows
                     // whether one is live right now, not just the config.
@@ -1500,7 +1773,7 @@ impl VoicePipeline {
                         "wakes": st.keyword_wakes,
                         "ignored": st.keyword_ignored,
                         "last_keyword_ms": st.last_keyword_ms,
-                        "phrase": settings.wake_words.first().map(String::as_str).unwrap_or(""),
+                        "phrase": eff.wake_words.first().map(String::as_str).unwrap_or(""),
                         // R1g/P7: two processes, two epochs. The gateway's
                         // lifetime `detections` outlive this core's counters,
                         // so compare `detections_since_epoch` with `stops`
@@ -1533,12 +1806,12 @@ impl VoicePipeline {
                         // R1 truth: the current answer is still inside its
                         // onset protection period (facts are being ignored).
                         "protected": now < st.barge_protect_until_ms,
-                        "protect_ms": settings.barge_protect_ms,
+                        "protect_ms": eff.barge_protect_ms,
                     },
                     // R1j/P1: the reflex table + this device's per-word counts
                     // and the last deployment as the DEVICE answered it.
                     "reflex": {
-                        "words": reflex_cfg.words.iter().map(|w| json!({
+                        "words": dev_reflex_cfg.words.iter().map(|w| json!({
                             "text": w.text, "tokens": w.tokens,
                             "intent": w.intent.word(), "enabled": w.enabled,
                             "hits": st.reflex_hits.get(&w.text).copied().unwrap_or(0),
@@ -1589,6 +1862,26 @@ impl VoicePipeline {
             .collect();
         for dev in devices.iter_mut() {
             let name = dev["device"].as_str().unwrap_or_default().to_string();
+            let eff = settings.effective_for(&name);
+            dev["media_trim_db"] = json!(eff.media_trim_db);
+            dev["wake_words"] = json!(eff.wake_words);
+            dev["retreat_words"] = json!(eff.retreat_words);
+            dev["tail_blind_ms"] = json!(eff.tail_blind_ms);
+            dev["barge_in"] = json!(eff.barge_in);
+            dev["barge_protect_ms"] = json!(eff.barge_protect_ms);
+            dev["keyword_interrupt"] = json!(eff.keyword_interrupt);
+            dev["follow_window_enabled"] = json!(eff.follow_window_enabled);
+            dev["follow_window_ms"] = json!(eff.follow_window_ms);
+            dev["context_window_ms"] = json!(eff.context_window_ms);
+            dev["followup_credits"] = json!(eff.followup_credits);
+            let (dev_kws_threshold, dev_kws_score) =
+                settings.effective_kws_for(&name, self.hub.kws_device_class(&name));
+            dev["kws_threshold"] = json!(dev_kws_threshold);
+            dev["kws_score"] = json!(dev_kws_score);
+            dev["asr_wake_fallback"] = json!(eff.proactive_asr_wake);
+            dev["proactive_asr_wake"] = json!(eff.proactive_asr_wake);
+            dev["wake_arbitration"] = json!(eff.wake_arbitration.as_str());
+            dev["has_device_override"] = json!(settings.device_overrides.contains_key(&name));
             if let Some(st) = states.get(&name) {
                 if let Some(music) = self.music() {
                     let explicit = st
@@ -1649,56 +1942,79 @@ impl VoicePipeline {
             dev["playback"] = json!(self.playback_capabilities(name, None));
         }
         let settings = crate::lock_or_recover(&self.settings, "voice.settings");
+        let target = target_device.map(str::trim).filter(|s| !s.is_empty());
+        let resolved_for =
+            target.or_else(|| (device_names.len() == 1).then(|| device_names[0].as_str()));
+        let top_eff = match resolved_for {
+            Some(dev) => settings.effective_for(dev),
+            None => settings.clone(),
+        };
         let mut snap = json!({
             "default_duplex": "half",
-            "wake_words": settings.wake_words,
-            "retreat_words": settings.retreat_words,
-            "retreat_ack": settings.retreat_ack,
-            "window_close_ack": settings.window_close_ack,
-            "truncation_notice": settings.truncation_notice,
-            "vad": settings.vad,
-            "tail_blind_ms": settings.tail_blind_ms,
-            "media_trim_db": settings.media_trim_db,
-            "keyword_interrupt": settings.keyword_interrupt,
-            "barge_in": settings.barge_in,
-            "barge_protect_ms": settings.barge_protect_ms,
-            "filler": settings.filler,
-            "stop_intents": settings.stop_intents,
+            "wake_words": top_eff.wake_words,
+            "retreat_words": top_eff.retreat_words,
+            "retreat_ack": top_eff.retreat_ack,
+            "window_close_ack": top_eff.window_close_ack,
+            "truncation_notice": top_eff.truncation_notice,
+            "vad": top_eff.vad,
+            "tail_blind_ms": top_eff.tail_blind_ms,
+            "media_trim_db": top_eff.media_trim_db,
+            "keyword_interrupt": top_eff.keyword_interrupt,
+            "barge_in": top_eff.barge_in,
+            "barge_protect_ms": top_eff.barge_protect_ms,
+            "filler": top_eff.filler,
+            "stop_intents": top_eff.stop_intents,
             // R2: the spoken-delivery policy in force — the console shows the
             // same numbers the prompt and the runtime cap use.
-            "spoken": settings.spoken,
-            "keyword_phrase": settings.wake_words.first().cloned().unwrap_or_default(),
+            "spoken": top_eff.spoken,
+            "keyword_phrase": top_eff.wake_words.first().cloned().unwrap_or_default(),
             // M6b: the persistent journal's bounded health (written files,
             // dropped enqueues, bytes vs the cap). The console shows it so
             // "the disk is full" is a number, not a guess.
             "voice_journal": self.events_file_stats(),
             "devices": devices,
         });
+        snap["scope"] = json!(if target.is_some() { "device" } else { "global" });
+        if let Some(dev) = target {
+            snap["device"] = json!(dev);
+            snap["has_device_override"] = json!(settings.device_overrides.contains_key(dev));
+        }
+        snap["device_overrides"] = json!(settings.device_overrides);
+        snap["proactive_speech"] = json!(top_eff.proactive_speech);
+        snap["retreat_intent"] = json!(top_eff.retreat_intent);
+        snap["wake_ack"] = json!({
+            "enabled": top_eff.wake_ack.enabled,
+            "phrases": top_eff.wake_ack.phrases,
+        });
         // 2026-11-14: whether idle room speech is transcribed (the ASR wake
         // fallback). Global; the console states the recall/privacy trade-off.
-        snap["assistant_name"] = json!(settings.assistant_name);
-        snap["persona_prompt"] = json!(settings.persona_prompt);
-        snap["system_prompt_override"] = json!(settings.system_prompt_override);
-        snap["asr_wake_fallback"] = json!(settings.proactive_asr_wake);
-        snap["proactive_asr_wake"] = json!(settings.proactive_asr_wake);
+        snap["assistant_name"] = json!(top_eff.assistant_name);
+        snap["persona_prompt"] = json!(top_eff.persona_prompt);
+        snap["system_prompt_override"] = json!(top_eff.system_prompt_override);
+        snap["asr_wake_fallback"] = json!(top_eff.proactive_asr_wake);
+        snap["proactive_asr_wake"] = json!(top_eff.proactive_asr_wake);
         snap["sovereignty"] = json!(self.sovereignty.snapshot(now));
         snap["local_music_notices"] = json!(self.sovereignty.local_music_snapshot());
         // v0.30 (wake arbitration): the mode AND the household it applies to,
         // so the console can say "enforce, 4 peers" instead of implying that
         // one speaker decides alone.
         snap["wake_arbitration"] = json!({
-            "mode": settings.wake_arbitration.as_str(),
+            "mode": top_eff.wake_arbitration.as_str(),
             "peers": self.arbiter.peer_count(),
         });
-        snap["follow_window_enabled"] = json!(settings.follow_window_enabled);
-        snap["follow_window_ms"] = json!(settings.follow_window_ms);
-        snap["context_window_ms"] = json!(settings.context_window_ms);
-        snap["followup_credits"] = json!(settings.followup_credits);
-        snap["follow_window_tone"] = json!(settings.follow_window_tone);
+        snap["follow_window_enabled"] = json!(top_eff.follow_window_enabled);
+        snap["follow_window_ms"] = json!(top_eff.follow_window_ms);
+        snap["context_window_ms"] = json!(top_eff.context_window_ms);
+        snap["followup_credits"] = json!(top_eff.followup_credits);
+        snap["follow_window_tone"] = json!(top_eff.follow_window_tone);
         // Contract v2 #4: the spotter's tunable sensitivity (the CONFIG; the
         // applied numbers per device are in `devices[*].kws`).
-        snap["kws_threshold"] = json!(settings.kws_threshold);
-        snap["kws_score"] = json!(settings.kws_score);
+        let (top_kws_threshold, top_kws_score) = match resolved_for {
+            Some(dev) => settings.effective_kws_for(dev, self.hub.kws_device_class(dev)),
+            None => (settings.kws_threshold, settings.kws_score),
+        };
+        snap["kws_threshold"] = json!(top_kws_threshold);
+        snap["kws_score"] = json!(top_kws_score);
         snap["cue_readiness"] = self.cue_readiness_for(&settings);
         snap["announce_queue"] = self.announce_queue_summary();
         snap
@@ -1920,8 +2236,17 @@ pub(super) fn validate_wake_ack(ack: &WakeAckSettings) -> Result<(), String> {
 }
 
 fn cue_phrases_changed(before: &VoiceSettings, after: &VoiceSettings) -> bool {
+    let device_ack_changed = after.device_overrides.iter().any(|(dev, after_ov)| {
+        let Some(after_ack) = after_ov.wake_ack.as_ref() else {
+            return false;
+        };
+        let before_eff = before.effective_for(dev);
+        before_eff.wake_ack.phrases != after_ack.phrases
+            || (!before_eff.wake_ack.enabled && after_ack.enabled)
+    });
     before.wake_ack.phrases != after.wake_ack.phrases
         || (!before.wake_ack.enabled && after.wake_ack.enabled)
+        || device_ack_changed
         || before.retreat_ack != after.retreat_ack
         || before.window_close_ack != after.window_close_ack
         || before.truncation_notice != after.truncation_notice

@@ -43,8 +43,14 @@ impl ConfigApplyCoordinator {
                 let store_c = store.clone();
                 let voice_c = voice.clone();
                 let open_sockets_c = open_sockets.clone();
+                let hub_c = hub.clone();
                 match tokio::task::spawn_blocking(move || {
-                    run_with_runtime(&store_c, voice_c.as_ref(), open_sockets_c.as_ref())
+                    run_with_runtime(
+                        &store_c,
+                        voice_c.as_ref(),
+                        open_sockets_c.as_ref(),
+                        hub_c.as_deref(),
+                    )
                 })
                 .await
                 {
@@ -241,13 +247,14 @@ fn database<T>(store: &Store, f: impl FnOnce(&Connection) -> Result<T>) -> Resul
 
 #[cfg(test)]
 pub(super) fn publish(store: &Store, job: Job) -> Result<()> {
-    publish_transaction(store, &job, None).map(|_| ())
+    publish_transaction(store, &job, None, None).map(|_| ())
 }
 
 fn publish_transaction(
     store: &Store,
     job: &Job,
     current_mode: Option<&VoiceSettings>,
+    hub: Option<&DeviceHub>,
 ) -> Result<(Option<VoiceSettings>, bool)> {
     let _openapi_gate = (job.block == "openapi")
         .then(|| crate::lock_or_recover(&store.openapi_gate, "openapi.publication"));
@@ -290,6 +297,11 @@ fn publish_transaction(
                     "openapi" => "OPENAPI_BASELINE_CHANGED",
                     "mode" => "VOICE_BASELINE_CHANGED",
                     "open_sockets" => "OPEN_SOCKETS_BASELINE_CHANGED",
+                    "reflex" => "REFLEX_BASELINE_CHANGED",
+                    "node" => "NODE_BASELINE_CHANGED",
+                    "audio_eq" => "AUDIO_EQ_BASELINE_CHANGED",
+                    "device_led_configs" => "LED_BASELINE_CHANGED",
+                    "unit_acoustic_profiles" => "ACOUSTIC_PROFILE_BASELINE_CHANGED",
                     _ => "SEARCH_BASELINE_CHANGED",
                 }),
             )?;
@@ -359,8 +371,12 @@ fn publish_transaction(
                     }
                 } else if job.block == "unit_acoustic_profiles" {
                     if let Some(map) = desired.as_object() {
+                        let expected_map = block["expected"].as_object();
                         for (dev, v) in map {
-                            if dev != &node {
+                            let changed = expected_map.and_then(|m| m.get(dev)) != Some(v);
+                            let dev_allowed =
+                                dev == &node || hub.is_some_and(|h| h.device_exists(dev));
+                            if changed && !dev_allowed {
                                 return Err(DeliveryError::new(
                                     "FORBIDDEN_SCOPE",
                                     "unit acoustic profile device mismatch",
@@ -421,6 +437,11 @@ fn publish_transaction(
                     "openapi" => "OPENAPI_PUBLICATION_FAILED",
                     "mode" => "VOICE_PUBLICATION_FAILED",
                     "open_sockets" => "OPEN_SOCKETS_PUBLICATION_FAILED",
+                    "reflex" => "REFLEX_PUBLICATION_FAILED",
+                    "node" => "NODE_PUBLICATION_FAILED",
+                    "audio_eq" => "AUDIO_EQ_PUBLICATION_FAILED",
+                    "device_led_configs" => "LED_PUBLICATION_FAILED",
+                    "unit_acoustic_profiles" => "ACOUSTIC_PROFILE_PUBLICATION_FAILED",
                     _ => "SEARCH_PUBLICATION_FAILED",
                 },
             )?;
@@ -483,7 +504,7 @@ fn finish(c: &Connection, job: &Job, state: &str, error: Option<&str>) -> Result
 
 #[cfg(test)]
 pub(super) fn run_once(store: &Store) -> Result<()> {
-    run_with_runtime(store, None, None)
+    run_with_runtime(store, None, None, None)
 }
 
 fn mode_has_gateway_changes(job: &Job) -> bool {
@@ -492,6 +513,7 @@ fn mode_has_gateway_changes(job: &Job) -> bool {
     let desired = &block["desired"];
     [
         "wake_words",
+        "retreat_words",
         "kws_threshold",
         "kws_score",
         "duplex_requested",
@@ -511,16 +533,17 @@ fn run_with_runtime(
     store: &Store,
     voice: Option<&Arc<VoicePipeline>>,
     open_sockets: Option<&super::open_sockets::Provider>,
+    hub: Option<&DeviceHub>,
 ) -> Result<()> {
     for job in prepare(store)? {
-        if is_gateway_block(&job) {
+        if is_gateway_block(&job) && (hub.is_some() || job.block != "mode") {
             continue;
         }
         match job.block.as_str() {
             "mode" => {
                 if let Some(voice) = voice {
-                    voice.publish_reviewed_settings(|current| {
-                        publish_transaction(store, &job, Some(current)).map(|(next, _)| next)
+                    let _ = voice.publish_reviewed_settings(|current| {
+                        publish_transaction(store, &job, Some(current), hub)
                     })?;
                 }
             }
@@ -533,39 +556,53 @@ fn run_with_runtime(
                         provider
                             .runtime
                             .publish_reviewed(&provider.registry, desired, || {
-                                publish_transaction(store, &job, None).map(|(_, applied)| applied)
+                                publish_transaction(store, &job, None, hub)
+                                    .map(|(_, applied)| applied)
                             })
                     });
                     if let Err(error) = attempt {
-                        record_failure(store, &job, error.code)?;
+                        record_failure(store, &job, &error.code)?;
                     }
                 }
             }
             _ => {
-                publish_transaction(store, &job, None)?;
+                publish_transaction(store, &job, None, hub)?;
             }
         }
     }
     Ok(())
 }
 
+async fn blocking_db<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| DeliveryError::internal(format!("blocking sqlite task failed: {e}")))?
+}
+
 async fn run_gateway_jobs(
-    store: &Store,
+    store: &Arc<Store>,
     voice: Option<&Arc<VoicePipeline>>,
     hub: &Arc<DeviceHub>,
 ) -> Result<()> {
-    let jobs = prepare(store)?;
-    if jobs.is_empty() {
-        return Ok(());
-    }
-    let node_id: String = database(store, |c| {
-        Ok(
-            c.query_row("SELECT node_id FROM config_head WHERE id=1", [], |r| {
-                r.get(0)
-            })?,
-        )
-    })?;
-    if node_id.is_empty() {
+    let store_prep = store.clone();
+    let (jobs, node_id) = blocking_db(move || {
+        let jobs = prepare(&store_prep)?;
+        if jobs.is_empty() {
+            return Ok((Vec::new(), String::new()));
+        }
+        let node_id: String = database(&store_prep, |c| {
+            Ok(
+                c.query_row("SELECT node_id FROM config_head WHERE id=1", [], |r| {
+                    r.get(0)
+                })?,
+            )
+        })?;
+        Ok((jobs, node_id))
+    })
+    .await?;
+    if jobs.is_empty() || node_id.is_empty() {
         return Ok(());
     }
 
@@ -577,130 +614,394 @@ async fn run_gateway_jobs(
         let desired = &block_data["desired"];
         let expected = block_data.get("expected");
         let current_voice = voice.map(|v| v.settings_snapshot());
-        let current_reflex = store
-            .config_get(crate::config::REFLEX_KEY)
-            .ok()
-            .flatten()
-            .and_then(|s| serde_json::from_str::<crate::config::ReflexConfig>(&s).ok());
-        let current_node = store
-            .config_get("node")
-            .ok()
-            .flatten()
-            .and_then(|s| serde_json::from_str::<Value>(&s).ok());
-        let current_led = store
-            .config_get(crate::config::DEVICE_LED_CONFIGS_KEY)
-            .ok()
-            .flatten()
-            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-            .and_then(|v| v.get(&node_id).cloned())
-            .and_then(|v| serde_json::from_value::<crate::config::DeviceLedConfig>(v).ok());
+        let store_snap = store.clone();
+        let (current_reflex, current_node, current_led_map) = blocking_db(move || {
+            let current_reflex = store_snap
+                .config_get(crate::config::REFLEX_KEY)
+                .ok()
+                .flatten()
+                .and_then(|s| serde_json::from_str::<crate::config::ReflexConfig>(&s).ok());
+            let current_node = store_snap
+                .config_get("node")
+                .ok()
+                .flatten()
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+            let current_led_map = store_snap
+                .config_get(crate::config::DEVICE_LED_CONFIGS_KEY)
+                .ok()
+                .flatten()
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+            Ok((current_reflex, current_node, current_led_map))
+        })
+        .await?;
 
-        let targets = match super::gateway_dispatch::build_gateway_payload(
-            &job.block,
-            &node_id,
-            desired,
-            expected,
-            current_voice.as_ref(),
-            current_reflex.as_ref(),
-            current_node.as_ref(),
-            current_led.as_ref(),
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                record_failure_with_receipt(store, &job, e.code, json!({ "error": e.detail }))?;
-                continue;
+        // Resolve target gateway devices for this config job (`MG-P1-02`):
+        // - `unit_acoustic_profiles` and `device_led_configs` target ONLY per-unit
+        //   keys that actually changed in `desired` vs `expected`. If a changed
+        //   target device is offline, NEVER fall back to pushing to `node_id`
+        //   (`dot2-d`); record `skipped_offline` and persist for reconnect reconciliation.
+        // - Shared gateway blocks (`reflex`, `audio_eq`, `mode`, `node`) target every
+        //   online `config_apply_v2` device, falling back to `[node_id]` only when
+        //   zero v2 gateways are online so offline failures remain honest.
+        let mut receipts: Vec<Value> = Vec::new();
+        let target_devices: Vec<String> = match job.block.as_str() {
+            "unit_acoustic_profiles" | "device_led_configs" => {
+                let online_v2 = hub.devices_with_cap("config_apply_v2");
+                let expected_map = expected.and_then(|v| v.as_object());
+                let cfg_block = if job.block == "unit_acoustic_profiles" {
+                    crate::gateway::ConfigBlock::Acoustics
+                } else {
+                    crate::gateway::ConfigBlock::Led
+                };
+                let mut changed: Vec<String> = desired
+                    .as_object()
+                    .map(|m| {
+                        m.iter()
+                            .filter(|(k, v)| {
+                                expected_map.is_none_or(|em| em.get(k.as_str()) != Some(*v))
+                            })
+                            .map(|(k, _)| k.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                changed.sort();
+                let mut matched = Vec::new();
+                for dev in changed {
+                    if online_v2.iter().any(|d| d == &dev) {
+                        matched.push(dev);
+                    } else {
+                        receipts.push(json!({
+                            "device": dev,
+                            "block": cfg_block,
+                            "state": "skipped_offline",
+                            "reason": "target device is offline or lacks config_apply_v2; saved for reconnect reconciliation",
+                        }));
+                    }
+                }
+                matched
+            }
+            _ => {
+                let mut online_v2 = hub.devices_with_cap("config_apply_v2");
+                online_v2.sort();
+                if online_v2.is_empty() {
+                    vec![node_id.clone()]
+                } else {
+                    online_v2
+                }
             }
         };
 
-        let mut receipts = Vec::new();
-        let mut applied_blocks = Vec::new();
-        let mut failure: Option<(String, &'static str, Value)> = None;
-
-        for (idx, (cfg_block, values)) in targets.iter().enumerate() {
-            let outcome = super::gateway_dispatch::dispatch_block_v2(
-                hub,
-                &node_id,
-                job.epoch,
-                &job.id,
-                job.revision,
-                job.revision.saturating_mul(10) + (idx as u64) + 1,
-                *cfg_block,
-                values.clone(),
-            )
-            .await;
-            receipts.push(outcome.receipt.clone());
-            if outcome.state == "applied" {
-                applied_blocks.push(*cfg_block);
-            } else {
-                failure = Some((
-                    outcome
-                        .error
-                        .unwrap_or_else(|| "GATEWAY_DISPATCH_FAILED".into()),
-                    outcome.state,
-                    json!(receipts),
-                ));
-                break;
+        // Plan blocks per device and ALWAYS check per-device capabilities
+        // (`supports_config_apply_v2`), even when only 1 gateway (e.g. Android)
+        // is online (`MG-P1-02` #4).
+        let mut planned_by_device: std::collections::BTreeMap<
+            String,
+            Vec<(crate::gateway::ConfigBlock, Value)>,
+        > = std::collections::BTreeMap::new();
+        let mut build_err: Option<DeliveryError> = None;
+        for target_dev in &target_devices {
+            let current_led = current_led_map
+                .as_ref()
+                .and_then(|v| v.get(target_dev).cloned())
+                .and_then(|v| serde_json::from_value::<crate::config::DeviceLedConfig>(v).ok());
+            match super::gateway_dispatch::build_gateway_payload(
+                &job.block,
+                target_dev,
+                hub.kws_device_class(target_dev),
+                desired,
+                expected,
+                current_voice.as_ref(),
+                current_reflex.as_ref(),
+                current_node.as_ref(),
+                current_led.as_ref(),
+            ) {
+                Ok(items) => {
+                    let dev_is_online_v2 =
+                        hub.device_online_with_cap(target_dev, "config_apply_v2");
+                    for (cfg_block, values) in items {
+                        if let Err(reason) = hub.supports_config_apply_v2(target_dev, cfg_block) {
+                            if dev_is_online_v2 {
+                                receipts.push(json!({
+                                    "device": target_dev,
+                                    "block": cfg_block,
+                                    "state": "skipped_unsupported",
+                                    "reason": reason,
+                                }));
+                                continue;
+                            }
+                        }
+                        planned_by_device
+                            .entry(target_dev.clone())
+                            .or_default()
+                            .push((cfg_block, values));
+                    }
+                }
+                Err(e) => {
+                    build_err = Some(e);
+                    break;
+                }
             }
         }
+        if let Some(e) = build_err {
+            let store_err = store.clone();
+            let job_err = job.clone();
+            blocking_db(move || {
+                record_failure_with_receipt(
+                    &store_err,
+                    &job_err,
+                    &e.code,
+                    json!({ "error": e.detail }),
+                )
+            })
+            .await?;
+            continue;
+        }
 
-        if let Some((err_msg, state, receipts_json)) = failure {
-            // Rollback compensation for any sub-blocks that already succeeded in this job.
-            if !applied_blocks.is_empty() {
-                if let Some(exp) = expected {
-                    if let Ok(rollback_targets) = super::gateway_dispatch::build_gateway_payload(
-                        &job.block,
+        let mut all_applied_blocks: Vec<(String, crate::gateway::ConfigBlock)> = Vec::new();
+        let mut failures: Vec<(String, String, &'static str)> = Vec::new();
+
+        // `block_generation` is tracked per `(device, block)` monotonically.
+        // Using `revision * 10 + 1` for forward apply and `revision * 10 + 2` for
+        // rollback compensation guarantees strict monotonicity across any number
+        // of devices and blocks without ever colliding into `revision + 1`.
+        let forward_gen = job.revision.saturating_mul(10).saturating_add(1);
+        let rollback_gen = job.revision.saturating_mul(10).saturating_add(2);
+
+        // Dispatch per device independently (`MG-P1-02` #1): a failure on Device B
+        // rolls back ONLY Device B's own intra-device partial blocks and NEVER rolls
+        // back healthy sibling Device A.
+        for (target_dev, blocks) in &planned_by_device {
+            let mut dev_applied: Vec<(String, crate::gateway::ConfigBlock)> = Vec::new();
+            let mut dev_failure: Option<(String, &'static str)> = None;
+            for (cfg_block, values) in blocks {
+                let mut outcome = super::gateway_dispatch::dispatch_block_v2(
+                    hub,
+                    target_dev,
+                    &node_id,
+                    job.epoch,
+                    &job.id,
+                    job.revision,
+                    forward_gen,
+                    *cfg_block,
+                    values.clone(),
+                )
+                .await;
+                if let Some(obj) = outcome.receipt.as_object_mut() {
+                    obj.entry("device".to_string())
+                        .or_insert_with(|| json!(target_dev));
+                }
+                receipts.push(outcome.receipt.clone());
+                if outcome.state == "applied" {
+                    dev_applied.push((target_dev.clone(), *cfg_block));
+                    all_applied_blocks.push((target_dev.clone(), *cfg_block));
+                } else {
+                    dev_failure = Some((
+                        outcome
+                            .error
+                            .unwrap_or_else(|| "GATEWAY_DISPATCH_FAILED".into()),
+                        outcome.state,
+                    ));
+                    break;
+                }
+            }
+            if let Some((err_msg, state)) = dev_failure {
+                if !dev_applied.is_empty() {
+                    // Roll back ONLY this failing device's intra-device partial blocks.
+                    let single = vec![target_dev.clone()];
+                    rollback_applied_gateway_blocks(
+                        hub,
+                        &job,
                         &node_id,
-                        exp,
-                        None,
+                        rollback_gen,
+                        &single,
+                        &dev_applied,
+                        expected,
                         current_voice.as_ref(),
                         current_reflex.as_ref(),
                         current_node.as_ref(),
-                        current_led.as_ref(),
-                    ) {
-                        for (idx, (rb_block, rb_values)) in rollback_targets.into_iter().enumerate()
-                        {
-                            if applied_blocks.contains(&rb_block) {
-                                let _ = super::gateway_dispatch::dispatch_block_v2(
-                                    hub,
-                                    &node_id,
-                                    job.epoch,
-                                    &job.id,
-                                    job.revision,
-                                    job.revision.saturating_mul(10) + 5 + (idx as u64),
-                                    rb_block,
-                                    rb_values,
-                                )
-                                .await;
-                            }
-                        }
-                    }
+                        current_led_map.as_ref(),
+                    )
+                    .await;
                 }
+                failures.push((target_dev.clone(), err_msg, state));
             }
-            if state == "superseded" {
-                record_superseded_with_receipt(store, &job, &err_msg, receipts_json)?;
+        }
+
+        if !failures.is_empty() {
+            let receipts_json = json!(receipts);
+            let all_superseded = failures.iter().all(|(_, _, st)| *st == "superseded");
+            let err_summary = if failures.len() == 1 {
+                failures[0].1.clone()
             } else {
-                record_failure_with_receipt(store, &job, &err_msg, receipts_json)?;
-            }
+                failures
+                    .iter()
+                    .map(|(d, e, _)| format!("{d}: {e}"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            let store_fail = store.clone();
+            let job_fail = job.clone();
+            blocking_db(move || {
+                if all_superseded {
+                    record_superseded_with_receipt(
+                        &store_fail,
+                        &job_fail,
+                        &err_summary,
+                        receipts_json,
+                    )
+                } else {
+                    record_failure_with_receipt(&store_fail, &job_fail, &err_summary, receipts_json)
+                }
+            })
+            .await?;
             continue;
         }
 
         let receipts_json = json!(receipts);
-        let pub_res = if job.block == "mode" {
-            if let Some(voice) = voice {
-                voice.publish_reviewed_settings(|current| {
-                    publish_transaction(store, &job, Some(current)).map(|(next, _)| next)
-                })
+        let store_pub = store.clone();
+        let voice_pub = voice.cloned();
+        let hub_pub = hub.clone();
+        let job_pub = job.clone();
+        let pub_res = blocking_db(move || {
+            if job_pub.block == "mode" {
+                if let Some(voice) = voice_pub.as_ref() {
+                    voice.publish_reviewed_settings(|current| {
+                        publish_transaction(&store_pub, &job_pub, Some(current), Some(&hub_pub))
+                    })
+                } else {
+                    Err(DeliveryError::internal("voice runtime is unavailable"))
+                }
             } else {
-                Err(DeliveryError::internal("voice runtime is unavailable"))
+                publish_transaction(&store_pub, &job_pub, None, Some(&hub_pub))
+                    .map(|(_, applied)| applied)
             }
-        } else {
-            publish_transaction(store, &job, None).map(|_| ())
-        };
-        if pub_res.is_ok() {
-            store_gateway_receipt(store, &job, receipts_json)?;
+        })
+        .await;
+        match pub_res {
+            Ok(true) => {
+                let store_rcpt = store.clone();
+                let job_rcpt = job.clone();
+                blocking_db(move || store_gateway_receipt(&store_rcpt, &job_rcpt, receipts_json))
+                    .await?;
+            }
+            Ok(false) => {
+                // SQLite rejected or superseded publication after gateways applied
+                // the forward config: compensate all applied gateways immediately
+                // so live gateway state cannot diverge from Core SQLite.
+                rollback_applied_gateway_blocks(
+                    hub,
+                    &job,
+                    &node_id,
+                    rollback_gen,
+                    &target_devices,
+                    &all_applied_blocks,
+                    expected,
+                    current_voice.as_ref(),
+                    current_reflex.as_ref(),
+                    current_node.as_ref(),
+                    current_led_map.as_ref(),
+                )
+                .await;
+            }
+            Err(err) => {
+                rollback_applied_gateway_blocks(
+                    hub,
+                    &job,
+                    &node_id,
+                    rollback_gen,
+                    &target_devices,
+                    &all_applied_blocks,
+                    expected,
+                    current_voice.as_ref(),
+                    current_reflex.as_ref(),
+                    current_node.as_ref(),
+                    current_led_map.as_ref(),
+                )
+                .await;
+                return Err(err);
+            }
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn rollback_applied_gateway_blocks(
+    hub: &Arc<DeviceHub>,
+    job: &Job,
+    core_node_id: &str,
+    rollback_gen: u64,
+    target_devices: &[String],
+    applied_blocks: &[(String, crate::gateway::ConfigBlock)],
+    expected: Option<&Value>,
+    current_voice: Option<&crate::voice::VoiceSettings>,
+    current_reflex: Option<&crate::config::ReflexConfig>,
+    current_node: Option<&Value>,
+    current_led_map: Option<&Value>,
+) {
+    if applied_blocks.is_empty() {
+        return;
+    }
+    for target_dev in target_devices {
+        let dev_applied: Vec<crate::gateway::ConfigBlock> = applied_blocks
+            .iter()
+            .filter(|(d, _)| d == target_dev)
+            .map(|(_, b)| *b)
+            .collect();
+        if dev_applied.is_empty() {
+            continue;
+        }
+        let current_led = current_led_map
+            .and_then(|v| v.get(target_dev).cloned())
+            .and_then(|v| serde_json::from_value::<crate::config::DeviceLedConfig>(v).ok());
+        let mut rollback_targets = if let Some(exp) = expected {
+            super::gateway_dispatch::build_gateway_payload(
+                &job.block,
+                target_dev,
+                hub.kws_device_class(target_dev),
+                exp,
+                None,
+                current_voice,
+                current_reflex,
+                current_node,
+                current_led.as_ref(),
+            )
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        // If `mode` applied `ConfigBlock::Duplex` on a device whose prior
+        // `expected.duplex_requested` had no explicit entry, its effective
+        // baseline was the everyday default `"half"`: synthesize an explicit
+        // rollback frame so the gateway never remains stuck in `"full"` duplex.
+        if job.block == "mode"
+            && dev_applied.contains(&crate::gateway::ConfigBlock::Duplex)
+            && !rollback_targets
+                .iter()
+                .any(|(b, _)| *b == crate::gateway::ConfigBlock::Duplex)
+        {
+            rollback_targets.push((
+                crate::gateway::ConfigBlock::Duplex,
+                json!({ "duplex_requested": "half" }),
+            ));
+        }
+        for (rb_block, rb_values) in rollback_targets {
+            if dev_applied.contains(&rb_block) {
+                let _ = super::gateway_dispatch::dispatch_block_v2(
+                    hub,
+                    target_dev,
+                    core_node_id,
+                    job.epoch,
+                    &job.id,
+                    job.revision,
+                    rollback_gen,
+                    rb_block,
+                    rb_values,
+                )
+                .await;
+            }
+        }
+    }
 }
 
 fn store_gateway_receipt(store: &Store, job: &Job, receipts: Value) -> Result<()> {

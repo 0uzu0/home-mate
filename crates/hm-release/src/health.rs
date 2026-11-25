@@ -69,7 +69,10 @@ fn mode_get(paths: &Paths) -> Option<Value> {
     paths.mode().ok()
 }
 
-fn select_gateway_device<'a>(devices: &'a [Value], want_model: &str) -> Option<&'a Value> {
+pub(crate) fn select_gateway_device<'a>(
+    devices: &'a [Value],
+    want_model: &str,
+) -> Option<&'a Value> {
     devices
         .iter()
         .find(|d| {

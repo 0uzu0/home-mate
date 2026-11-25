@@ -33,6 +33,7 @@ interface Draft {
 }
 
 const draft = ref<Draft | null>(null)
+const touched = ref(false)
 const probe = ref<NewsProbe | null>(null)
 const probing = ref(false)
 const probeError = ref('')
@@ -58,7 +59,7 @@ function fromStatus(status: NewsStatus): Draft {
 watch(
   () => news.data.value,
   (status) => {
-    if (status && draft.value === null) draft.value = fromStatus(status)
+    if (status && (draft.value === null || !touched.value)) draft.value = fromStatus(status)
   },
   { immediate: true },
 )
@@ -92,6 +93,7 @@ const aliasOptions = computed(() => [
 
 function addSource(): void {
   if (!draft.value || draft.value.sources.length >= draft.value.maxSources) return
+  touched.value = true
   draft.value.sources.push({
     alias: draft.value.sources.length === 0 ? t('newsAliasPlaceholder') : '',
     url: '',
@@ -102,6 +104,7 @@ function addSource(): void {
 
 function removeSource(index: number): void {
   if (!draft.value) return
+  touched.value = true
   const removed = draft.value.sources[index]
   draft.value.sources.splice(index, 1)
   if (removed?.alias === draft.value.defaultAlias) draft.value.defaultAlias = ''
@@ -128,6 +131,7 @@ async function save(): Promise<void> {
       { timeoutMs: 10000 },
     )
     draft.value = fromStatus(status)
+    touched.value = false
     await news.load()
   })
 }
@@ -147,7 +151,10 @@ async function runProbe(): Promise<void> {
 
 function reload(): void {
   void news.load().then(() => {
-    if (news.data.value) draft.value = fromStatus(news.data.value)
+    if (news.data.value) {
+      draft.value = fromStatus(news.data.value)
+      touched.value = false
+    }
   })
   probe.value = null
   probeError.value = ''
@@ -172,12 +179,18 @@ function reload(): void {
     <ErrorNotice v-if="news.error.value" :error="news.error.value" compact @retry="news.load()" />
 
     <template v-if="draft">
-      <Toggle v-model="draft.enabled" :label="t('newsEnabled')" />
+      <Toggle v-model="draft.enabled" :label="t('newsEnabled')" @update:model-value="touched = true" />
 
       <div class="news__sources">
         <p class="news__subtitle">{{ t('newsSources') }}</p>
         <p v-if="!draft.sources.length" class="news__empty">{{ t('newsNoSources') }}</p>
-        <div v-for="(source, index) in draft.sources" :key="`src-${index}`" class="news__source">
+        <div
+          v-for="(source, index) in draft.sources"
+          :key="`src-${index}`"
+          class="news__source"
+          @input="touched = true"
+          @change="touched = true"
+        >
           <label class="wf">
             <span class="wf__label">{{ t('newsAlias') }}</span>
             <input v-model="source.alias" class="wf__input" :placeholder="t('newsAliasPlaceholder')" />
@@ -213,9 +226,26 @@ function reload(): void {
       </div>
 
       <div class="news__grid">
-        <Select v-model="draft.defaultAlias" :label="t('newsDefault')" :options="aliasOptions" />
-        <NumberField v-model="draft.timeoutMs" :label="t('newsTimeout')" :min="500" :max="15000" />
-        <NumberField v-model="draft.maxSources" :label="t('newsMaxSources')" :min="1" :max="50" />
+        <Select
+          v-model="draft.defaultAlias"
+          :label="t('newsDefault')"
+          :options="aliasOptions"
+          @update:model-value="touched = true"
+        />
+        <NumberField
+          v-model="draft.timeoutMs"
+          :label="t('newsTimeout')"
+          :min="500"
+          :max="15000"
+          @update:model-value="touched = true"
+        />
+        <NumberField
+          v-model="draft.maxSources"
+          :label="t('newsMaxSources')"
+          :min="1"
+          :max="50"
+          @update:model-value="touched = true"
+        />
       </div>
 
       <div class="news__actions">

@@ -1,10 +1,11 @@
 <script setup lang="ts">
 /**
- * Exact integer entry (thresholds, milliseconds, dB). Today's value is the
- * stored value: mid-keystroke emptiness is allowed but never committed, and
+ * Exact numeric entry (thresholds, milliseconds, dB). Defaults to integer-only;
+ * passing a fractional `step` enables decimal entry with clean precision
+ * rounding on blur. Mid-keystroke emptiness is allowed but never committed, and
  * blur snaps the box back to what is actually saved.
  */
-import { ref, useId, watch } from 'vue'
+import { computed, ref, useId, watch } from 'vue'
 import { clamp } from '../format'
 
 const props = withDefaults(
@@ -13,18 +14,37 @@ const props = withDefaults(
     label: string
     min: number
     max: number
+    step?: number
     unit?: string
     hint?: string
     disabled?: boolean
     placeholder?: string
   }>(),
-  { unit: '', hint: '', disabled: false, placeholder: '' },
+  { step: undefined, unit: '', hint: '', disabled: false, placeholder: '' },
 )
 
 const emit = defineEmits<{ 'update:modelValue': [value: number] }>()
 const id = useId()
 const text = ref(String(props.modelValue))
 const editing = ref(false)
+
+const isDecimal = computed(() => props.step !== undefined && props.step > 0 && !Number.isInteger(props.step))
+
+function stepDecimals(step: number): number {
+  const s = step.toString().toLowerCase()
+  if (s.includes('e-')) {
+    const [base, exp] = s.split('e-')
+    const frac = base.includes('.') ? base.split('.')[1].length : 0
+    return Number(exp) + frac
+  }
+  return s.includes('.') ? s.split('.')[1].length : 0
+}
+
+function normalize(value: number): number {
+  if (!isDecimal.value) return Math.trunc(value)
+  const factor = 10 ** stepDecimals(props.step!)
+  return Math.round(value * factor) / factor
+}
 
 watch(
   () => props.modelValue,
@@ -35,15 +55,17 @@ watch(
 
 function commit(raw: string): void {
   if (props.disabled) return
-  if (raw === '' || raw === '-') return
+  if (raw === '' || raw === '-' || raw === '.' || raw === '-.' || raw.endsWith('.')) return
   const parsed = Number(raw)
-  if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) return
+  if (!Number.isFinite(parsed)) return
+  if (!isDecimal.value && !Number.isInteger(parsed)) return
   emit('update:modelValue', clamp(parsed, props.min, props.max))
 }
 
 function onInput(event: Event): void {
   const raw = (event.target as HTMLInputElement).value
-  if (!/^-?\d*$/.test(raw)) return
+  const pattern = isDecimal.value ? /^-?\d*\.?\d*$/ : /^-?\d*$/
+  if (!pattern.test(raw)) return
   text.value = raw
   commit(raw)
 }
@@ -54,7 +76,7 @@ function onBlur(): void {
   const next =
     text.value === '' || !Number.isFinite(parsed)
       ? props.modelValue
-      : clamp(Math.trunc(parsed), props.min, props.max)
+      : clamp(normalize(parsed), props.min, props.max)
   text.value = String(next)
   if (next !== props.modelValue) emit('update:modelValue', next)
 }
@@ -69,7 +91,7 @@ function onBlur(): void {
         :id="id"
         class="field__input mono"
         type="text"
-        inputmode="numeric"
+        :inputmode="isDecimal ? 'decimal' : 'numeric'"
         autocomplete="off"
         :value="text"
         :disabled="disabled"

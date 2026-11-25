@@ -4,7 +4,7 @@
  * Stop submits cancellation; only a matching flush confirms hardware silence.
  */
 import { computed } from 'vue'
-import { stopDevice, type GatewaySnapshot, type ModeDevice } from '../../api'
+import { stopDevice, type GatewayDevice, type GatewaySnapshot, type ModeDevice } from '../../api'
 import { t } from '../../i18n'
 import { formatTime } from '../../format'
 import { useSave } from '../../hooks/useSave'
@@ -16,6 +16,7 @@ import Pill from '../Pill.vue'
 const props = defineProps<{
   device: ModeDevice | null
   gateway: GatewaySnapshot | null
+  gatewayDevice?: GatewayDevice | null
   refresh: () => void | Promise<void>
 }>()
 
@@ -25,6 +26,21 @@ const outputs = computed(() => props.device?.outputs ?? [])
 // That is a fact, not an active output — show it, but explain it, so the
 // card cannot read as "four things are playing" while activity is idle.
 const hasStopping = computed(() => outputs.value.some((output) => output.stage === 'stopping'))
+
+const deviceGatewayConnected = computed(() => {
+  const id = props.device?.device
+  if (!id) return false
+  const gwDev =
+    props.gatewayDevice && props.gatewayDevice.stable_id === id
+      ? props.gatewayDevice
+      : props.gateway?.devices?.find((d) => d.stable_id === id) ?? null
+  if (props.gateway?.connections?.length) {
+    const hasConn = props.gateway.connections.some((c) => c.devices.includes(id))
+    return hasConn && (gwDev ? gwDev.online : true)
+  }
+  if (gwDev) return gwDev.online
+  return (props.gateway?.devices?.length ?? 0) <= 1 && Boolean(props.gateway?.connected)
+})
 
 async function stop(): Promise<void> {
   if (!props.device) return
@@ -45,9 +61,12 @@ async function stop(): Promise<void> {
       </button>
     </template>
 
-    <div v-if="gateway" class="outputs__meta">
-      <Pill size="sm" mono>{{ t('pendingPlays') }}: {{ gateway.pending_plays }}</Pill>
-      <Pill size="sm" mono>{{ t('gatewayLabel') }}: {{ gateway.connected ? t('connected') : t('disconnected') }}</Pill>
+    <div v-if="device" class="outputs__meta">
+      <Pill size="sm" tone="accent" mono>{{ t('scopeThisDevice', { device: device.device }) }}</Pill>
+      <Pill size="sm" mono>{{ t('deviceOutputsCount') }}: {{ outputs.length }}</Pill>
+      <Pill v-if="gateway || gatewayDevice" size="sm" :tone="deviceGatewayConnected ? 'ok' : 'warn'" mono>
+        {{ t('gatewayLabel') }}: {{ deviceGatewayConnected ? t('connected') : t('disconnected') }}
+      </Pill>
     </div>
 
     <EmptyState v-if="!outputs.length" :title="t('noOutputs')" />

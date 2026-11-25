@@ -5,15 +5,15 @@
  * roll back. The device is the authority: every card renders facts from
  * `state.json` / the live core, never an assumption that a click worked.
  */
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, ref } from 'vue'
 import {
   activateRelease,
   getRelease,
   getReleaseLog,
   installRelease,
+  isAbort,
   rollbackRelease,
   type ReleaseRef,
-  type ReleaseRun,
 } from '../api'
 import { t } from '../i18n'
 import { useResource } from '../hooks/useResource'
@@ -30,24 +30,35 @@ import ConfirmDialog from '../components/ConfirmDialog.vue'
 
 const view = useResource((signal) => getRelease({ signal }), { timeoutMs: 6000, retries: 1 })
 usePoll(() => view.load(), 3000)
-onMounted(() => view.load())
 
 const logLines = ref<string[]>([])
 const logPath = ref('')
 const logError = ref<unknown>(null)
+let logSeq = 0
+let logController: AbortController | null = null
 
 async function loadLog(): Promise<void> {
+  const seq = ++logSeq
+  logController?.abort()
+  const controller = new AbortController()
+  logController = controller
   try {
-    const r = await getReleaseLog(200)
+    const r = await getReleaseLog(200, { signal: controller.signal })
+    if (seq !== logSeq) return
     logLines.value = r.lines
     logPath.value = r.path
     logError.value = null
   } catch (err) {
+    if (seq !== logSeq || isAbort(err)) return
     logError.value = err
   }
 }
 usePoll(() => loadLog(), 5000)
-onMounted(() => loadLog())
+onBeforeUnmount(() => {
+  logSeq += 1
+  logController?.abort()
+  logController = null
+})
 
 const state = computed(() => view.data.value?.state ?? null)
 const active = computed(() => state.value?.active ?? null)
@@ -163,25 +174,31 @@ async function runAction(fn: () => Promise<unknown>, done: string): Promise<void
 
 async function confirmPending(): Promise<void> {
   const p = pending.value
-  if (!p) return
-  const pAction = p
-  pending.value = null
-  if (pAction.kind === 'install-activate') {
-    await runAction(
-      () => installRelease(confirmUrl.value, true),
-      t('releaseTaskStarted', { task: t('releaseInstallActivate') }),
-    )
-  } else if (pAction.kind === 'activate') {
-    await runAction(
-      () => activateRelease(pAction.id, 'console'),
-      t('releaseTaskStarted', { task: t('releaseActivate') }),
-    )
-  } else {
-    await runAction(
-      () => rollbackRelease('console rollback'),
-      t('releaseTaskStarted', { task: t('releaseRollback') }),
-    )
+  if (!p || actionBusy.value) return
+  try {
+    if (p.kind === 'install-activate') {
+      await runAction(
+        () => installRelease(confirmUrl.value, true),
+        t('releaseTaskStarted', { task: t('releaseInstallActivate') }),
+      )
+    } else if (p.kind === 'activate') {
+      await runAction(
+        () => activateRelease(p.id, 'console'),
+        t('releaseTaskStarted', { task: t('releaseActivate') }),
+      )
+    } else {
+      await runAction(
+        () => rollbackRelease('console rollback'),
+        t('releaseTaskStarted', { task: t('releaseRollback') }),
+      )
+    }
+  } finally {
+    pending.value = null
   }
+}
+
+function cancelPending(): void {
+  if (!actionBusy.value) pending.value = null
 }
 
 const installUrl = ref('')
@@ -205,8 +222,8 @@ async function install(activate: boolean): Promise<void> {
     return
   }
   await runAction(
-    () => installRelease(url, activate),
-    t('releaseTaskStarted', { task: activate ? t('releaseInstallActivate') : t('releaseInstallOnly') }),
+    () => installRelease(url, false),
+    t('releaseTaskStarted', { task: t('releaseInstallOnly') }),
   )
 }
 </script>
@@ -224,6 +241,14 @@ async function install(activate: boolean): Promise<void> {
     <ErrorNotice v-else-if="view.error.value && !view.data.value" :error="view.error.value" @retry="view.load" />
 
     <div v-else class="page__grid">
+      <ErrorNotice
+        v-if="view.error.value && view.data.value"
+        :error="view.error.value"
+        :stale="view.stale.value"
+        :at="view.updatedAt.value"
+        compact
+        @retry="view.load"
+      />
       <Panel icon="package" :title="t('releaseCurrent')" tone="default">
         <template #actions>
           <Pill v-if="running" tone="info" size="sm">{{ t('releaseRunning') }}</Pill>
@@ -438,7 +463,7 @@ async function install(activate: boolean): Promise<void> {
       :busy="actionBusy"
       :busy-label="t('releaseRunning')"
       @confirm="confirmPending"
-      @cancel="pending = null"
+      @cancel="cancelPending"
     />
   </section>
 </template>

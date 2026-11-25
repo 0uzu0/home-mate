@@ -3,8 +3,6 @@
 import { RouterLink } from 'vue-router'
 import { t } from '../../i18n'
 import Panel from '../Panel.vue'
-
-defineEmits<{ open: [] }>()
 </script>
 
 <template>

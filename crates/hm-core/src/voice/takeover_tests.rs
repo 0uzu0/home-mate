@@ -134,7 +134,10 @@ async fn feed_chunk_during_live_media_is_side_effect_free_on_music_sessions() {
         notes.lock().unwrap()
     );
     assert!(
-        pipe.mic.lock().unwrap()[dev]
+        pipe.mic_arc(dev)
+            .unwrap()
+            .lock()
+            .unwrap()
             .open_provenance()
             .spans
             .iter()
@@ -176,7 +179,10 @@ async fn feed_chunk_during_live_media_is_side_effect_free_on_music_sessions() {
         crate::gateway::InputProvenance::default(),
     );
     assert!(
-        pipe.mic.lock().unwrap()[dev]
+        pipe.mic_arc(dev)
+            .unwrap()
+            .lock()
+            .unwrap()
             .open_provenance()
             .spans
             .last()
@@ -319,7 +325,10 @@ async fn paused_media_with_inflight_hub_play_unblocks_cues_sweeps_mode_and_start
             16_000,
             crate::mic::CaptureProvenance::legacy(1280),
         );
-        pipe.mic.lock().unwrap().insert(dev.into(), mic_proc);
+        pipe.mic
+            .lock()
+            .unwrap()
+            .insert(dev.into(), Arc::new(Mutex::new(mic_proc)));
     }
     pipe.start_input(dev);
     assert_eq!(
@@ -378,13 +387,29 @@ async fn paused_media_with_inflight_hub_play_unblocks_cues_sweeps_mode_and_start
     }
     music.seed_media_session_for_test(dev, radio_session(MediaState::Playing, id::now_ms(), None));
     pipe.follow_window_tone_sweep();
-    assert_eq!(
-        pipe.states.lock().unwrap()[dev].participation.session.state,
-        SessionState::Listening,
-        "actively playing media must still prevent follow-window timeout"
-    );
+    {
+        let states = pipe.states.lock().unwrap();
+        let st = states.get(dev).unwrap();
+        assert_eq!(
+            st.participation.session.state,
+            SessionState::Listening,
+            "actively playing media must still prevent follow-window timeout"
+        );
+        assert!(
+            !st.follow_open_last_tick && st.follow_close_pending_at.is_none(),
+            "actively playing media clears stale follow-edge flags so finishing music never fires a delayed farewell"
+        );
+    }
 
+    // Re-arm follow_open_last_tick for the separate Paused-with-in-flight-StopReceipt
+    // scenario (modeling a follow window that was open while media was already paused).
     music.seed_media_session_for_test(dev, radio_session(MediaState::Paused, id::now_ms(), None));
+    pipe.states
+        .lock()
+        .unwrap()
+        .get_mut(dev)
+        .unwrap()
+        .follow_open_last_tick = true;
     pipe.follow_window_tone_sweep();
     {
         let states = pipe.states.lock().unwrap();
@@ -626,11 +651,8 @@ async fn mixed_real_speech_and_control_only_segment_is_not_reset_on_play_end() {
         );
     }
     assert!(pipe
-        .mic
-        .lock()
-        .unwrap()
-        .get(dev)
-        .is_some_and(|p| p.in_speech()));
+        .mic_arc(dev)
+        .is_some_and(|p| p.lock().unwrap().in_speech()));
 
     {
         let mut states = pipe.states.lock().unwrap();
@@ -675,7 +697,7 @@ async fn mixed_real_speech_and_control_only_segment_is_not_reset_on_play_end() {
     .await;
 
     assert!(
-        pipe.mic.lock().unwrap().get(dev).unwrap().in_speech(),
+        pipe.mic_arc(dev).unwrap().lock().unwrap().in_speech(),
         "segment containing real non-control_only speech must not be wiped on PlayFinished"
     );
     assert!(
@@ -777,7 +799,7 @@ async fn wake_takeover_pause_survives_same_frame_pump_forget_race() {
     );
 
     let ident = pipe.open_participation(dev, CreditGrant::Full);
-    let res = pipe.honor_wake_word(dev, "asr_wake", ident, None);
+    let res = pipe.honor_wake_word(dev, "asr_wake", ident, None, None);
     assert!(res.is_some(), "honor_wake_word must succeed");
 
     // Simulate same-frame pump exit invoking forget() after stop-all.
@@ -866,7 +888,9 @@ async fn wake_takeover_pauses_story_media_and_bookmarks_live_program_and_uses_ef
         });
     }
 
-    assert!(pipe.honor_wake_word(dev, "asr_wake", ident, None).is_some());
+    assert!(pipe
+        .honor_wake_word(dev, "asr_wake", ident, None, None)
+        .is_some());
     music.forget(dev, &ticket.play_id);
     assert_eq!(
         music.media_session(dev).map(|s| s.state),
@@ -886,7 +910,7 @@ async fn wake_takeover_pauses_story_media_and_bookmarks_live_program_and_uses_ef
         .unwrap();
     let ident2 = pipe.states.lock().unwrap()[dev].participation.identity();
     assert!(pipe
-        .honor_wake_word(dev, "asr_wake", ident2, None)
+        .honor_wake_word(dev, "asr_wake", ident2, None, None)
         .is_some());
     assert!(
         !pipe

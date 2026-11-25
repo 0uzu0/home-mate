@@ -201,7 +201,7 @@ async function testConn(): Promise<void> {
 .mb__tasks {
   margin-top: var(--sp-2);
   padding-top: var(--sp-2);
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--line);
 }
 .mb__tasks-title { font-size: var(--fs-xs); color: var(--muted); margin-bottom: var(--sp-1); }
 .mb__task-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 4px; }

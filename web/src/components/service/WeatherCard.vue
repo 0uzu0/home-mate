@@ -47,6 +47,7 @@ interface Draft {
 }
 
 const draft = ref<Draft | null>(null)
+const touched = ref(false)
 const probe = ref<WeatherProbe | null>(null)
 const probing = ref(false)
 const probeError = ref('')
@@ -76,7 +77,7 @@ function fromStatus(status: WeatherStatus): Draft {
 watch(
   () => weather.data.value,
   (status) => {
-    if (status && draft.value === null) draft.value = fromStatus(status)
+    if (status && (draft.value === null || !touched.value)) draft.value = fromStatus(status)
   },
   { immediate: true },
 )
@@ -125,6 +126,7 @@ const aliasOptions = computed(() => [
 
 function addPlace(): void {
   if (!draft.value) return
+  touched.value = true
   draft.value.places.push({
     alias: draft.value.places.length === 0 ? (locale.value === 'zh' ? '家' : 'home') : '',
     name: '',
@@ -137,6 +139,7 @@ function addPlace(): void {
 
 function removePlace(index: number): void {
   if (!draft.value) return
+  touched.value = true
   draft.value.places.splice(index, 1)
   if (!draft.value.places.some((place) => place.alias === draft.value?.defaultAlias)) {
     draft.value.defaultAlias = ''
@@ -162,6 +165,7 @@ async function search(): Promise<void> {
 
 function useGeocoded(place: GeocodePlace): void {
   if (!draft.value) return
+  touched.value = true
   const taken = new Set(draft.value.places.map((item) => item.alias))
   let alias = place.name
   let suffix = 2
@@ -206,6 +210,7 @@ async function save(): Promise<void> {
     // The server returns the new revision and the normalised places; adopt
     // them so the next save cannot conflict and the form shows what is stored.
     draft.value = { ...fromStatus(status), apiKey: '' }
+    touched.value = false
     await weather.load()
   })
 }
@@ -225,7 +230,10 @@ async function runProbe(): Promise<void> {
 
 function reload(): void {
   void weather.load().then(() => {
-    if (weather.data.value) draft.value = fromStatus(weather.data.value)
+    if (weather.data.value) {
+      draft.value = fromStatus(weather.data.value)
+      touched.value = false
+    }
   })
   probe.value = null
   probeError.value = ''
@@ -250,15 +258,21 @@ function reload(): void {
     />
 
     <template v-if="draft">
-      <Toggle v-model="draft.enabled" :label="t('weatherEnabled')" />
+      <Toggle v-model="draft.enabled" :label="t('weatherEnabled')" @update:model-value="touched = true" />
 
       <div class="weather__grid">
-        <Select v-model="draft.provider" :label="t('weatherProvider')" :options="providerOptions" />
+        <Select
+          v-model="draft.provider"
+          :label="t('weatherProvider')"
+          :options="providerOptions"
+          @update:model-value="touched = true"
+        />
         <TextInput
           v-model="draft.endpoint"
           :label="t('weatherEndpoint')"
           wide
           :placeholder="endpointPlaceholder"
+          @update:model-value="touched = true"
         />
       </div>
 
@@ -290,7 +304,7 @@ function reload(): void {
 
       <div class="weather__places">
         <p class="weather__subtitle">{{ t('weatherPlaces') }}</p>
-        <div v-for="(place, index) in draft.places" :key="`place-${index}`" class="weather__place">
+        <div v-for="(place, index) in draft.places" :key="`place-${index}`" class="weather__place" @input="touched = true">
           <label class="wf">
             <span class="wf__label">{{ t('weatherAlias') }}</span>
             <input v-model="place.alias" class="wf__input" :placeholder="t('weatherAliasPlaceholder')" />
@@ -330,15 +344,32 @@ function reload(): void {
       <details class="weather__advanced">
         <summary>{{ t('weatherAdvanced') }}</summary>
         <div class="weather__grid">
-          <TextInput v-model="draft.apiKeyEnv" :label="t('apiKeyEnv')" placeholder="WEATHER_API_KEY" />
+          <TextInput
+            v-model="draft.apiKeyEnv"
+            :label="t('apiKeyEnv')"
+            placeholder="WEATHER_API_KEY"
+            @update:model-value="touched = true"
+          />
           <PasswordField
             v-model="draft.apiKey"
             :label="t('weatherApiKey')"
             :is-set="weather.data.value?.api_key_set ?? false"
             :hint="t('weatherApiKeySet')"
+            @update:model-value="touched = true"
           />
-          <NumberField v-model="draft.maxDays" :label="t('weatherMaxDays')" :min="1" :max="7" />
-          <Select v-model="draft.defaultAlias" :label="t('weatherDefaultAlias')" :options="aliasOptions" />
+          <NumberField
+            v-model="draft.maxDays"
+            :label="t('weatherMaxDays')"
+            :min="1"
+            :max="7"
+            @update:model-value="touched = true"
+          />
+          <Select
+            v-model="draft.defaultAlias"
+            :label="t('weatherDefaultAlias')"
+            :options="aliasOptions"
+            @update:model-value="touched = true"
+          />
         </div>
       </details>
 

@@ -183,16 +183,18 @@ struct SentenceGate {
     suppressed: usize,
     refusal_sent: bool,
     has_fact: bool,
+    allow_followup_prose: bool,
 }
 
 impl SentenceGate {
-    fn new(has_fact: bool) -> Self {
+    fn new(has_fact: bool, allow_followup_prose: bool) -> Self {
         Self {
             buf: String::new(),
             spoken: String::new(),
             suppressed: 0,
             refusal_sent: false,
             has_fact,
+            allow_followup_prose,
         }
     }
 
@@ -216,7 +218,7 @@ impl SentenceGate {
     }
 
     fn emit(&mut self, seg: String, tx: &mut futures::channel::mpsc::UnboundedSender<AgentEvent>) {
-        if self.has_fact {
+        if self.has_fact && !self.allow_followup_prose {
             // ENFORCED boundary (R2-BM5, audit Q1): once the core has a
             // confirmed/rejected fact for this turn, the core owns both the
             // action sentence AND the speaker. No model prose is appended —
@@ -227,7 +229,7 @@ impl SentenceGate {
         }
         if facts::asserts_action(&seg) {
             self.suppressed += 1;
-            if !self.refusal_sent {
+            if !self.has_fact && !self.refusal_sent {
                 self.refusal_sent = true;
                 let refusal = facts::UNSUPPORTED_ACTION_REFUSAL;
                 let _ = tx.unbounded_send(AgentEvent::Fact {
@@ -263,10 +265,11 @@ async fn consume_stream(
     cancel: &crate::task::CancellationScope,
     tx: &mut futures::channel::mpsc::UnboundedSender<AgentEvent>,
     has_fact: bool,
+    allow_followup_prose: bool,
     silent: bool,
 ) -> Result<CallOutcome, (crate::llm::LlmError, bool)> {
     let mut deltas: Vec<String> = Vec::new();
-    let mut gate = SentenceGate::new(has_fact);
+    let mut gate = SentenceGate::new(has_fact, allow_followup_prose);
     let mut end: Option<(Finish, String, Vec<crate::llm::WireToolCall>)> = None;
 
     if tx.is_closed() {
@@ -607,8 +610,13 @@ pub fn run_turn_with_scope_and_wake(
     cancel: Arc<crate::task::CancellationScope>,
     scope_ctx: crate::working_memory::ScopeContext,
     wake: Option<(String, String)>,
+    lan_exempt: bool,
 ) -> impl futures::Stream<Item = AgentEvent> {
-    let authority = crate::execution::Authority::internal(env.sessions.store(), scope_ctx);
+    let authority = crate::execution::Authority::internal_with_lan_exempt(
+        env.sessions.store(),
+        scope_ctx,
+        lan_exempt,
+    );
     run_turn_authorized_with_wake(
         env, session_id, text, source, delivery, cancel, authority, wake,
     )
@@ -835,6 +843,8 @@ async fn turn_body(
     // facts rendered by `facts::render_fact`), plus the gate's bookkeeping.
     let mut facts: Vec<crate::tool::ToolFact> = Vec::new();
     let mut facts_confirmed_all = true;
+    let mut allow_followup_prose = false;
+    let mut saw_strict_fact = false;
     let mut core_said = String::new();
     let mut suppressed_total = 0usize;
     // 2026-11-13 (M2): a turn whose tools ALL failed says ONE core line. The
@@ -900,6 +910,7 @@ async fn turn_body(
                         &cancel_scope,
                         tx,
                         !facts.is_empty(),
+                        allow_followup_prose && !saw_strict_fact,
                         silent_round || authoritative_said,
                     )
                     .await
@@ -970,6 +981,7 @@ async fn turn_body(
                             &cancel_scope,
                             tx,
                             !facts.is_empty(),
+                            allow_followup_prose && !saw_strict_fact,
                             silent_round || authoritative_said,
                         )
                         .await
@@ -1067,10 +1079,20 @@ async fn turn_body(
             // R2-BM5: what the model SAID (post-gate). A provider that only
             // sent terminal content never streamed deltas, so sanitize the
             // whole answer here — the claim gate must not depend on transport.
-            let model_text = if streamed_any {
+            let model_text = if authoritative_said {
+                // Core already emitted the tool's authoritative `rendered_answer`
+                // (`reminder.set`, `brain.delegate`, `brain.steer`, `brain.cancel`).
+                // Never run `sanitize_whole` over the discarded post-tool model
+                // prose — doing so would otherwise trigger `UNSUPPORTED_ACTION_REFUSAL`.
+                String::new()
+            } else if streamed_any {
                 spoken.clone()
             } else {
-                let (text, suppressed) = facts::sanitize_whole(content.trim(), !facts.is_empty());
+                let (text, suppressed) = facts::sanitize_whole_with_prose(
+                    content.trim(),
+                    !facts.is_empty(),
+                    allow_followup_prose && !saw_strict_fact,
+                );
                 suppressed_total += suppressed;
                 if suppressed > 0 {
                     env.traces.event(
@@ -1140,6 +1162,13 @@ async fn turn_body(
                     }),
                 );
                 task.note(format!("core-rendered facts: {}", facts.len()));
+            } else if let Some((text, true)) = rendered_answer.as_ref() {
+                env.traces.event(
+                    &trace,
+                    "answer_rendered",
+                    serde_json::json!({ "source": "tool", "chars": text.chars().count() }),
+                );
+                answer_text = text.clone();
             } else if suppressed_total > 0 {
                 // Fail-closed: an action claim without a receipt is not
                 // adopted. The refusal is the answer (never the claim).
@@ -1155,24 +1184,18 @@ async fn turn_body(
                     }),
                 );
             } else {
-                // Existing precedence: a tool that declared its rendering
-                // authoritative, then an empty model answer with a rendering
+                // Existing precedence: an empty model answer with a rendering
                 // to hand, then the model's own words.
                 answer_text = model_text;
-                match rendered_answer.as_ref() {
-                    Some((text, true)) => {
+                if let Some((text, false)) = rendered_answer.as_ref() {
+                    if answer_text.is_empty() {
                         env.traces.event(
                             &trace,
                             "answer_rendered",
-                            serde_json::json!({ "source": "tool", "chars": text.chars().count() }),
+                            serde_json::json!({ "source": "tool_fallback", "chars": text.chars().count() }),
                         );
                         answer_text = text.clone();
                     }
-                    Some((text, false)) if answer_text.is_empty() => {
-                        env.traces.event(&trace, "answer_rendered", serde_json::json!({ "source": "tool_fallback", "chars": text.chars().count() }));
-                        answer_text = text.clone();
-                    }
-                    _ => {}
                 }
             }
             let (_, raw_next_socket) = extract_next_step(&content);
@@ -1336,7 +1359,10 @@ async fn turn_body(
             let ctx = ToolCtx::new(task_id.clone(), call_id.clone(), task.cancel_flag())
                 .with_model_exchange()
                 .with_provenance(
-                    authority.physical_device_id().map(str::to_string),
+                    authority
+                        .physical_device_id()
+                        .or_else(|| authority.scope().device_id.as_deref())
+                        .map(str::to_string),
                     Some(trace.trace_id.clone()),
                 )
                 .with_task_authority(authority.clone(), task.cancellation_scope());
@@ -1465,6 +1491,17 @@ async fn turn_body(
                     }),
                 );
                 if !late {
+                    let tool_allows_prose = result
+                        .result
+                        .as_ref()
+                        .and_then(|r| r.get("allow_followup_prose"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if tool_allows_prose {
+                        allow_followup_prose = true;
+                    } else {
+                        saw_strict_fact = true;
+                    }
                     facts.push(f);
                     facts_confirmed_all &= confirmed;
                     core_said.push_str(&text);
@@ -1574,9 +1611,11 @@ async fn turn_body(
         }
     }
     if !finished && turn_error.is_none() && final_status.is_empty() {
-        // Loop exhausted without a final answer.
+        // Loop exhausted without a final answer: emit an explicit Error event
+        // so Web Console and Android clients never display a silent blank turn.
         env.traces
             .event(&trace, "loop_budget_exhausted", serde_json::json!({}));
+        turn_error = Some("达到最大工具调用轮数，未能完成回答".into());
         final_status = "failed";
     }
     if let Some(msg) = turn_error.clone() {

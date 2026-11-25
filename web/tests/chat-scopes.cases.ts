@@ -325,4 +325,51 @@ for (const component of [ConversationCard, FollowUpPanel]) {
   assert.ok(text(root).includes('更早消息'))
   locale.value = 'en'; app.unmount()
 }
+// P1-2: After retreat (退下) rotates history into archived_contexts leaving current_context
+// empty (count === 0, archived_contexts.length > 0), both ConversationCard and FollowUpPanel
+// keep Clear enabled and send include_archived: true to wipe current + archived history.
+for (const component of [ConversationCard, FollowUpPanel]) {
+  calls = []
+  let state: any = {
+    session_id: 'current-after-retreat',
+    current_context: { generation: 3 },
+    archived_contexts: [
+      { session_id: 'archive-2', generation: 2 },
+      { session_id: 'archive-1', generation: 1 },
+    ],
+    messages: [],
+    view: 'current',
+  }
+  handler = (path, method, body) => {
+    assert.equal(path, '/api/v0/devices/unit-one/conversation')
+    if (method === 'GET') return state
+    assert.equal(method, 'DELETE')
+    assert.deepEqual(body, {
+      expected_session_id: 'current-after-retreat',
+      include_archived: true,
+    })
+    state = {
+      session_id: 'current-after-retreat',
+      current_context: { generation: 3 },
+      archived_contexts: [],
+      messages: [],
+      view: 'current',
+    }
+    return { session_id: 'current-after-retreat', cleared: 4, include_archived: true }
+  }
+  const { root, app } = mount(component, { device: { device: 'unit-one', session: null }, mode: {}, refresh() {} }); await flush()
+  assert.ok(text(root).includes('0 messages · 2 archived'), 'EN count summary must show archived count after retreat')
+  locale.value = 'zh'; await nextTick()
+  assert.ok(text(root).includes('0 条消息 · 2 段归档'), 'ZH count summary must show archived count after retreat')
+  locale.value = 'en'; await nextTick()
+  const clearBtn = button(root, 'Clear conversation')
+  assert.equal(clearBtn.props.disabled, false, 'clear button must stay enabled when archived contexts exist even with 0 current messages')
+  await clearBtn.props.onClick(); await nextTick()
+  assert.ok(text(portal).includes('2 archived context(s)'), 'confirm dialog must clarify archived contexts will be cleared')
+  await button(portal, 'Clear conversation').props.onClick(); await flush()
+  assert.equal(state.archived_contexts.length, 0)
+  assert.ok(text(root).includes('Cleared 4 messages'))
+  assert.equal(button(root, 'Clear conversation').props.disabled, true, 'clear button disables once both current and archived history are empty')
+  app.unmount()
+}
 console.log('Chat scope UI: selection/readback/grants/revoke/expiry/SSE rejection/headless history/scoped visibility/current physical conversation and bilingual checks passed')

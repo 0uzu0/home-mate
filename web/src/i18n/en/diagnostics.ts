@@ -106,6 +106,9 @@ export default {
   assetTestHint: 'Plays the archived ERLE stimulus through the real play path.',
   loopbackTest: 'ch8 playback self-check (DAC write vs loopback)',
   loopbackTestHint: 'Plays a probe tone and compares the DAC write with the ch8 loopback: correlation, lag, clipped/silent stretches.',
+  micArrayTest: '7-mic array measurement (plays probe tone)',
+  micArrayTestHint: 'Plays a probe tone and measures per-mic level, floor, SNR and arrival lags.',
+  probeTargetLabel: 'Probe target device',
   repairTitle: 'Repairs',
   reapply: 'Re-send mode request',
   reapplyHint: 'Re-sends the stored duplex request; negotiation follows the device report.',
@@ -167,6 +170,7 @@ export default {
   chatScopeRequired: 'Enter the required person and device IDs before applying.',
   chatScopeReadbackMismatch: 'The saved selection could not be verified. Your message and selection draft are kept.',
   chatScopeUnavailable: 'This selection has expired or is unavailable. Explicitly reapply or remove it to continue; your message is kept.',
+  chatTurnFailed: 'This turn failed without producing a reply.',
   chatScopeLegacy: 'This conversation cannot use the requested memory selection. Start a new session or explicitly apply a selection; the old history has not been imported.',
   conversationChanged: 'The current device conversation changed. Refresh and confirm again; no archived conversation was cleared.',
 

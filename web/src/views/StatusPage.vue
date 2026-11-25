@@ -47,7 +47,7 @@ const loadingFirst = computed(() => !mode.value && loading.value)
         <strong>{{ t('wifiProvisioningBannerTitle') }}</strong>
         <p>{{ t('wifiProvisioningBannerHint', { device: wifiProvisioning.device || 'dot2' }) }}</p>
       </div>
-      <RouterLink class="btn" to="/setup">
+      <RouterLink class="btn" :to="selected ? { path: '/setup', query: { device: selected.device } } : '/setup'">
         <AppIcon name="wizard" :size="14" /> {{ t('wifiProvisioningGoSetup') }}
       </RouterLink>
     </div>
@@ -57,7 +57,7 @@ const loadingFirst = computed(() => !mode.value && loading.value)
     <template v-else>
       <!-- Readiness first: on a fresh install this is the only thing that
            tells the user what is still missing (audit 2026-11-14). -->
-      <ReadinessCard :mode="mode" :device="selected" />
+      <ReadinessCard :mode="mode" :device="selected" :gateway-device="selectedGateway" />
       <EmptyState v-if="!mode?.devices.length" :title="t('statusNoDevices')" :hint="t('firstRunHint')">
         <div class="first-run">
           <p class="first-run__title">{{ t('firstRunTitle') }}</p>
@@ -76,7 +76,7 @@ const loadingFirst = computed(() => !mode.value && loading.value)
     <div v-if="mode?.devices.length" class="page__grid">
       <StatusBoard :device="selected" :gateway="gateway" :gateway-device="selectedGateway" />
       <ProgramCard :device="selected" :refresh="refresh" />
-      <OutputsCard :device="selected" :gateway="gateway" :refresh="refresh" />
+      <OutputsCard :device="selected" :gateway="gateway" :gateway-device="selectedGateway" :refresh="refresh" />
     </div>
   </section>
 </template>

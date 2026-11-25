@@ -147,7 +147,6 @@ impl Participation {
     pub fn snapshot(&self) -> serde_json::Value {
         let phase = match self.session.state {
             SessionState::Idle => "closed",
-            SessionState::Closing => "closing",
             SessionState::Listening if !self.request_running() && self.has_answer_tail => "tail",
             SessionState::Listening => "active",
         };
@@ -239,6 +238,22 @@ impl Participation {
             _ => {}
         }
         Some(self.identity())
+    }
+
+    /// When a `wake_ack` finishes playing on a freshly woken session whose
+    /// user request has not yet started, refresh the listening anchor from
+    /// `play_finished` so slow LAN/Tailscale delivery of the ack does not eat
+    /// the wake listening window. Never reopens closed or blocked sessions.
+    pub fn refresh_wake_ack_window(&mut self, now: u64) -> bool {
+        if self.session.state != SessionState::Listening
+            || self.request_started()
+            || self.follow_window_blocked
+        {
+            return false;
+        }
+        self.last_activity_ms = self.last_activity_ms.max(now);
+        self.tail_end_ms = self.tail_end_ms.max(now);
+        true
     }
 
     pub fn available_followup_credit(&self) -> Option<u8> {
@@ -576,7 +591,12 @@ impl Participation {
         }
         let from = self.last_session_open_ms.max(self.tail_end_ms);
         let eff = self.effective_follow_window_ms(now);
-        from != 0 && start >= from && start < from.saturating_add(eff) && end.max(now) >= from
+        let opened_at = self.session.since_ms;
+        from != 0
+            && start >= opened_at
+            && end >= from
+            && start < from.saturating_add(eff)
+            && end.max(now) >= from
     }
 }
 
@@ -895,5 +915,62 @@ mod admission_tests {
             "post-tool answer completion must grant full follow-up tail window"
         );
         assert!(!p.session_open(24_000, false));
+    }
+
+    #[test]
+    fn wake_ack_refresh_extends_open_listening_window_without_reopening_closed() {
+        assert_eq!(super::super::settings::ACK_SETTLE_MS, 2_500);
+
+        let mut p = Participation::default();
+        p.activate(
+            p.identity(),
+            FollowWindowPolicy::default(),
+            CreditGrant::Full,
+            1_000,
+        )
+        .unwrap();
+        // Slow LAN/Tailscale wake_ack finishes 7.5 s after wake -> listening
+        // window refreshes from 8_500 so user still gets a full 9 s window.
+        assert!(p.refresh_wake_ack_window(8_500));
+        assert!(p.session_open(17_499, false));
+        assert!(!p.session_open(17_500, false));
+
+        // Once a request has started, wake_ack finish must NOT mutate tail_end_ms.
+        let _req = p.begin_request(p.identity(), 10_000, false).unwrap();
+        assert!(!p.refresh_wake_ack_window(12_000));
+
+        // On an explicitly closed session, wake_ack finish must NEVER reopen.
+        assert!(p.close(p.identity(), CloseReason::ExplicitExit, 12_500));
+        assert!(!p.refresh_wake_ack_window(13_000));
+        assert!(!p.session_open(13_000, false));
+    }
+
+    #[test]
+    fn p1_07_session_covers_admits_speech_starting_before_play_finished_and_rejects_pre_session() {
+        let mut p = Participation::default();
+        p.activate(
+            p.identity(),
+            FollowWindowPolicy {
+                ms: 9_000,
+                ..Default::default()
+            },
+            CreditGrant::Full,
+            1_000,
+        )
+        .unwrap();
+        let req = p.begin_request(p.identity(), 1_500, false).unwrap();
+        p.answer_started(req, "ans-1");
+        assert!(p.finish_request(req, 4_000));
+        assert!(p.answer_ended(req, "ans-1", 5_000));
+
+        // Speech starts 150 ms before PlayFinished (4_850 >= opened_at 1_000)
+        // and continues into the follow window (end 5_100 >= from 5_000) -> ADMITTED.
+        assert!(p.session_covers(4_850, 5_100, 5_100, false));
+        // Speech that started AND ended before PlayFinished (end 4_950 < 5_000) -> REJECTED.
+        assert!(!p.session_covers(4_600, 4_950, 5_100, false));
+        // Speech that started before session opened (start 900 < opened_at 1_000) -> REJECTED.
+        assert!(!p.session_covers(900, 5_100, 5_100, false));
+        // Speech starting after the follow-up window expires (5_000 + 9_000 = 14_000) -> REJECTED.
+        assert!(!p.session_covers(14_000, 14_200, 14_200, false));
     }
 }

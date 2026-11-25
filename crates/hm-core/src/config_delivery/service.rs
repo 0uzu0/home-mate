@@ -45,6 +45,7 @@ pub(super) const PUBLISHED_BLOCKS: &[&str] = &[
 pub struct ConfigDelivery {
     pub(super) store: Arc<Store>,
     voice: Option<Arc<crate::voice::VoicePipeline>>,
+    hub: Option<Arc<crate::gateway::DeviceHub>>,
     open_sockets: Option<super::open_sockets::Provider>,
 }
 struct Snapshot {
@@ -346,16 +347,29 @@ impl ConfigDelivery {
         Self {
             store,
             voice: None,
+            hub: None,
             open_sockets: None,
         }
+    }
+
+    pub fn with_hub(mut self, hub: Arc<crate::gateway::DeviceHub>) -> Self {
+        self.hub = Some(hub);
+        self
     }
 
     pub fn for_app(state: &crate::api::AppState) -> Self {
         Self {
             store: state.store.clone(),
             voice: Some(state.voice.clone()),
+            hub: Some(state.hub.clone()),
             open_sockets: Some(super::open_sockets::Provider::from_app(state)),
         }
+    }
+
+    fn hub(&self) -> Option<&crate::gateway::DeviceHub> {
+        self.hub
+            .as_deref()
+            .or_else(|| self.voice.as_ref().map(|v| v.hub().as_ref()))
     }
 
     fn db<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
@@ -511,7 +525,7 @@ impl ConfigDelivery {
                         Operation::Clear { .. } | Operation::Preserve { .. } => None,
                     };
                     let desc = inventory::validate_path(path, &package.purpose, value)?;
-                    enforce_exact_unit_gate(&package, &s.node, path, &desc)?;
+                    enforce_exact_unit_gate(&package, &s.node, self.hub(), path, &desc)?;
                     if matches!(op, Operation::Replace { .. })
                         && !matches!(desc.kind.as_str(), "array" | "object" | "json")
                     {
@@ -674,7 +688,7 @@ impl ConfigDelivery {
                         Operation::Clear { .. } | Operation::Preserve { .. } => None,
                     };
                     let desc = inventory::validate_path(path, &package.purpose, value)?;
-                    enforce_exact_unit_gate(&package, &s.node, path, &desc)?;
+                    enforce_exact_unit_gate(&package, &s.node, self.hub(), path, &desc)?;
                 }
             }
             let after_fields: Fields = serde_json::from_str(&after)?;
@@ -939,9 +953,12 @@ fn list(c: &Connection, principal: &str) -> Result<Vec<Value>> {
 fn enforce_exact_unit_gate(
     package: &Package,
     enrolled_node: &str,
+    hub: Option<&crate::gateway::DeviceHub>,
     path: &str,
     desc: &inventory::FieldDescriptor,
 ) -> Result<()> {
+    let device_owned_by_core =
+        |dev: &str| dev == enrolled_node || hub.is_some_and(|h| h.device_exists(dev));
     if desc.scope == "unit" {
         if package.purpose == Purpose::FamilyPolicy {
             return Err(DeliveryError::new(
@@ -966,7 +983,7 @@ fn enforce_exact_unit_gate(
         }
         if let Some(rest) = path.strip_prefix("unit_acoustic_profiles.") {
             if let Some((dev, _)) = rest.rsplit_once('.') {
-                if dev != enrolled_node {
+                if !device_owned_by_core(dev) {
                     return Err(DeliveryError::new(
                         "FORBIDDEN_SCOPE",
                         format!(
@@ -980,7 +997,7 @@ fn enforce_exact_unit_gate(
     }
     if let Some(rest) = path.strip_prefix("device_led_configs.") {
         if let Some((dev, _)) = rest.rsplit_once('.') {
-            if dev != enrolled_node {
+            if !device_owned_by_core(dev) {
                 return Err(DeliveryError::new(
                     "TARGET_MISMATCH",
                     format!("device LED config for '{dev}' does not match enrolled node '{enrolled_node}'"),
@@ -990,7 +1007,7 @@ fn enforce_exact_unit_gate(
         }
     }
     if let Some(dev) = path.strip_prefix("mode.duplex_requested.") {
-        if dev != enrolled_node {
+        if !device_owned_by_core(dev) {
             return Err(DeliveryError::new(
                 "TARGET_MISMATCH",
                 format!(

@@ -13,8 +13,10 @@ import {
   closeSession,
   getMode,
   getDeviceConversation,
+  putGlobalMode,
   putMode,
   type ModeDevice,
+  type ModePatch,
   type ModeSnapshot,
 } from '../../api'
 import { t } from '../../i18n'
@@ -67,26 +69,40 @@ usePoll(() => {
   if (props.device) return messages.load()
 }, 15000)
 const confirmedSession = ref<string | null>(null)
-watch(() => props.device?.device, () => { confirmingClear.value = false; confirmedSession.value = null; messages.reset(); void messages.load() })
+const confirmedIncludeArchived = ref(false)
+watch(() => props.device?.device, () => { confirmingClear.value = false; confirmedSession.value = null; confirmedIncludeArchived.value = false; messages.reset(); void messages.load() })
+
+const msgCount = computed(() => messages.data.value?.messages?.length ?? 0)
+const archivedCount = computed(() => messages.data.value?.archived_contexts?.length ?? 0)
+const hasArchived = computed(() => archivedCount.value > 0)
+const canClear = computed(() => msgCount.value > 0 || archivedCount.value > 0)
+const msgCountLabel = computed(() =>
+  archivedCount.value > 0
+    ? t('conversationCountWithArchives', { n: msgCount.value, archives: archivedCount.value })
+    : t('conversationCount', { n: msgCount.value }),
+)
 
 function confirmClear(): void {
   confirmedSession.value = messages.data.value?.session_id ?? null
+  confirmedIncludeArchived.value = archivedCount.value > 0
   confirmingClear.value = confirmedSession.value !== null
 }
 
-const msgCount = computed(() => messages.data.value?.messages?.length ?? 0)
-
 watch(
-  () => props.mode,
-  (mode) => {
-    if (!mode || touched.value) return
-    enabled.value = mode.follow_window_enabled ?? true
-    seconds.value = (mode.follow_window_ms ?? 9000) / 1000
-    contextSeconds.value = (mode.context_window_ms ?? 240000) / 1000
-    closeTone.value = mode.follow_window_tone ?? false
-    retreatWords.value = [...(mode.retreat_words ?? [])]
-    retreatAck.value = mode.retreat_ack ?? ''
-    windowCloseAck.value = mode.window_close_ack ?? '拜拜啦'
+  [() => props.mode, () => props.device],
+  ([mode, device], [, prevDevice]) => {
+    const switchedDevice = prevDevice?.device !== undefined && prevDevice.device !== device?.device
+    if (switchedDevice) touched.value = false
+    if ((!mode && !device) || touched.value) return
+    enabled.value = device?.follow_window_enabled ?? mode?.follow_window_enabled ?? true
+    seconds.value = (device?.follow_window_ms ?? mode?.follow_window_ms ?? 9000) / 1000
+    contextSeconds.value = (device?.context_window_ms ?? mode?.context_window_ms ?? 240000) / 1000
+    closeTone.value = device?.follow_window_tone ?? mode?.follow_window_tone ?? false
+    retreatWords.value = [...(device?.retreat_words ?? mode?.retreat_words ?? [])]
+    if (mode) {
+      retreatAck.value = mode.retreat_ack ?? ''
+      windowCloseAck.value = mode.window_close_ack ?? '拜拜啦'
+    }
   },
   { immediate: true },
 )
@@ -110,24 +126,41 @@ const phaseTone = computed<'ok' | 'info' | 'muted'>(() => {
 
 async function save(): Promise<void> {
   if (!props.device) return
+  const devId = props.device.device
   const ack = windowCloseAck.value.trim()
-  const patch = {
+  const retreatAckTrimmed = retreatAck.value.trim()
+  const devicePatch: ModePatch = {
     follow_window_enabled: enabled.value,
     follow_window_ms: seconds.value * 1000,
     context_window_ms: contextSeconds.value * 1000,
     follow_window_tone: closeTone.value,
     retreat_words: retreatWords.value,
-    retreat_ack: retreatAck.value.trim(),
-    ...(closeTone.value || ack ? { window_close_ack: ack } : {}),
+  }
+  const globalPatch: ModePatch = {}
+  if (retreatAckTrimmed !== (props.mode?.retreat_ack ?? '').trim()) {
+    globalPatch.retreat_ack = retreatAckTrimmed
+  }
+  if ((closeTone.value || ack) && ack !== (props.mode?.window_close_ack ?? '').trim()) {
+    globalPatch.window_close_ack = ack
   }
   await run(async () => {
-    await putMode(props.device!.device, patch)
-    const readback = await getMode()
+    await putMode(devId, devicePatch)
+    if (Object.keys(globalPatch).length > 0) {
+      await putGlobalMode(globalPatch)
+    }
+    const readback = await getMode({ device: devId })
+    const rbDev = readback.devices?.find((d) => d.device === devId)
+    const rbEnabled = rbDev?.follow_window_enabled ?? readback.follow_window_enabled
+    const rbMs = rbDev?.follow_window_ms ?? readback.follow_window_ms
+    const rbCtxMs = rbDev?.context_window_ms ?? readback.context_window_ms
+    const rbTone = rbDev?.follow_window_tone ?? readback.follow_window_tone
     if (
-      readback.follow_window_enabled !== patch.follow_window_enabled ||
-      readback.follow_window_ms !== patch.follow_window_ms ||
-      readback.context_window_ms !== patch.context_window_ms ||
-      readback.follow_window_tone !== patch.follow_window_tone
+      rbEnabled !== devicePatch.follow_window_enabled ||
+      rbMs !== devicePatch.follow_window_ms ||
+      rbCtxMs !== devicePatch.context_window_ms ||
+      rbTone !== devicePatch.follow_window_tone ||
+      (globalPatch.retreat_ack !== undefined && readback.retreat_ack !== globalPatch.retreat_ack) ||
+      (globalPatch.window_close_ack !== undefined && readback.window_close_ack !== globalPatch.window_close_ack)
     ) {
       throw new Error(t('followWindowReadbackError'))
     }
@@ -151,9 +184,10 @@ async function handleCloseWindow(): Promise<void> {
 async function handleClearConversation(): Promise<void> {
   confirmingClear.value = false
   const id = confirmedSession.value
+  const includeArchived = confirmedIncludeArchived.value
   if (!id || !props.device) return
   await runSession(async () => {
-    const r = await clearDeviceConversation(props.device!.device, id).catch((err) => {
+    const r = await clearDeviceConversation(props.device!.device, id, includeArchived).catch((err) => {
       if (err instanceof ApiError && err.status === 409) throw new Error(t('conversationChanged'))
       throw err
     })
@@ -173,6 +207,10 @@ async function handleClearConversation(): Promise<void> {
 
     <template v-else>
       <div class="fp__block">
+        <div class="fp__scope-head">
+          <Pill size="sm" tone="accent" mono>{{ t('scopeThisDevice', { device: device.device }) }}</Pill>
+          <span class="fp__hint">{{ t('scopeDeviceHint', { device: device.device }) }}</span>
+        </div>
         <Toggle
           v-model="enabled"
           :label="t('followWindowEnabled')"
@@ -205,9 +243,6 @@ async function handleClearConversation(): Promise<void> {
           :disabled="busy"
           @update:model-value="touched = true"
         />
-      </div>
-
-      <div class="fp__block">
         <PhraseList
           v-model="retreatWords"
           :label="t('retreatWordsTitle')"
@@ -217,6 +252,14 @@ async function handleClearConversation(): Promise<void> {
           @update:model-value="touched = true"
         />
         <p class="fp__hint">{{ t('retreatWordsHint') }}</p>
+      </div>
+
+      <div class="fp__block">
+        <div class="fp__scope-head">
+          <span class="fp__subhead">{{ t('followGlobalAcksTitle') }}</span>
+          <Pill size="sm" tone="info" mono>{{ t('scopeNodeGlobal') }}</Pill>
+          <span class="fp__hint">{{ t('scopeGlobalHint') }}</span>
+        </div>
         <div class="fp__acks">
           <TextInput
             v-model="retreatAck"
@@ -267,7 +310,7 @@ async function handleClearConversation(): Promise<void> {
             }}
           </dd>
           <dt>{{ t('conversationTitle') }}</dt>
-          <dd class="mono">{{ t('conversationCount', { n: msgCount }) }}</dd>
+          <dd class="mono">{{ msgCountLabel }}</dd>
         </dl>
         <div class="fp__actions">
           <button type="button" class="btn" :disabled="sessionBusy || !session" @click="handleCloseWindow">
@@ -276,7 +319,7 @@ async function handleClearConversation(): Promise<void> {
           <button
             type="button"
             class="btn btn--danger"
-            :disabled="sessionBusy || messages.loading.value || Boolean(messages.error.value) || !messages.data.value?.session_id || msgCount === 0"
+            :disabled="sessionBusy || messages.loading.value || Boolean(messages.error.value) || !messages.data.value?.session_id || !canClear"
             @click="confirmClear"
           >
             {{ t('conversationClear') }}
@@ -291,7 +334,7 @@ async function handleClearConversation(): Promise<void> {
     <ConfirmDialog
       v-if="confirmingClear"
       :title="t('conversationClear')"
-      :message="t('conversationClearConfirm')"
+      :message="hasArchived ? t('conversationClearAllConfirm', { archives: archivedCount }) : t('conversationClearConfirm')"
       :confirm-label="t('conversationClear')"
       :cancel-label="t('cancel')"
       tone="danger"
@@ -311,6 +354,19 @@ async function handleClearConversation(): Promise<void> {
   border: 1px solid var(--line);
   border-radius: var(--r-sm);
   background: var(--surface-2);
+}
+
+.fp__scope-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+.fp__subhead {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--ink-2);
 }
 
 .fp__row {

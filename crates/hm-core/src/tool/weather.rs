@@ -248,9 +248,6 @@ impl WeatherRuntime {
         if !cfg.enabled {
             return Err(WeatherError::Disabled);
         }
-        if cfg.resolve_place(None).is_none() {
-            return Err(WeatherError::PlaceRequired);
-        }
         Ok(snapshot)
     }
 
@@ -910,7 +907,7 @@ impl Tool for WeatherForecastTool {
                     .map(|(i, d)| {
                         json!({
                             "date": d.date,
-                            "day": match i { 0 => "今天", 1 => "明天", _ => "后天" },
+                            "day": match i { 0 => "今天", 1 => "明天", 2 => "后天", _ => d.date.as_str() },
                             "condition": d.condition,
                             "min_c": round1(d.min_c),
                             "max_c": round1(d.max_c),

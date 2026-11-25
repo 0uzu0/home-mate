@@ -94,8 +94,8 @@ impl VoicePipeline {
             st.suppress_cue_until_ms = None;
             st.last_wake = None;
             st.wake_flash_until_ms = 0;
-            if let Some(p) = crate::lock_or_recover(&self.mic, "voice.mic").get_mut(device) {
-                p.reset();
+            if let Some(arc) = self.mic_arc(device) {
+                crate::lock_or_recover(&arc, "voice.mic.dev").reset();
             }
             self.apply_capture_revocation_locked(device, st);
             self.stop_device_locked(device, st, true)
@@ -122,32 +122,47 @@ impl VoicePipeline {
     ) -> Result<serde_json::Value, String> {
         let now = id::now_ms();
         let room = self.room_of(device);
+        let hub_live = self.hub_live(device);
+        let media_present = self.music().is_some_and(|m| m.media_present(device));
         if matches!(&guard, SessionCloseGuard::Identity(_)) {
             let explicit_room = crate::sovereignty::is_explicit_room_addressed(text, &room);
-            if let crate::sovereignty::RetreatAuth::DeniedNotOwner {
-                owner_device,
-                owner_room,
-            } = self
-                .sovereignty
-                .can_retreat(&room, device, explicit_room, now)
-            {
-                self.note(
-                    "retreat_ignored_not_owner",
-                    json!({
-                        "device": device,
-                        "room": room,
+            let local_has_active_work = hub_live.voice
+                || hub_live.media
+                || media_present
+                || crate::lock_or_recover(&self.states, "voice.states")
+                    .get(device)
+                    .is_some_and(|st| {
+                        st.current_task.is_some()
+                            || st.live_program.is_some()
+                            || st.paused_program.is_some()
+                            || st.outputs.values().any(|o| stage_is_live(&o.stage))
+                    });
+            if !local_has_active_work {
+                if let crate::sovereignty::RetreatAuth::DeniedNotOwner {
+                    owner_device,
+                    owner_room,
+                } = self
+                    .sovereignty
+                    .can_retreat(&room, device, explicit_room, now)
+                {
+                    self.note(
+                        "retreat_ignored_not_owner",
+                        json!({
+                            "device": device,
+                            "room": room,
+                            "owner_device": owner_device,
+                            "owner_room": owner_room,
+                            "via": via,
+                            "text": text,
+                        }),
+                    );
+                    return Ok(json!({
+                        "closed": false,
+                        "ignored": "not_owner",
                         "owner_device": owner_device,
                         "owner_room": owner_room,
-                        "via": via,
-                        "text": text,
-                    }),
-                );
-                return Ok(json!({
-                    "closed": false,
-                    "ignored": "not_owner",
-                    "owner_device": owner_device,
-                    "owner_room": owner_room,
-                }));
+                    }));
+                }
             }
         }
         let model = matches!(&guard, SessionCloseGuard::Model { .. });
@@ -159,11 +174,9 @@ impl VoicePipeline {
                 room: None,
             },
         )?;
-        let hub_live = self.hub_live(device);
-        let media_present = self.music().is_some_and(|m| m.media_present(device));
         let has_inline_wake = matches!(via, "transcript" | "utterance")
             && self
-                .effective_wake_words()
+                .effective_wake_words_for(device)
                 .iter()
                 .any(|w| mic::wake_span_near(text, w).is_some());
         let (stop, discarded, cleared, transcript, media, permit, snapshot, should_speak_ack) = {
@@ -242,8 +255,8 @@ impl VoicePipeline {
             st.barge.reset();
             st.suppress_cue_until_ms = None;
             st.last_wake = None;
-            if let Some(p) = crate::lock_or_recover(&self.mic, "voice.mic").get_mut(device) {
-                p.reset();
+            if let Some(arc) = self.mic_arc(device) {
+                crate::lock_or_recover(&arc, "voice.mic.dev").reset();
             }
             self.apply_capture_revocation_locked(device, st);
             let discarded = st.live_program.take().is_some() | st.paused_program.take().is_some();
@@ -252,7 +265,9 @@ impl VoicePipeline {
             let session_id = sessions.device_session_id(device)?;
             self.tasks.cancel_cross_turn(&session_id);
             let transcript = Self::memory_transcript(&sessions, &session_id);
-            let cleared = sessions.clear(&session_id).unwrap_or(0);
+            let (session_id, cleared) = sessions
+                .archive_and_rotate_device_context(device, now)
+                .unwrap_or((session_id, 0));
             // Drop an established paused/playing media session. In-flight
             // fetch cancellation is intentionally still D2a.
             let media = self.music().and_then(|m| m.stop_now(device, "retreat"));
@@ -353,8 +368,10 @@ impl VoicePipeline {
     pub(super) fn open_participation(&self, device: &str, grant: CreditGrant) -> Identity {
         let now = id::now_ms();
         let mut states = crate::lock_or_recover(&self.states, "voice.states");
-        let policy =
-            FollowWindowPolicy::from(&*crate::lock_or_recover(&self.settings, "voice.settings"));
+        let policy = FollowWindowPolicy::for_device(
+            &crate::lock_or_recover(&self.settings, "voice.settings"),
+            device,
+        );
         let st = states.entry(device.to_string()).or_default();
         st.invalidate_live_turn();
         let expected = st.participation.identity();
@@ -374,13 +391,7 @@ impl VoicePipeline {
         expected: Identity,
         opened_by: &'static str,
     ) -> Option<Identity> {
-        let (policy, context_ms) = {
-            let settings = crate::lock_or_recover(&self.settings, "voice.settings");
-            (
-                FollowWindowPolicy::from(&*settings),
-                settings.context_window_ms,
-            )
-        };
+        let (policy, context_ms) = self.context_policy_for(device);
         let mut states = crate::lock_or_recover(&self.states, "voice.states");
         let st = states.get_mut(device)?;
         st.invalidate_live_turn();
@@ -394,12 +405,16 @@ impl VoicePipeline {
         Some(identity)
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(super) fn context_policy(&self) -> (FollowWindowPolicy, u64) {
+        self.context_policy_for("global")
+    }
+
+    pub(super) fn context_policy_for(&self, device: &str) -> (FollowWindowPolicy, u64) {
         let settings = crate::lock_or_recover(&self.settings, "voice.settings");
-        (
-            FollowWindowPolicy::from(&*settings),
-            settings.context_window_ms,
-        )
+        let eff = settings.effective_for(device);
+        (FollowWindowPolicy::from(&eff), eff.context_window_ms)
     }
     pub(super) fn accept_context_transcript(&self, device: &str, input_id: u64) -> bool {
         let captured = crate::lock_or_recover(&self.states, "voice.states")
@@ -445,9 +460,9 @@ impl VoicePipeline {
         };
         // A KWS winner can authorize its already-open current capture. ASR
         // dispatched before this wake retains its original context ticket.
-        if crate::lock_or_recover(&self.mic, "voice.mic")
-            .get(device)
-            .is_some_and(|p| p.in_speech())
+        if self
+            .mic_arc(device)
+            .is_some_and(|arc| crate::lock_or_recover(&arc, "voice.mic.dev").in_speech())
         {
             Self::bind_capture_input(st, context.ticket());
         } else if st.input.is_some() {
@@ -493,7 +508,9 @@ impl VoicePipeline {
         debit: bool,
     ) -> Option<TurnTicket> {
         let now = id::now_ms();
-        let context_ms = crate::lock_or_recover(&self.settings, "voice.settings").context_window_ms;
+        let context_ms = crate::lock_or_recover(&self.settings, "voice.settings")
+            .effective_for(device)
+            .context_window_ms;
         let ticket = {
             let mut states = crate::lock_or_recover(&self.states, "voice.states");
             let st = states.get_mut(device)?;
@@ -721,6 +738,7 @@ impl VoicePipeline {
                     }
                     let submitted = {
                         let protect_ms = crate::lock_or_recover(&self.settings, "voice.settings")
+                            .effective_for(device)
                             .barge_protect_ms
                             .min(3_000);
                         let mut states = crate::lock_or_recover(&self.states, "voice.states");
@@ -1095,7 +1113,8 @@ impl VoicePipeline {
         let turn_epoch = ticket.stop_epoch;
         let request = Some(ticket.request);
         // R2: the same soft targets go into the prompt and the runaway backstop cap.
-        let voice_policy = crate::lock_or_recover(&self.settings, "voice.settings").clone();
+        let voice_policy =
+            crate::lock_or_recover(&self.settings, "voice.settings").effective_for(&device);
         let continue_hint = voice_policy.effective_continue_hint();
         let spoken_settings = voice_policy.spoken;
         let short_chars = spoken_settings.max_chars;
@@ -1234,6 +1253,7 @@ impl VoicePipeline {
             room: None,
             person_id: None,
         };
+        let lan_exempt = self.hub.is_device_lan_exempt(&device);
         let mut stream = crate::agent::run_turn_with_scope_and_wake(
             env,
             Some(session),
@@ -1243,6 +1263,7 @@ impl VoicePipeline {
             scope,
             scope_ctx,
             wake,
+            lan_exempt,
         );
         // This turn's OWN task id — captured from the Task event, never
         // re-read from shared state (an old turn answering late must not
@@ -1288,10 +1309,7 @@ impl VoicePipeline {
             .get_mut(&device)
             .filter(|st| st.stop_epoch == turn_epoch && st.participation.contains(ticket.request))
         {
-            st.turn_audio = TurnAudio {
-                gen: st.turn_audio.gen + 1,
-                ..Default::default()
-            };
+            st.turn_audio = TurnAudio::default();
         }
         let mut first_byte_ms: Option<u64> = None;
         let mut stop_seen_ms: Option<u64> = None;
@@ -2055,7 +2073,7 @@ impl VoicePipeline {
             );
             return None;
         }
-        if self.hub.primary_audio_out().map(|d| d.stable_id).as_deref() != Some(device) {
+        if !self.hub.device_online_with_cap(device, "audio_out") {
             self.note(
                 "speak_skipped",
                 json!({ "device": device, "reason": "device has no audio_out / not connected" }),
@@ -2181,6 +2199,7 @@ impl VoicePipeline {
         };
         let submitted = {
             let protect_ms = crate::lock_or_recover(&self.settings, "voice.settings")
+                .effective_for(device)
                 .barge_protect_ms
                 .min(3_000);
             let mut states = crate::lock_or_recover(&self.states, "voice.states");
@@ -2198,53 +2217,40 @@ impl VoicePipeline {
                     crate::lock_or_recover(&self.terminal_waiters, "voice.terminal_waiters")
                         .insert(play_id.clone(), tx);
                 }
-                let raced_stop = match states.get_mut(device) {
-                    Some(st) => {
-                        Self::note_voice_play_submitted_locked(st, id::now_ms(), protect_ms);
-                        let raced = st.stop_epoch != started_epoch;
-                        if kind == "answer" {
-                            // M6b: this turn's answer audio started here
-                            // (whole path; the streamed path records in
-                            // register_stream_output).
-                            st.turn_audio.note_submit(id::now_ms(), task_id.as_deref());
+                if let Some(st) = states.get_mut(device) {
+                    Self::note_voice_play_submitted_locked(st, id::now_ms(), protect_ms);
+                    if kind == "answer" {
+                        // M6b: this turn's answer audio started here
+                        // (whole path; the streamed path records in
+                        // register_stream_output).
+                        st.turn_audio.note_submit(id::now_ms(), task_id.as_deref());
+                        if let Some(ticket) = request {
+                            st.participation.answer_started(ticket, &play_id);
                         }
-                        if !raced {
-                            if kind == "answer" {
-                                if let Some(ticket) = request {
-                                    st.participation.answer_started(ticket, &play_id);
-                                }
-                            }
-                        }
-                        st.outputs.insert(
-                            play_id.clone(),
-                            OutputRecord {
-                                answer_text: text.to_string(),
-                                request: if kind == "answer" { request } else { None },
-                                task_id: task_id.clone(),
-                                channel: "voice".into(),
-                                kind: kind.to_string(),
-                                content_ref: String::new(),
-                                stage: if raced {
-                                    "stopping".into()
-                                } else {
-                                    "submitted".into()
-                                },
-                                started_ms: id::now_ms(),
-                                stage_ms: id::now_ms(),
-                                end_sent_ms: None,
-                                expected_ms: 0,
-                                synth_ms,
-                            },
-                        );
-                        raced
                     }
-                    None => false,
-                };
-                (ticket, raced_stop)
+                    st.outputs.insert(
+                        play_id.clone(),
+                        OutputRecord {
+                            answer_text: text.to_string(),
+                            request: if kind == "answer" { request } else { None },
+                            task_id: task_id.clone(),
+                            channel: "voice".into(),
+                            kind: kind.to_string(),
+                            content_ref: String::new(),
+                            stage: "submitted".into(),
+                            started_ms: id::now_ms(),
+                            stage_ms: id::now_ms(),
+                            end_sent_ms: None,
+                            expected_ms: 0,
+                            synth_ms,
+                        },
+                    );
+                }
+                ticket
             })
         };
         match submitted {
-            Ok((ticket, raced_stop)) => {
+            Ok(ticket) => {
                 let play_id = ticket.play_id.clone();
                 self.note(
                     "tts_played",
@@ -2257,17 +2263,6 @@ impl VoicePipeline {
                             "provider": audio.provider, "voice": audio.voice }),
                 );
                 self.push_assistant_state(device, false);
-                if raced_stop {
-                    // Record the SEND result too — if the link was torn down
-                    // inside the window the compensation never reached the
-                    // wire, and the log must not claim it did.
-                    let stop_sent = self.hub.stop(&play_id).is_ok();
-                    self.note(
-                        "tts_stop_compensated_after_race",
-                        json!({ "device": device, "play_id": play_id, "task": task_id,
-                                "started_epoch": started_epoch, "stop_sent": stop_sent }),
-                    );
-                }
                 // Terminal receipt bookkeeping flows through the event pump
                 // (DeviceEvent::PlayStage) — no parallel writer here.
                 if !wait_terminal {

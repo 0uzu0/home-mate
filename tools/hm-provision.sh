@@ -558,7 +558,7 @@ if wait_http "http://$IP:8930/api/v0/status" 2; then
     if [ -n "$LOADED_HASH" ] && [ "$KWS_STATE" = "running" ]; then
         skip "spotter already loaded $LOADED_HASH and is running — deploying would restart it for no reason"
     elif mutate "POST /api/v0/reflex/deploy (the node's own words; idempotent)"; then
-        DEPLOY=$(curl -sf -m 10 -H "$(auth_hdr)" -X POST "http://$IP:8930/api/v0/reflex/deploy" || true)
+        DEPLOY=$(curl -sf -m 30 -H "$(auth_hdr)" -X POST "http://$IP:8930/api/v0/reflex/deploy" || true)
         if [ -n "$DEPLOY" ]; then
             log "  $(printf '%s' "$DEPLOY" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("sent hash", d.get("hash"), "words", d.get("words"))' 2>/dev/null || echo "$DEPLOY")"
         else
@@ -784,7 +784,7 @@ words = [w for w in (d.get("words") or []) if w.get("intent") != "wake"]
 words.insert(0, {"text": new_text, "tokens": new_tok, "intent": "wake", "enabled": True})
 print(json.dumps({"words": words, "deploy": True, "device": sys.argv[3]}))' "$WAKE_WORD" "$TOK" "$NODE_DEV" 2>/dev/null || true)
         [ -n "$WORDS" ] || fail "could not read the node's reflex table"
-        DEPLOYED=$(curl -s -m 25 -X PUT -H "$(auth_hdr)" -H 'content-type: application/json' --data-binary "$WORDS" \
+        DEPLOYED=$(curl -s -m 30 -X PUT -H "$(auth_hdr)" -H 'content-type: application/json' --data-binary "$WORDS" \
             "http://$IP:8930/api/v0/reflex" 2>/dev/null || true)
         printf '%s' "$DEPLOYED" | python3 -c 'import json,sys
 d=json.load(sys.stdin)

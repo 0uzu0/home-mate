@@ -68,6 +68,10 @@ const label = computed(() => props.state || 'idle')
   background: var(--led-listening);
 }
 
+.led--hearing {
+  background: var(--led-hearing);
+}
+
 .led--wake {
   background: var(--led-wake);
 }

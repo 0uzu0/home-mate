@@ -33,10 +33,12 @@ interface Row {
   tone: 'ok' | 'warn' | 'danger' | 'neutral'
 }
 
-const idleOff = computed(() => props.mode?.asr_wake_fallback === false)
+const idleOff = computed(
+  () => (props.device?.asr_wake_fallback ?? props.mode?.asr_wake_fallback) === false,
+)
 
 const rows = computed<Row[]>(() => {
-  const wakeWords = props.mode?.wake_words ?? []
+  const wakeWords = props.device?.wake_words ?? props.mode?.wake_words ?? []
   const reflex = props.device?.reflex
   const live = reflex?.words ?? []
   const deploy = reflex?.deploy ?? null
@@ -67,6 +69,9 @@ const rows = computed<Row[]>(() => {
 
 <template>
   <Panel icon="wake" :title="t('wakeMethodsTitle')" :hint="t('wakeMethodsHint')">
+    <template v-if="device" #actions>
+      <Pill size="sm" tone="accent" mono>{{ t('scopeThisDevice', { device: device.device }) }}</Pill>
+    </template>
     <p v-if="!rows.length" class="wm__empty">{{ t('wakeMethodsEmpty') }}</p>
     <div v-else class="wm__table-wrap">
       <table class="wm__table">

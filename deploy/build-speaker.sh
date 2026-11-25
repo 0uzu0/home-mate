@@ -12,8 +12,8 @@ cd "$(dirname "$0")/.."
 TARGET=aarch64-unknown-linux-musl
 OUT="${1:-/tmp/hm-speaker}/speaker"
 
-echo "==> cargo zigbuild --release --target $TARGET"
-cargo zigbuild --release --target $TARGET -p hm-core
+echo "==> ./tools/build_core.sh"
+./tools/build_core.sh
 
 echo "==> console dist (web/)"
 (cd web && npm run build >/dev/null)

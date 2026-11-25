@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/hero-banner-zh.png" alt="Home Mate · 小瑞 — RUI 下一代纯 Rust 音箱本体语音运行时" width="100%" />
+  <img src="docs/assets/hero-banner-zh.png" alt="Home Mate · 小瑞 — 纯 Rust 边缘语音大脑、多网关隔离与家庭主脑生态" width="100%" />
 </p>
 
 <p align="center">
@@ -7,21 +7,31 @@
 </p>
 
 <p align="center">
-  <a href="https://mymate.homes"><img src="https://img.shields.io/badge/Website-mymate.homes-1f6b45?style=flat-square" alt="Website" /></a>
+  <a href="https://mymate.homes"><img src="https://img.shields.io/badge/Website-mymate.homes-1f6b45?style=flat-square" alt="官方网站" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL--3.0-2e7d4f?style=flat-square" alt="AGPL-3.0" /></a>
   <a href="LICENSE-PROTOCOL-APACHE-2.0"><img src="https://img.shields.io/badge/Protocol_v2_Spec-Apache--2.0-245a8d?style=flat-square" alt="Apache-2.0" /></a>
-  <img src="https://img.shields.io/badge/Execution-100%25_音箱本体运行-175536?style=flat-square" alt="100% 音箱本体运行" />
-  <img src="https://img.shields.io/badge/Hardware-小爱_Pro_(LX06)_%7C_Echo_Dot_2-364239?style=flat-square" alt="支持硬件" />
+  <img src="https://img.shields.io/badge/核心-纯_Rust_%2B_Vue_3-175536?style=flat-square" alt="纯 Rust + Vue 3" />
+  <img src="https://img.shields.io/badge/网关生态-Linux_(Dot2%2FLX06)_%7C_Android_(手机%2F86屏%2F带屏音箱)-364239?style=flat-square" alt="全形态网关支持" />
 </p>
 
 ---
 
-## 这是什么？与第一代「小瑞 · rui」是什么关系？
+## 这是什么？从「小瑞 · rui」到三层主权家庭语音生态
 
-**Home Mate（中文名：小瑞）** 是开源项目 [小瑞 · rui](https://github.com/yes999zc/rui) 的下一代全面架构升级版。我们**用纯 Rust 重写了全部代码，并彻底改变了技术路线**：
+**Home Mate（中文名：小瑞）** 是开源项目 [小瑞 · rui](https://github.com/yes999zc/rui) 的下一代纯 Rust 全面演进版，现已升级为 **「边缘主权大脑 + 多形态网关彻底隔离 + 家庭主脑 Agent」** 三层架构：
 
-- 在第一代 `rui` 中，需要一台常开的外部服务器（NAS / 小主机）运行 Python FastAPI 与 Docker 容器，音箱只作为远程麦克风/喇叭卫星节点；
-- 而在 **Home Mate · 小瑞** 中，核心大脑（`hm-core`）、Vue 3 网页管理控制台（`:8930`）、硬件音频网关（`hm-gateway`）以及离线热词与神经网络断句引擎（`hm-kws`：**3.3M Zipformer + Silero VAD v4**）**100% 直接运行在音箱自身的 ARM64 处理器与内存盘上**！不再需要外部 Docker 主机常驻推流，音箱插上电就是一台完整的主权 AI 语音终端。
+1. **边缘大脑（`hm-core`）：可 100% 跑在音箱本体，也可作为 NAS 全屋中枢**
+   - 告别第一代 `rui` 必须依赖常开外部 Python 服务器的限制：在 **Echo Dot 2** 与 **256 MB 小米小爱 Pro（`LX06`）** 上，`hm-core`、Vue 3 控制台（`:8930`）、`hm-gateway` 与离线热词/VAD 引擎（`hm-kws`）**100% 运行在音箱本体**，插电即独立工作。
+   - 同一套 `hm-core` 也原生提供 **NAS / 服务器全量 Docker 镜像**（`linux/amd64` + `linux/arm64`，含内置 Silero VAD），统一接入 **128 MB 小内存版 LX06 瘦网关** 与 **全屋安卓终端（带屏音箱、86 墙面屏、平板与废旧手机）**。
+2. **主脑 / 家庭 Agent 编排（Master Brain）**
+   - 边缘音箱负责毫秒级唤醒、日常快答、音乐/故事/提醒与 Home Assistant 写后回读控家；
+   - 复杂长任务、深度多工具检索、家庭汇报与全屋节点巡检（内置 `skills/home-mate-fleet`）通过 `brain.delegate / status / steer / cancel` **异步委派给家庭主脑 Agent**（兼容 Hermes / OpenAI-Compatible Agent 网关）后台执行，绝不阻塞日常语音对话，完成后自动回播到发起房间。
+3. **边缘脑 + 多 Gateway 彻底隔离（Northbound Protocol v2）**
+   - 单台 `hm-core` 可同时稳定承载多台异构网关接入：
+     - **每设备会话与音频完全隔离**：独立上下文、「退下」自动归档历史、统一一键清空当前与归档记录（`DELETE /api/v0/devices/{id}/conversation`）、独立播控与打断路由；
+     - **分硬件家族独立 KWS 灵敏度**：Dot2（`0.32 / 2.50`）、LX06（`0.20 / 2.50`）、Android（`0.22 / 3.00`）按硬件类型自动隔离，绝不互相覆盖污染，单设备手动调优优先；
+     - **更自然的低延迟交互**：一语直达 `wake_dur_ms` 精准切片、唤醒应答尾音桥接、本地退出词毫秒级打断；安全边界支持家庭 Bearer Token 与局域网私网免密豁免（`lan_gateway_exempt`）。
+     - *（透明说明：日常默认采用稳定的半双工模式 + 唤醒词/本地退出词播中打断；**全双工模式仍在持续开发中**，控制台与 Android 客户端均已明确标注「开发中」。）*
 
 > [!IMPORTANT]
 > **硬件研究用途声明与自研定制音箱计划**
@@ -30,29 +40,81 @@
 
 ---
 
-## 小米小爱音箱 Pro (`LX06`) 三大核心亮点
+## 正式公开：统一三仓开源生态矩阵（Linux 统一网关 + Android 通用端）
 
-配合专属网关仓 [yes999zc/home-mate-gateway-lx06](https://github.com/yes999zc/home-mate-gateway-lx06)，小瑞在百元级神机**小米小爱音箱 Pro（黑色圆柱款 `LX06`，Amlogic A113X 四核 `aarch64`）**上实现了零风险双系统体验：
+<p align="center">
+  <img src="docs/assets/architecture-v3-light.png" alt="Home Mate · 小瑞 边缘脑 + 多网关隔离 + 家庭主脑架构图" width="100%" />
+</p>
 
-1. **完全音箱侧运行（告别外部 Docker 推流服务器）**
-   - 通过 LTO 编译优化与 `--no-default-features`（`--slim`）拆解，`hm-core` 大脑、Vue 3 控制台、`hm-gateway`（仅 `1.68 MiB`）与 Silero `gateway_vad` 被压缩进 **`4.84 MiB`** 的主程序包（`/data/hm/hm-bundle.tar.xz`）。
-   - 音箱开机时自动将主包解压至 **`120.9 MiB` 的 `/tmp` 内存盘**运行：热词唤醒、神经网络 VAD 断句、`:8930` 管理后台与多房间声学信噪比（SNR）仲裁全部在音箱本体闭环完成。
-2. **不伤害本系统（双系统无损并行，零变砖风险）**
-   - **原厂只读 SquashFS 分区 0 字节修改**：绝不触碰或重刷 `mtd4 (system0)` 与 `mtd5 (system1)` 原厂固件分区。
-   - 原厂小爱服务栈（`mipns-xiaomi`、`mediaplayer`、米家蓝牙网关、原厂闹钟）保持原样运行。
-   - 诊断与语音事件日志（`voice-events`）自动软链至 `/tmp` 内存盘并在 85% 水位自动轮转，绝不磨损或撑满 `13.3 MiB` 的 `/data` 闪存。
-   - **一行命令无痕恢复出厂**：随时在 SSH 执行 `rm -rf /data/hm /data/init.sh && reboot`，重启后即 100% 回到纯原厂状态。
-3. **唤醒词切换系统（喊谁谁应，无需拨开关）**
-   - 两套系统的唤醒引擎通过 ALSA `noop`（`dsnoop`）共享 6 麦环形阵列同时监听，并在播放空闲时立即释放 `softvol` 句柄：
-     - **喊“小爱同学”** → 直接由原厂小爱同学应答（米家设备控制、蓝牙网关、原厂技能照常使用）。
-     - **喊“你好小智 / 你好高达”** *(可在后台任意自定义)* → 直接由**小瑞 Home Mate** 应答（调用 DeepSeek / GLM / OpenAI 大模型、本地 Qwen3-ASR、火山 `seed-tts-2.0` 与 Home Assistant 状态回读控制）。
-     - **会话中说“切换小爱”** *(或双击音箱顶部的实体 **CH 键**)* → 立即本地退场交还声道，或一键锁定为纯原厂小爱独占模式。
+我们现已正式整合、公开 **Home Mate 三仓完整生态**：
+
+| 仓库 | 定位与核心能力 | 开源协议 |
+| :--- | :--- | :--- |
+| **[yes999zc/home-mate](https://github.com/yes999zc/home-mate)** *（本仓）* | **边缘大脑与控制台**：`hm-core`（NAS 全量版 & 音箱 `--slim` 精简版）、家庭主脑 Agent 委派、多网关隔离、`hm-release` Ed25519 签名 OTA、Vue 3 控制台（`web/`）、Dot2 配网脚本（`tools/hm-provision.sh`）与北向 v2 协议契约 | `AGPL-3.0`（北向 v2 协议规范 `Apache-2.0`） |
+| **[yes999zc/home-mate-gateway-linux](https://github.com/yes999zc/home-mate-gateway-linux)** *（新公开统一 Linux 网关仓）* | **正式合并原 `dot2` 与 `lx06` 分拆仓**：一套特征门控 Rust 代码统一支持 **Echo Dot 2（`board-dot2`）**、**小米 LX06 256 MB**（音箱本体方案 A 双唤醒）与 **小米 LX06 128 MB**（自动识别内存切换瘦网关，连接 NAS 全量 Docker Core） | `AGPL-3.0` |
+| **[yes999zc/home-mate-gateway-android](https://github.com/yes999zc/home-mate-gateway-android)** *（新公开 Android 通用网关仓）* | **一个自适应零依赖 APK**（Android 5–16），适配**安卓带屏音箱、4 寸 86 墙面控制面板、平板、主力手机，甚至把家里吃灰的废旧安卓手机秒变全屋 AI 语音终端与多房间控制器**，内置离线唤醒与 GitHub Releases 自动更新 | `AGPL-3.0` |
+
+> **旧仓迁移提示**：原独立维护的 `home-mate-gateway-dot2` 与 `home-mate-gateway-lx06` 现已合并至统一的 **[yes999zc/home-mate-gateway-linux](https://github.com/yes999zc/home-mate-gateway-linux)**，后续所有新特性与修复均在统一仓发布。
+
+### 我该选择哪种部署组合？（速查表）
+
+| 你手头的设备 | 推荐架构组合 | 是否需要常开 NAS / 服务器？ |
+| :--- | :--- | :--- |
+| **小米小爱 Pro (`LX06`, 256 MB 内存版)** | 音箱本体 `hm-core --slim` + `hm-gateway` + `hm-kws`（免刷机双系统） | **不需要**（100% 音箱本体运行） |
+| **小米小爱 Pro (`LX06`, 128 MB 小内存版)** | 音箱自动启用 **瘦网关**（`~1.6 MiB`） → 连接 **NAS / 服务器全量 Docker `hm-core`** | **需要**（主脑部署在 NAS 或服务器） |
+| **亚马逊 Echo Dot 2 (`RS03QR`)** | 音箱本体全量 `hm-core` + `hm-gateway` + `hm-kws`（7 麦 + 160ms AEC） | **不需要**（100% 音箱本体运行） |
+| **安卓带屏音箱 / 86 墙面屏 / 平板 / 闲置旧安卓手机** | **NAS / 电脑全量 Docker `hm-core`** + 安装 **Android 通用 APK**（零刷机 3 分钟体验！） | **需要**（也可直接以管理模式连接已有音箱 Core） |
 
 ---
 
-## 实机管理后台界面（默认浅色主题 · `http://<音箱IP>:8930`）
+## 小米小爱音箱 Pro (`LX06`) 核心亮点（256 MB / 128 MB 自适应）
 
-每台音箱直接在本地 `8930` 端口提供响应式 Web 控制台（默认采用清爽高对比浅色主题，支持一键切换深色主题与中英双语）：
+通过 **[yes999zc/home-mate-gateway-linux](https://github.com/yes999zc/home-mate-gateway-linux)** 部署时，守护进程自动读取 `/proc/meminfo` 的 `MemTotal` 内存容量，自动适配小米出厂的两种硬件批次：
+
+1. **256 MB 独立全本体 / 128 MB 瘦网关自动分流**
+   - **256 MB 批次（`MemTotal >= 180,000 kB`）**：主包（`<= 6.0 MiB`）存放于 `/data/hm`，开机自动解压进 `120.9 MiB` `/tmp` 内存盘，本机独立运行 `hm-core --slim`、`:8930` 控制台、`hm-gateway` 与离线 `hm-kws`（自动采用实机标定的 `0.20 / 2.50` 灵敏度）。
+   - **128 MB 小内存批次（`MemTotal < 180,000 kB`，`/tmp` 约 59 MB）**：自动进入**瘦网关模式**（`hm-lx06-thin.tar.xz` 压缩仅 ~550 KB / 解压 ~1.6 MiB，不跑本机 Core 与 KWS），通过局域网 `:8932` 或 SSH 反向隧道连接部署在 **NAS / 服务器上的全量 Docker `hm-core`**。
+2. **不伤害原厂系统（双系统无损共存，零变砖风险）**
+   - 原厂只读 SquashFS 分区 `mtd4 / mtd5` **0 字节修改**；随时执行 `rm -rf /data/hm /data/init.sh && reboot` 一键恢复纯原厂小爱。
+3. **唤醒词直切双系统（256 MB 双唤醒）**
+   - 喊 **“小爱同学”** → 原厂小爱应答（米家蓝牙网关、原厂闹钟照常可用）；
+   - 喊 **自定义唤醒词（如“你好高达 / 你好小智”）** → 小瑞 Home Mate 大模型与 Home Assistant 状态回读应答；
+   - 说 **“切换小爱”** 或长按播放/暂停键 1.5 秒 → 立即退场交还或切换原厂独占模式。
+
+---
+
+## 实机界面展示：Android 通用端 + Web 控制台
+
+### Android 通用客户端与语音网关（`v2.3.10+` · 4:3 与 1:1 自适应实机截图）
+
+同一个 APK 自动适配手机、废旧手机改造、4 寸 86 墙面屏（`1:1`）及带屏音箱/平板（`4:3`），内置 Sherpa-ONNX JNI 离线唤醒、播中 PBFDAF 回声消除打断、右上角完整对话历史与首页底部字幕条同步一键清空、全屋多房间切控、后台防杀与 GitHub Releases 自动更新：
+
+<table>
+  <tr>
+    <td width="50%">
+      <img src="docs/assets/android-zh-voice-history-4x3.png" alt="Android 语音首页与统一对话历史清空 (4:3)" />
+      <p align="center"><strong>1. 语音主页与统一对话记录清空（手机端 · 4:3）</strong><br>3D 粒子星云球、底部实时字幕条与右上角完整历史面板联动，一键清空当前与归档记录</p>
+    </td>
+    <td width="50%">
+      <img src="docs/assets/android-zh-rooms-settings-4x3.png" alt="Android 全屋设备管理与设置页 (4:3)" />
+      <p align="center"><strong>2. 全屋多房间控播与系统设置（手机端 · 4:3）</strong><br>多核心自由切换、86 墙面屏 Kiosk 桌面常驻、后台防杀管理与 GitHub 自动更新</p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <img src="docs/assets/android-zh-display-4x3.png" alt="Android 带屏音箱与平板自适应布局 (4:3)" />
+      <p align="center"><strong>3. 带屏音箱 / 平板横屏自适应（原生 4:3）</strong><br>自动切换左侧导航栏，适配安卓带屏音箱、桌面支架平板与床头时钟形态</p>
+    </td>
+    <td width="50%">
+      <img src="docs/assets/android-zh-panel86-1x1.png" alt="Android 4寸86墙面控制面板自适应布局 (1:1)" />
+      <p align="center"><strong>4. 4 寸 86 墙面控制面板自适应（原生 1:1）</strong><br>紧凑方屏排布 + 可选 Kiosk Launcher 常驻，闲置墙面屏一秒接入全屋语音</p>
+    </td>
+  </tr>
+</table>
+
+### 内置 Web 管理控制台（默认浅色主题 · `http://<核心IP>:8930`）
+
+每台音箱或 NAS Docker Core 均在 `:8930` 提供响应式 Vue 3 控制台（支持浅/深主题与中英双语切换）：
 
 <table>
   <tr>
@@ -62,180 +124,174 @@
     </td>
     <td width="50%">
       <img src="docs/assets/lx06-interaction-light.png" alt="唤醒与连续对话 (/interaction)" />
-      <p align="center"><strong>2. 唤醒与连续对话 (<code>/interaction</code>)</strong><br>自定义唤醒词、灵敏度阈值、9 秒免唤醒连续追问窗口与本地结束词（含“切换小爱”）</p>
+      <p align="center"><strong>2. 唤醒与连续对话 (<code>/interaction</code>)</strong><br>自定义唤醒词、分家族灵敏度、9 秒免唤醒追问窗口与本地退出词</p>
     </td>
   </tr>
   <tr>
     <td width="50%">
       <img src="docs/assets/lx06-devices-light.png" alt="硬件与音频门控 (/devices)" />
-      <p align="center"><strong>3. 硬件与音频门控 (<code>/devices</code>)</strong><br>LX06 固件状态、房间分组、Silero VAD 起止分贝门限与播后盲窗设置</p>
+      <p align="center"><strong>3. 硬件与音频门控 (<code>/devices</code>)</strong><br>硬件状态、房间分组、Silero VAD 门限与播后盲窗</p>
     </td>
     <td width="50%">
-      <img src="docs/assets/lx06-eq-vad-light.png" alt="专属 3 段防破音 EQ (/devices)" />
-      <p align="center"><strong>4. 硬件声学均衡曲线 (<code>/devices</code>)</strong><br>LX06 专属 3 段低音防破音 EQ（120Hz/350Hz/3.2kHz）与 Dot2 专属 EchoMuse 曲线</p>
+      <img src="docs/assets/lx06-eq-vad-light.png" alt="硬件声学均衡曲线 (/devices)" />
+      <p align="center"><strong>4. 硬件声学均衡曲线 (<code>/devices</code>)</strong><br>LX06 专属 3 段低音防破音 EQ 与 Dot2 专属 EchoMuse 曲线</p>
     </td>
   </tr>
   <tr>
     <td width="50%">
-      <img src="docs/assets/console-services-light.png" alt="大模型与语音服务 (/services)" />
-      <p align="center"><strong>5. 对话模型与语音服务 (<code>/services</code>)</strong><br>主备大模型（DeepSeek / GLM）、本地 Qwen3-ASR 语音识别与火山引擎 seed-tts-2.0</p>
+      <img src="docs/assets/console-services-light.png" alt="对话模型与家庭主脑 (/services)" />
+      <p align="center"><strong>5. 对话模型、语音服务与家庭主脑 (<code>/services</code>)</strong><br>主备大模型（DeepSeek / GLM）、Qwen3-ASR、火山 TTS 与家庭主脑 Agent 配置</p>
     </td>
     <td width="50%">
-      <img src="docs/assets/console-ha-readback-light.png" alt="Home Assistant 闭环回读 (/tools)" />
-      <p align="center"><strong>6. Home Assistant 状态回读闭环 (<code>/tools</code>)</strong><br>自动发现暴露实体，每次控制强制执行写后真实状态回读（没读回绝不谎报已完成）</p>
+      <img src="docs/assets/console-ha-readback-light.png" alt="Home Assistant 状态回读闭环 (/tools)" />
+      <p align="center"><strong>6. Home Assistant 状态回读闭环 (<code>/tools</code>)</strong><br>自动发现暴露实体，每次控家强制写后真实状态回读</p>
     </td>
   </tr>
 </table>
 
 ---
 
-## 音箱本体架构与三仓矩阵
+## 分设备上手向导 & AI 编程助手部署话术（四大轨道）
 
-<p align="center">
-  <img src="docs/assets/architecture-v2-light.png" alt="Home Mate · 小瑞 音箱本体全栈运行架构" width="100%" />
-</p>
+### 轨道 A：小米小爱音箱 Pro (`LX06`) — 256 MB / 128 MB 自适应免刷机部署
 
-| 仓库 | 职责边界 | 开源许可证 |
-| :--- | :--- | :--- |
-| **[yes999zc/home-mate](https://github.com/yes999zc/home-mate)** *(本仓)* | `hm-core` 核心大脑、`hm-release` Ed25519 签名升级器、Vue 3 控制台（`web/`）、Dot2 一键配网脚本（`tools/hm-provision.sh`）与北向 v2 协议契约 | `AGPL-3.0`（北向 Protocol v2 规范为 `Apache-2.0`） |
-| **[yes999zc/home-mate-gateway-lx06](https://github.com/yes999zc/home-mate-gateway-lx06)** | **小米小爱音箱 Pro（`LX06`，A113X `aarch64`）**专属硬件网关：方案 A 内存盘解压守护、100% 音箱侧运行、双系统共存与唤醒词切换 | `AGPL-3.0` |
-| **[yes999zc/home-mate-gateway-dot2](https://github.com/yes999zc/home-mate-gateway-dot2)** | **亚马逊 Echo Dot 2（`RS03QR`，MT8163 7 麦阵列）**专属硬件网关：160ms 硬件参考锁回声消除、12 灯珠 60fps RGB 灯环与 emOS 集成 | `AGPL-3.0` |
+#### 前置条件
+1. **确认型号与内存批次**：黑色圆柱款**小米小爱音箱 Pro（底部铭牌 `LX06`，A113X `aarch64`）**，部署前务必通过 SSH 执行 `grep ^MemTotal /proc/meminfo` 区分 **256 MB（`>= 180,000 kB`）** 与 **128 MB（`< 180,000 kB`）**。
+2. **自行开启 Root SSH**：参考社区项目 [idootop/open-xiaoai](https://github.com/idootop/open-xiaoai) 开启 22 端口 SSH 登录。
+3. **如为 128 MB 批次**：请先按下方 **轨道 C** 在局域网 NAS / 服务器部署**全量 Docker `hm-core`**（切勿用 `--slim`）。
 
----
-
-## 分设备前置条件与安装向导（请按你手头的音箱型号选择）
-
-小米小爱音箱 Pro（`LX06`）与亚马逊 Echo Dot 2（`RS03QR`）是两套硬件架构完全不同的设备，**请勿混用步骤**。
-
-### 设备 A：小米小爱音箱 Pro (`LX06`) 免刷机双系统部署
-
-#### LX06 必备前置条件
-1. **确认硬件型号与内存版本**：必须是黑色高圆柱款**小米小爱音箱 Pro（底部铭牌型号为 `LX06`，Amlogic A113X `aarch64`）**，且全本地双系统模式需 **256 MB 内存版本**（如为 128 MB 内存版，请改用下方「方式 C：NAS / Docker 容器化部署」+ 音箱仅跑 `hm-gateway` 薄网关）。
-2. **自行完成 SSH 解锁**：请先参照开源社区项目 [idootop/open-xiaoai](https://github.com/idootop/open-xiaoai) 开启音箱的 root SSH 权限（端口 22），确认在电脑终端可执行 `ssh root@<音箱IP>` 登录。
-3. **检查 `/data` 可用空间**：SSH 登录后执行 `df -k /data`，确认剩余可用空间 ≥ **`5.5 MiB`**。
-
-#### LX06 手工安装三行命令
+#### 手工命令
 ```bash
-git clone https://github.com/yes999zc/home-mate.git "../home mate b"
-git clone https://github.com/yes999zc/home-mate-gateway-lx06.git
-cd home-mate-gateway-lx06
+git clone https://github.com/yes999zc/home-mate.git
+git clone https://github.com/yes999zc/home-mate-gateway-linux.git
+cd home-mate-gateway-linux
+
+# 情况 A1：256 MB 批次（100% 音箱本体双唤醒）
 ./tools/pack_lx06_bundle.sh
-
-# 在局域网常开机器或本机通过 HTTP 托管 8.5 MiB 离线 KWS 模型包（音箱开机拉取到 /tmp/hm-kws）
 python3 -m http.server 18089 --directory build/lx06 &
-
-# 一键部署到小爱音箱 Pro /data/hm（绝不改动原厂只读 SquashFS 分区）
 ./deploy/lx06/install-lx06.sh --device-ip 192.168.1.50 --kws-url http://192.168.1.10:18089/hm-kws-lx06.tar.xz
+
+# 情况 A2：128 MB 小内存批次（瘦网关直连 NAS 全量 Docker Core）
+./tools/pack_lx06_bundle.sh --thin
+./deploy/lx06/install-lx06.sh --thin --device-ip 192.168.1.50 --core-addr 192.168.1.10:8932 --device-id lx06-living
 ```
 
-#### 让 AI 编程助手（Claude Code / Cursor / Codex）代你一键部署 LX06
-直接复制以下话术发给你的 AI 助手（**注意：复制后请把话术里的示例 IP `192.168.1.50` 和 `192.168.1.10` 替换为你自己的真实局域网 IP**）：
+#### 让 AI 编程助手一键自适应部署 LX06（自动判断 256 MB / 128 MB）
+复制以下话术给 **Claude Code / Cursor / Codex / Antigravity**（**请先将示例 IP `192.168.1.50` 和 `192.168.1.10` 替换为你家真实局域网 IP**）：
 ```text
 请帮我将 Home Mate · 小瑞部署到我的小米小爱音箱 Pro（型号 LX06，已通过 open-xiaoai 开启 root SSH）：
-【请先将下方两个示例 IP 替换为你自己的真实局域网 IP】
-- 音箱 SSH 地址：root@192.168.1.50  <-- 替换为你小爱音箱 Pro 的实际局域网 IP（密码：open-xiaoai 或已配好免密）
-- 局域网托管机 IP：192.168.1.10    <-- 替换为你当前电脑或常开 NAS 的实际局域网 IP
+【请先替换下方两个示例 IP 为你的真实局域网 IP】
+- 音箱 SSH 地址：root@192.168.1.50
+- 局域网 NAS / 电脑 IP：192.168.1.10
 
-请按以下步骤依次执行并在每一步向我汇报事实结果（执行时请统一使用我上面提供的真实 IP）：
-1. 克隆 https://github.com/yes999zc/home-mate.git 与 https://github.com/yes999zc/home-mate-gateway-lx06.git 到平级目录。
-2. SSH 登录 root@<音箱IP> 检查 `uname -m`（确认为 aarch64）与 `df -k /data /tmp`（确认 /data 可用空间 >= 5500 KB；若不足请先帮我清理 /data/log/* 旧日志）。
-3. 在 home-mate-gateway-lx06 目录执行 `./tools/pack_lx06_bundle.sh`（或直接从 GitHub Release v0.2.0 下载预编译好的 hm-bundle.tar.xz 与 hm-kws-lx06.tar.xz），并用后台 HTTP 服务在 <托管机IP>:18089 托管 build/lx06/ 目录（验证 curl -I http://<托管机IP>:18089/hm-kws-lx06.tar.xz 返回 200）。
-4. 执行 `./deploy/lx06/install-lx06.sh --device-ip <音箱IP> --kws-url http://<托管机IP>:18089/hm-kws-lx06.tar.xz` 完成方案 A 免刷机安装（绝不修改 mtd4/mtd5 原厂只读分区）。
-5. 等待 15 秒内存盘解压完成后，调用 `POST http://<音箱IP>:8930/api/v0/auth/provision` 生成家庭访问令牌并保存到本机 `~/.home-mate/lx06.token`（权限 0600），最后打印控制台地址与令牌供我登录。
+请严格遵守以下安全与自适应步骤：
+1. 严禁修改原厂只读 SquashFS 分区（mtd4 / mtd5），仅使用方案 A（/data/hm 与 /data/init.sh）。
+2. 将 https://github.com/yes999zc/home-mate.git 与 https://github.com/yes999zc/home-mate-gateway-linux.git 克隆到平级目录。
+3. SSH 登录 root@<音箱IP> 检查 `uname -m`、`grep ^MemTotal /proc/meminfo` 与 `df -k /data /tmp`，根据实测内存自动分流：
+   - 若 MemTotal >= 180000 kB（256 MB 批次 → 音箱本体双唤醒）：
+     a) 确认 /data 剩余 >= 6000 KB，执行 `./tools/pack_lx06_bundle.sh` 打包，并用 HTTP 在 <托管机IP>:18089 托管 build/lx06/（验证 hm-kws-lx06.tar.xz 返回 200）。
+     b) 执行 `./deploy/lx06/install-lx06.sh --device-ip <音箱IP> --kws-url http://<托管机IP>:18089/hm-kws-lx06.tar.xz`。
+     c) 验证音箱 `hm-core`、`hm-gateway`、`hm-kws` 运行正常、`http://<音箱IP>:8930` 返回 200、`/api/v0/mode` 中 LX06 灵敏度为 `0.20 / 2.50`。
+   - 若 MemTotal < 180000 kB（128 MB 批次 → 瘦网关 + NAS 全量 Core）：
+     a) 先在我的 NAS / 服务器（<托管机IP>）部署 `yes999zc/home-mate` 的**标准全量版 Docker `hm-core`**（不要用 `--slim`，确认开启 `HM_GATEWAY_ALLOW_LAN=1` 并配对管理员令牌）。
+     b) 在 `home-mate-gateway-linux` 执行 `./tools/pack_lx06_bundle.sh --thin`，再执行 `./deploy/lx06/install-lx06.sh --thin --device-ip <音箱IP> --core-addr <托管机IP>:8932`（若未开启局域网免密豁免，请附加 `--core-token`）。
+     c) 验证音箱上**只运行 `hm-gateway`** 且在 `http://<托管机IP>:8930` 控制台显示在线。
+4. 严禁将任何真实 IP、Token 或密钥提交到 Git；生成的家庭令牌请保存至 `~/.home-mate/`（权限 0600）。
 ```
 
 ---
 
-### 设备 B：亚马逊 Echo Dot 2 (`RS03QR`) 一键配网脚本 (`tools/hm-provision.sh`)
+### 轨道 B：亚马逊 Echo Dot 2 (`RS03QR`) — 一键配网脚本 (`tools/hm-provision.sh`)
 
-#### Echo Dot 2 必备前置条件
-1. **已通过 `firebreak / amonet` 解锁 Bootrom 并获得底层权限**：未解锁的原厂 Echo Dot 2（第二代，型号 `RS03QR`）需先使用 [yes999zc/firebreak](https://github.com/yes999zc/firebreak)（执行 `uvx firebreak@latest`）通过 Micro-USB 解锁 Bootrom（切勿先连 Alexa App 升级固件），并妥善保存原厂 `p10` 分区备份镜像。
-2. **已刷入 `emOS` 音频系统底座并连上 Wi-Fi**：解锁后需已刷入 `emOS` 系统层，音箱通过 USB 数据线连上电脑后出现串口控制台（macOS 为 `/dev/cu.usbmodem*`，Linux 为 `/dev/ttyACM*`，串口 `/etc/os-release` 返回 `ID=emos`），且已在串口执行 `em-wifi` 连上家庭局域网。
+#### 前置条件
+1. **已通过 `firebreak / amonet` 解锁 Bootrom**（[yes999zc/firebreak](https://github.com/yes999zc/firebreak)）并留存原厂 `p10` 备份。
+2. **已刷入 `emOS` 底座并连上 Wi-Fi**（USB 串口返回 `ID=emos`）。
 
-#### Echo Dot 2 手工运行 `tools/hm-provision.sh`
-一旦满足上述两个前置条件，本仓内置的 `tools/hm-provision.sh`（已随仓内置 `tools/serial_cmd.py` 串口通信工具）将一条命令全自动完成：**修复 `/data/emos/sockets` → 推送 `bootstrap` 种子包并重启交由 `emOS init` 守护 → 激活 Ed25519 签名 `home-mate-release` 包 → `7/7` 健康自检 → 签发家庭令牌 → 从家里已配好的主音箱一键克隆全套家庭配置并设置新唤醒词**：
-
+#### 手工运行
 ```bash
-# 1. 先加 --dry-run 执行只读预检（验证串口 ID=emos、Wi-Fi IP 与安装包哈希，不写入设备任何字节）：
+# 1. 只读预检（不写入设备任何字节）：
 ./tools/hm-provision.sh --device-id dot2-living \
   --seed build/bootstrap/home-mate-bootstrap-dot2-living.tar.gz \
-  --release build/release/home-mate-release-2026.11.23-106.tar \
+  --release build/release/home-mate-release.tar \
   --serial /dev/cu.usbmodem8401 --ip 192.168.1.73 \
-  --reference-node lx06 --reference-ip 192.168.1.50 \
   --wake-word 你好小智 --dry-run
 
-# 2. 预检无误后，去掉 --dry-run 正式执行安装、激活、配对与全屋配置克隆：
+# 2. 去掉 --dry-run 正式执行安装、Ed25519 签名激活（8/8 健康自检）与令牌配对：
 ./tools/hm-provision.sh --device-id dot2-living \
   --seed build/bootstrap/home-mate-bootstrap-dot2-living.tar.gz \
-  --release build/release/home-mate-release-2026.11.23-106.tar \
+  --release build/release/home-mate-release.tar \
   --serial /dev/cu.usbmodem8401 --ip 192.168.1.73 \
-  --reference-node lx06 --reference-ip 192.168.1.50 \
   --wake-word 你好小智
 ```
 
-#### 让 AI 编程助手代你完成 Echo Dot 2 刷机与克隆
-直接复制以下话术发给 **Claude Code、Cursor 或 Codex**（**注意：复制后请把话术里的示例串口和示例 IP 替换为你自己的真实值**）：
+#### 让 AI 编程助手代你刷入与配网 Echo Dot 2
 ```text
-我有一台已经通过 firebreak (amonet) 解锁并刷好 emOS 音频底座的亚马逊 Echo Dot 2：
-【请先将下方示例串口与示例 IP 替换为你自己的真实值】
-- USB 串口设备：/dev/cu.usbmodem8401  <-- 替换为你电脑识别到的实际串口（或让 AI 执行 ls /dev/cu.usbmodem* /dev/ttyACM* 自动查找）
-- 音箱局域网 IP：192.168.1.73         <-- 替换为你这台 Echo Dot 2 通过 em-wifi 连上后的实际局域网 IP
-- （可选）家里已配好的参考音箱 IP：192.168.1.50 <-- 如需克隆已有节点配置，请替换为参考节点的实际 IP
+我有一台已通过 firebreak (amonet) 解锁并刷好 emOS 且连上 Wi-Fi 的亚马逊 Echo Dot 2：
+- USB 串口：/dev/cu.usbmodem8401（或自动检测 `ls /dev/cu.usbmodem* /dev/ttyACM*`）
+- 音箱局域网 IP：192.168.1.73
+- （可选）参考节点 IP：192.168.1.50
 
-请帮我在 `home-mate` 仓库下使用 `./tools/hm-provision.sh` 完成这台新节点（节点 ID 设为 `dot2-living`，唤醒词设为 `你好小智`）的应用层部署：
-1. 先加上 `--dry-run` 参数运行一次 `./tools/hm-provision.sh`，向我展示串口 `ID=emos` 核验、`/data/emos/sockets` 状态、wlan0 IP 与将要执行的计划，确认 0 报错后再继续。
-2. 去掉 `--dry-run` 正式执行 `./tools/hm-provision.sh`（若我上面提供了参考节点 IP，请加上 `--reference-node <参考节点ID> --reference-ip <参考节点真实IP>`），自动完成 bootstrap 种子包安装、重启交由 emOS init 守护、Ed25519 签名 release 包激活、7/7 健康自检与全屋配置克隆，并将生成的令牌保存到 `~/.home-mate/dot2-living.token`。
+请在 `yes999zc/home-mate` 下（如需重编网关固件请在 `yes999zc/home-mate-gateway-linux` 使用 `./tools/build_firmware.sh`，切勿直接跑裸 `cargo zigbuild`），先加 `--dry-run` 预检 `./tools/hm-provision.sh`（节点 ID 设为 `dot2-living`，唤醒词 `你好小智`），确认无误后再正式激活、验证 8/8 健康自检，并将令牌保存至 `~/.home-mate/dot2-living.token`（chmod 600）。
 ```
 
 ---
 
-### 方式 C：NAS / Docker 容器化部署（支持局域网网关接入 & 128 MB 音箱分离部署）
+### 轨道 C：NAS / 服务器全量 Docker 部署（128 MB LX06 与全屋安卓终端中枢）
 
-现已原生支持 **Docker 一键部署**（多架构镜像 `linux/amd64` + `linux/arm64`，适用于群晖、飞牛 fnOS、绿联、Unraid、树莓派及 Linux/macOS 主机）。
+支持群晖、飞牛 fnOS、绿联、Unraid、树莓派与 Linux/macOS 服务器（`linux/amd64` + `linux/arm64` 多架构镜像），**务必部署标准全量版 `hm-core`**（内置 Silero VAD，切勿使用 LX06 专用 `--slim`）：
 
-通过显式环境变量 **`HM_GATEWAY_ALLOW_LAN=1`**，容器内的 `hm-core` 可在 `:8932` 接收局域网远程语音网关（如 **128 MB 内存版 LX06 薄网关**、通用 Android / Linux 客户端等）通过 Northbound Protocol v2 接入；音箱本体独立运行模式默认仍保持严格的 `127.0.0.1` 回环限制。
-
-#### 一行命令启动（拉取预编译多架构镜像）
 ```bash
 docker run -d \
   --name home-mate-core \
   --restart unless-stopped \
   -p 8930:8930 \
   -p 8932:8932 \
+  -p 8933:8933/udp \
   -e TZ=Asia/Shanghai \
   -e HM_GATEWAY_ALLOW_LAN=1 \
   -v "$(pwd)/data:/data" \
   ghcr.io/yes999zc/home-mate:latest
 ```
+*（或直接用仓内 `docker-compose.yml` 执行 `docker compose up -d`；首次启动后请立即访问 `http://<NAS_IP>:8930` 配对家庭管理员令牌，避免局域网无鉴权暴露。）*
 
-#### 或使用 Docker Compose 启动
-```bash
-# 直接使用仓库内置 docker-compose.yml（自动拉取 ghcr.io 预编译镜像；如需本地源码构建请加 --build）
-docker compose up -d
+#### 让 AI 编程助手一键部署 NAS 全量 Core 与家庭主脑
+```text
+请帮我在局域网 NAS/服务器（192.168.1.10）上部署 https://github.com/yes999zc/home-mate 的标准全量版 Docker `hm-core`：
+1. 使用标准全量镜像（切勿使用 `--slim`），开启 `HM_GATEWAY_ALLOW_LAN=1`，持久化挂载 `./data:/data`，并开放 8930/tcp（Web 控制台）、8932/tcp（北向 v2 多网关接入）与 8933/udp（局域网一键发现）。
+2. 验证 `http://192.168.1.10:8930/` 返回 200 且 `/api/v0/status` 健康。
+3. 立即调用 `/api/v0/auth/provision` 生成家庭管理员令牌并保存到本机 `~/.home-mate/nas.token`（chmod 600），再引导我配置 LLM/ASR/TTS、可选家庭主脑（`master_brain`）及是否启用局域网可信设备免密豁免（`lan_gateway_exempt`）。
 ```
 
-- **Web 控制台**：启动后访问 `http://<NAS_IP>:8930`（首次登录按页面引导签发家庭访问令牌）。
-- **离线镜像包（国内 NAS 友好）**：若 NAS 访问 GHCR 较慢，可直接从 [GitHub Releases (`v0.2.1`)](https://github.com/yes999zc/home-mate/releases/tag/v0.2.1) 下载 `hm-core-docker-linux-amd64.tar.gz` 或 `hm-core-docker-linux-arm64.tar.gz`，执行 `docker load -i <压缩包>` 导入后运行上述命令即可。
+---
+
+### 轨道 D：Android 通用终端（带屏音箱 / 86 墙面屏 / 平板 / 废旧安卓手机）
+
+零刷机、3 分钟把安卓带屏音箱、4 寸 86 墙面控制面板、平板、主力机或吃灰的废旧安卓手机变成 **Home Mate 远场语音终端 + 全屋中控**：
+
+1. **按机型挑选 APK**（前往 **[yes999zc/home-mate-gateway-android](https://github.com/yes999zc/home-mate-gateway-android/releases)** 下载）：
+   - **`full-arm64`（~13 MB）**：**现代 64 位手机/平板首选**，含完整离线语音唤醒（Sherpa-ONNX JNI）。
+   - **`universal`（~21 MB）**：同时内置 **64 位 + 32 位** 离线唤醒库，**32 位 86 墙面屏 / 老旧平板 / 不确定架构时直接选它**。
+   - **`slim`（~225 KB）**：超轻量纯控端，不含本地离线唤醒库（适合纯全屋遥控、文字对话与点击语音）。
+2. **连接 Core**：打开 APP 点击 **「扫描局域网」**（UDP `:8933` 自动发现）或手动输入 `<Core_IP>:8930` 与家庭令牌，即可语音互动并控制全屋房间。
+3. **自动更新**：默认直连 **GitHub Releases** 按 CPU 架构自动匹配对应安装包（同时支持自定义局域网 `version.json` 更新源）。
+
+#### 让 AI 编程助手协助配置或本地编译 Android 端
+```text
+请帮我把 Home Mate Android 通用端（https://github.com/yes999zc/home-mate-gateway-android）接入到我局域网 192.168.1.10 的 Home Mate Core：
+1. 检查 `http://192.168.1.10:8930/api/v0/auth`、确认 Core 已开启 `HM_GATEWAY_ALLOW_LAN=1` 监听 `:8932` 且开放 UDP `:8933` 发现广播。
+2. 按我的设备形态推荐对应 APK（64 位手机选 `full-arm64`，32 位 86 墙面屏/老平板选 `universal`，仅遥控选 `slim`）。
+3. 若需要从源码本地编译，请执行 `./tools/test_jvm.sh` 与 `./tools/build_apk.sh`（对外发布时请务必配置独立正式签名 Keystore 环境变量，不要使用调试口令证书）。
+```
 
 ---
 
 ## 致谢
 
-这个项目站在很多优秀开源作者与硬件社区的工作之上。按它们**在这套系统里的实际位置**分两类；完整许可证与分发声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+感谢所有让 Home Mate 成为可能的开源项目与硬件社区（完整许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)）：
 
-**跑在音箱链路或解锁前置里的**
-- [idootop/open-xiaoai](https://github.com/idootop/open-xiaoai) 与 [@coderzc/open-xiaoai](https://github.com/coderzc/open-xiaoai)（MIT）—— 小米小爱音箱 Pro（`LX06`）的 SSH 开启前置方案与早期设备端协议探索基石。
-- [k2-fsa/sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)（Apache-2.0）与 [Microsoft ONNX Runtime](https://github.com/microsoft/onnxruntime)（MIT）—— 音箱本地 `hm-kws` 进程的 C-ABI 语音推理运行时与 3.3M int8 Zipformer 自定义关键词检测模型。
-- [snakers4/silero-vad](https://github.com/snakers4/silero-vad)（MIT）—— Silero VAD v4 神经网络语音端点检测模型（`silero_vad.onnx`）。
-- [xiph/speexdsp](https://github.com/xiph/speexdsp)（BSD-3-Clause）—— 回声消除（AEC）DSP 原语。
-- [pdeljanov/Symphonia](https://github.com/pdeljanov/Symphonia)（MPL-2.0）—— 纯 Rust 流式音频解码库（MP3 / FLAC / AAC / M4A / WAV / PCM）。
-- [Tokio](https://github.com/tokio-rs/tokio)、[Axum](https://github.com/tokio-rs/axum)、[Rusqlite](https://github.com/rusqlite/rusqlite)、[RustCrypto](https://github.com/RustCrypto)（`chacha20poly1305`、`ed25519-dalek`）、[Vue 3](https://github.com/vuejs/core) 与 [Lucide](https://github.com/lucide-icons/lucide)。
-
-**架构渊源与设计上参考的公开做法**
-- [yes999zc/rui（小瑞）](https://github.com/yes999zc/rui) —— Home Mate 的第一代前身项目。Home Mate 延续了小瑞的家庭多房间语音心智，并用纯 Rust 将整套系统浓缩进音箱本体运行。
-- [wilbowes/EchoMuse](https://github.com/wilbowes/EchoMuse) —— 设备管理控制台的状态机、「可解释向导」思路以及 Echo Dot 2 2 寸喇叭的声学补偿参考（未复制代码）。
-- [Rhasspy](https://github.com/rhasspy/rhasspy) 的分域式职责拆分与 [rhasspy/wyoming](https://github.com/rhasspy/wyoming) 的音频协议层抽象。
-- [Home Assistant](https://github.com/home-assistant/core) 的 Assist 暴露列表 WebSocket 机制，以及 [Navidrome](https://github.com/navidrome/navidrome) / OpenSubsonic 本地音乐库接口。
+- **音箱与网关管线**：[idootop/open-xiaoai](https://github.com/idootop/open-xiaoai) & [@coderzc/open-xiaoai](https://github.com/coderzc/open-xiaoai)（MIT）、[k2-fsa/sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)（Apache-2.0）、[Microsoft ONNX Runtime](https://github.com/microsoft/onnxruntime)（MIT）、[snakers4/silero-vad](https://github.com/snakers4/silero-vad)（MIT）、[xiph/speexdsp](https://github.com/xiph/speexdsp)（BSD-3-Clause）、[pdeljanov/Symphonia](https://github.com/pdeljanov/Symphonia)（MPL-2.0）、Tokio、Axum、Rusqlite、RustCrypto、Vue 3 与 Lucide。
+- **社区贡献致谢**：特别感谢 **[@jiantongzh](https://github.com/jiantongzh)** 实机验证 128 MB 批次 LX06 并贡献瘦网关方案思路。
+- **架构渊源与参考**：[yes999zc/rui（小瑞）](https://github.com/yes999zc/rui)、[wilbowes/EchoMuse](https://github.com/wilbowes/EchoMuse)、[Rhasspy](https://github.com/rhasspy/rhasspy) / [Wyoming](https://github.com/rhasspy/wyoming)、[Home Assistant](https://github.com/home-assistant/core) 与 [Navidrome](https://github.com/navidrome/navidrome)。
 
 ---
 

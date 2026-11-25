@@ -37,6 +37,7 @@ interface Draft {
 }
 
 const draft = ref<Draft | null>(null)
+const touched = ref(false)
 const probe = ref<SearchProbe | null>(null)
 const probing = ref(false)
 const probeError = ref('')
@@ -56,7 +57,7 @@ function fromStatus(status: SearchStatus): Draft {
 watch(
   () => search.data.value,
   (status) => {
-    if (status && draft.value === null) draft.value = fromStatus(status)
+    if (status && (draft.value === null || !touched.value)) draft.value = fromStatus(status)
   },
   { immediate: true },
 )
@@ -103,6 +104,7 @@ async function save(): Promise<void> {
     // Adopt the server's normalized block; the key box is always cleared so a
     // stale value can never be re-submitted by accident.
     draft.value = fromStatus(status)
+    touched.value = false
     await search.load()
   })
 }
@@ -115,6 +117,7 @@ async function clearKey(): Promise<void> {
       { timeoutMs: 10000 },
     )
     draft.value = fromStatus(status)
+    touched.value = false
     await search.load()
   })
 }
@@ -134,7 +137,10 @@ async function runProbe(): Promise<void> {
 
 function reload(): void {
   void search.load().then(() => {
-    if (search.data.value) draft.value = fromStatus(search.data.value)
+    if (search.data.value) {
+      draft.value = fromStatus(search.data.value)
+      touched.value = false
+    }
   })
   probe.value = null
   probeError.value = ''
@@ -159,12 +165,13 @@ function reload(): void {
     <ErrorNotice v-if="search.error.value" :error="search.error.value" compact @retry="search.load()" />
 
     <template v-if="draft">
-      <Toggle v-model="draft.enabled" :label="t('searchEnabled')" />
+      <Toggle v-model="draft.enabled" :label="t('searchEnabled')" @update:model-value="touched = true" />
 
       <TextInput
         v-model="draft.baseUrl"
         :label="t('searchBaseUrl')"
         placeholder="https://api.deepseek.com/v1/tools/search"
+        @update:model-value="touched = true"
       />
 
       <PasswordField
@@ -172,6 +179,7 @@ function reload(): void {
         :label="t('searchApiKey')"
         :is-set="search.data.value?.api_key_set ?? false"
         :placeholder="t('searchApiKeyPlaceholder')"
+        @update:model-value="touched = true"
       />
 
       <div class="search__grid">
@@ -181,8 +189,15 @@ function reload(): void {
           :min="1"
           :max="50"
           :hint="t('searchCountHint', { max: maxResults })"
+          @update:model-value="touched = true"
         />
-        <NumberField v-model="draft.timeoutMs" :label="t('searchTimeout')" :min="500" :max="15000" />
+        <NumberField
+          v-model="draft.timeoutMs"
+          :label="t('searchTimeout')"
+          :min="500"
+          :max="15000"
+          @update:model-value="touched = true"
+        />
       </div>
 
       <div class="search__actions">

@@ -5,9 +5,9 @@
  * plus a built-in one-sentence verification action and Wi-Fi provisioning banner.
  * ASR, TTS, Tools, and Home Assistant stay in ServicePage / ToolPage.
  */
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
-import { getAuthStatus, getStatus, postChat, provisionAuth } from '../api'
+import { getAuthStatus, getStatus, isAbort, postChat, provisionAuth, resolveWifiProvisioningForDevice } from '../api'
 import { authToken, setAuthToken } from '../auth'
 import { t } from '../i18n'
 import { useResource } from '../hooks/useResource'
@@ -17,7 +17,7 @@ import {
   loading as storeLoading,
   refresh as refreshDevices,
   selected,
-  wifiProvisioning,
+  wifiProvisioningByDevice,
 } from '../stores/devices'
 import AppIcon from '../components/AppIcon.vue'
 import Panel from '../components/Panel.vue'
@@ -41,7 +41,11 @@ function readPersistedVerified(): boolean | undefined {
 }
 
 const auth = useResource((signal) => getAuthStatus({ signal }), { timeoutMs: 5000, retries: 1 })
-const status = useResource((signal) => getStatus({ signal }), { timeoutMs: 6000, retries: 1 })
+const wifiId = ref<string | null>(null)
+const status = useResource(
+  (signal) => getStatus({ signal, device: wifiId.value || selected.value?.device || undefined }),
+  { timeoutMs: 6000, retries: 1 },
+)
 const provisioning = ref(false)
 const authError = ref('')
 
@@ -72,20 +76,51 @@ async function provision(): Promise<void> {
   }
 }
 
-const wifiId = ref<string | null>(null)
+const wifiDeviceIds = computed<string[]>(() => {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const d of modeDevices.value) {
+    if (d.device && !seen.has(d.device)) {
+      seen.add(d.device)
+      out.push(d.device)
+    }
+  }
+  for (const d of gatewayDevices.value) {
+    if (d.stable_id && !seen.has(d.stable_id)) {
+      seen.add(d.stable_id)
+      out.push(d.stable_id)
+    }
+  }
+  return out
+})
+
 watch(
-  [modeDevices, selected],
-  () => {
-    if (!wifiId.value || !modeDevices.value.some((device) => device.device === wifiId.value)) {
-      wifiId.value = selected.value?.device ?? modeDevices.value[0]?.device ?? null
+  [wifiDeviceIds, selected],
+  ([ids, sel], [, prevSel]) => {
+    const selectedChanged = prevSel !== undefined && sel?.device !== prevSel?.device
+    if (selectedChanged && sel?.device) {
+      wifiId.value = sel.device
+      return
+    }
+    if (!wifiId.value || (ids.length > 0 && !ids.includes(wifiId.value))) {
+      wifiId.value = sel?.device ?? (ids.length === 1 ? ids[0] : null)
     }
   },
   { immediate: true },
 )
 
-const wifiGateway = computed(
-  () => gatewayDevices.value.find((device) => device.stable_id === wifiId.value) ?? gatewayDevices.value[0] ?? null,
-)
+watch(wifiId, (id, prev) => {
+  if (prev !== undefined && id !== prev) {
+    void status.load()
+  }
+})
+
+const wifiGateway = computed(() => {
+  if (wifiId.value) {
+    return gatewayDevices.value.find((device) => device.stable_id === wifiId.value) ?? null
+  }
+  return gatewayDevices.value.length === 1 ? gatewayDevices.value[0] : null
+})
 const online = computed(() => wifiGateway.value?.online ?? false)
 const ssid = computed(() => wifiGateway.value?.wifi_ssid ?? null)
 
@@ -94,12 +129,15 @@ const asr = computed(() => status.data.value?.services.asr ?? null)
 const tts = computed(() => status.data.value?.services.tts ?? null)
 const voiceReady = computed(() => !!asr.value?.configured && !!tts.value?.configured)
 
-const wifiNotice = computed(
-  () =>
-    (status.data.value?.wifi_provisioning?.requested
-      ? status.data.value.wifi_provisioning
-      : null) ?? (wifiProvisioning.value.requested ? wifiProvisioning.value : null),
-)
+const wifiNotice = computed(() => {
+  const resolved = resolveWifiProvisioningForDevice(
+    wifiId.value ?? selected.value?.device,
+    status.data.value,
+    wifiProvisioningByDevice.value,
+    wifiDeviceIds.value.length,
+  )
+  return resolved.requested ? resolved : null
+})
 
 const wifiSummary = computed(() => {
   if (!wifiGateway.value) return t('setupDeviceMissing')
@@ -150,39 +188,58 @@ const verifyPrompt = ref('')
 const verifyBusy = ref(false)
 const verifyReply = ref('')
 const verifyError = ref('')
+let verifyController: AbortController | null = null
 
 async function runQuickVerify(): Promise<void> {
   const prompt = (verifyPrompt.value.trim() || t('setupVerifyDefaultPrompt')).trim()
+  verifyController?.abort()
+  const controller = new AbortController()
+  verifyController = controller
   verifyBusy.value = true
   verifyReply.value = ''
   verifyError.value = ''
+  let sawError = false
   try {
     await postChat(
       'setup-verify',
       prompt,
       (ev) => {
-        if (ev.type === 'text_delta' && typeof ev.delta === 'string') {
-          verifyReply.value += ev.delta
-        } else if (ev.type === 'turn_done' && typeof ev.text === 'string' && !verifyReply.value) {
+        if ((ev.type === 'token' || ev.type === 'fact') && typeof ev.text === 'string') {
+          verifyReply.value += ev.text
+        } else if (ev.type === 'answer' && typeof ev.text === 'string' && !verifyReply.value) {
           verifyReply.value = ev.text
-        } else if (ev.type === 'error' && typeof ev.error === 'string') {
-          verifyError.value = ev.error
+        } else if (ev.type === 'error' && typeof ev.message === 'string') {
+          sawError = true
+          verifyError.value = ev.message
+        } else if (ev.type === 'turn_end' && ev.status === 'failed' && !verifyError.value) {
+          sawError = true
+          verifyError.value = t('setupVerifyFailed')
         }
       },
-      { timeoutMs: 45000 },
+      { timeoutMs: 45000, signal: controller.signal },
     )
-    if (verifyReply.value && !verifyError.value) {
+    if (verifyReply.value.trim() && !sawError && !verifyError.value) {
       markVerified('llm', true)
     }
   } catch (err) {
-    verifyError.value = err instanceof Error ? err.message : String(err)
+    if (!controller.signal.aborted && !isAbort(err)) {
+      verifyError.value = err instanceof Error ? err.message : String(err)
+    }
   } finally {
-    verifyBusy.value = false
+    if (verifyController === controller) {
+      verifyController = null
+      verifyBusy.value = false
+    }
   }
 }
 
+onBeforeUnmount(() => {
+  verifyController?.abort()
+  verifyController = null
+})
+
 const loading = computed(
-  () => !status.data.value && !modeDevices.value.length && (status.loading.value || storeLoading.value),
+  () => !status.data.value && (status.loading.value || storeLoading.value),
 )
 const firstError = computed(() => status.error.value)
 </script>
@@ -236,11 +293,11 @@ const firstError = computed(() => status.error.value)
       </WizardStepCard>
 
       <WizardStepCard :index="2" :title="t('wifiTitle')" :done="online" :summary="wifiSummary">
-        <label v-if="modeDevices.length > 1" class="page__select">
+        <label v-if="wifiDeviceIds.length > 1" class="page__select">
           <span>{{ t('statusSelectedDevice') }}</span>
           <select v-model="wifiId">
-            <option v-for="device in modeDevices" :key="device.device" :value="device.device">
-              {{ device.device }}
+            <option v-for="id in wifiDeviceIds" :key="id" :value="id">
+              {{ id }}
             </option>
           </select>
         </label>

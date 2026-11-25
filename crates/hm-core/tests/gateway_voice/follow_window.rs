@@ -417,8 +417,12 @@ async fn the_kws_chain_records_sent_installed_and_loaded_hashes() {
     // act on locally, and versions the word→intent map it was given.
     assert_eq!(
         retreat_words,
-        vec!["停止播放".to_string()],
-        "the default table's only retreat intent must travel with the deploy"
+        vec![
+            "停止播放".to_string(),
+            "退下".to_string(),
+            "退下吧".to_string()
+        ],
+        "the default table's retreat intents must travel with the deploy"
     );
     assert!(!intents_hash.is_empty(), "the intent map needs a version");
     assert_eq!(sent["intents_hash"], json!(intents_hash));
@@ -429,8 +433,8 @@ async fn the_kws_chain_records_sent_installed_and_loaded_hashes() {
         accepted: true,
         hash: sent_hash.clone(),
         keywords: keywords.lines().count() as u64,
-        detail: "installed; 1 local exit word".into(),
-        local_exit: 1,
+        detail: "installed; 3 local exit words".into(),
+        local_exit: 3,
         threshold: 0.25,
         score: 3.0,
         intents_hash: intents_hash.clone(),
@@ -444,8 +448,8 @@ async fn the_kws_chain_records_sent_installed_and_loaded_hashes() {
     assert!(d["loaded_hash"].is_null(), "installed is not loaded: {d}");
     assert_eq!(d["state"], json!("accepted"));
     // #5: installed vocabulary AND installed meaning are two facts.
-    assert_eq!(d["retreat_words_sent"], json!(1));
-    assert_eq!(d["local_exit"], json!(1));
+    assert_eq!(d["retreat_words_sent"], json!(3));
+    assert_eq!(d["local_exit"], json!(3));
     assert_eq!(d["local_exit_matches"], json!(true));
     assert_eq!(d["intents_hash_matches"], json!(true));
     assert_eq!(d["local_exits"], json!(0));
@@ -528,7 +532,7 @@ async fn the_kws_chain_records_sent_installed_and_loaded_hashes() {
         epoch: 7,
         loaded_hash: sent_hash.clone(),
         loaded_ms: hm_core::id::now_ms(),
-        local_exit: 1,
+        local_exit: 3,
         threshold: 0.25,
         score: 3.0,
     })
@@ -543,7 +547,7 @@ async fn the_kws_chain_records_sent_installed_and_loaded_hashes() {
     // restart — `/mode.kws.local_exit`, not the in-memory deploy record.
     assert_eq!(
         snap["devices"][0]["kws"]["local_exit"],
-        json!(1),
+        json!(3),
         "the armed local exit must be visible as a device fact"
     );
 
@@ -1382,7 +1386,7 @@ async fn a_retreat_keyword_closes_an_idle_device_and_says_so() {
 async fn follow_window_config_roundtrips_history_restore_and_import() {
     let (base, state, gw) = spawn_app_with_gateway(FakeLlm::new(vec![])).await;
     let client = reqwest::Client::new();
-    let mode_url = format!("{base}/api/v0/mode/dot2-d");
+    let mode_url = format!("{base}/api/v0/mode");
     let before = state.voice.settings_snapshot();
     assert!(before.follow_window_enabled);
     assert_eq!(before.follow_window_ms, 9_000);

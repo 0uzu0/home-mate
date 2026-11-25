@@ -51,8 +51,12 @@ function transportState(device: GatewayDevice): string {
   if (!report || report.state === 'absent') return t('northboundAbsent')
   if (report.state === 'unsupported' || (report.schema != null && report.schema !== 1)) return t('northboundUnsupported')
   if (!transportSample(device)) return t('northboundInvalid')
+  const conns = props.data?.gateway.connections
+  const genLive = conns?.length
+    ? conns.some((c) => c.generation === device.generation && c.devices.includes(device.stable_id))
+    : device.generation === props.data?.gateway.generation
   return props.error || report.stale || !props.data?.gateway.connected || !device.online
-      || report.connection_generation !== device.generation || device.generation !== props.data.gateway.generation
+      || report.connection_generation !== device.generation || !genLive
     ? t('northboundStale') : t('northboundReported')
 }
 </script>

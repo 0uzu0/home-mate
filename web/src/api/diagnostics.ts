@@ -28,10 +28,13 @@ export interface SelfCheckResult {
   stages: SelfCheckStage[]
 }
 
-export const runSelfCheck = (deep: boolean, opts?: RequestOptions) =>
+export const runSelfCheck = (deep: boolean, device?: string, opts?: RequestOptions) =>
   request<SelfCheckResult>(
     '/api/v0/diagnostics/self_check',
-    { method: 'POST', body: JSON.stringify({ deep }) },
+    {
+      method: 'POST',
+      body: JSON.stringify({ deep, ...(device ? { device } : {}) }),
+    },
     { timeoutMs: deep ? 90000 : 15000, ...opts },
   )
 
@@ -384,13 +387,6 @@ export interface SessionMessage {
   ts_ms: number
 }
 
-export const getSessionMessages = (id: string, opts?: RequestOptions) =>
-  request<{ messages: SessionMessage[]; session_id: string }>(
-    `/api/v0/session/${encodeURIComponent(id)}/messages`,
-    {},
-    { timeoutMs: 6000, ...opts },
-  )
-
 export const getDeviceConversation = (device: string, opts?: RequestOptions, contextSessionId = '', page: { archiveBefore?: number; messageBefore?: number } = {}) => {
   const query = new URLSearchParams()
   if (contextSessionId) query.set('context_session_id', contextSessionId)
@@ -401,19 +397,27 @@ export const getDeviceConversation = (device: string, opts?: RequestOptions, con
   )
 }
 
-export const clearDeviceConversation = (device: string, expectedSessionId: string, opts?: RequestOptions) =>
-  request<{ session_id: string; cleared: number }>(
+export const clearDeviceConversation = (
+  device: string,
+  expectedSessionId: string,
+  includeArchivedOrOpts?: boolean | RequestOptions,
+  opts?: RequestOptions,
+) => {
+  const includeArchived = typeof includeArchivedOrOpts === 'boolean' ? includeArchivedOrOpts : false
+  const reqOpts = typeof includeArchivedOrOpts === 'boolean' ? opts : includeArchivedOrOpts
+  return request<{ session_id: string; cleared: number; include_archived?: boolean }>(
     `/api/v0/devices/${encodeURIComponent(device)}/conversation`,
-    { method: 'DELETE', body: JSON.stringify({ expected_session_id: expectedSessionId }) },
-    { timeoutMs: 6000, ...opts },
+    {
+      method: 'DELETE',
+      body: JSON.stringify(
+        includeArchived
+          ? { expected_session_id: expectedSessionId, include_archived: true }
+          : { expected_session_id: expectedSessionId },
+      ),
+    },
+    { timeoutMs: 6000, ...reqOpts },
   )
-
-export const clearSession = (id: string, opts?: RequestOptions) =>
-  request<{ session_id: string; cleared: number }>(
-    `/api/v0/session/${encodeURIComponent(id)}/clear`,
-    { method: 'POST' },
-    { timeoutMs: 6000, ...opts },
-  )
+}
 
 // ── Config history / backup ─────────────────────────────────────────────
 
@@ -456,7 +460,7 @@ export const importConfig = (doc: unknown, opts?: RequestOptions) =>
   request<ConfigImportResult>(
     '/api/v0/config/import',
     { method: 'POST', body: JSON.stringify(doc) },
-    { timeoutMs: 20000, ...opts },
+    { timeoutMs: 35000, ...opts },
   )
 
 // ── Fleet: peers and configuration push (M12a-1, v0.26) ─────────────────
@@ -577,6 +581,7 @@ export const getDiagnostics = (opts?: RequestOptions) =>
 
 export interface VoicePlayTestResult {
   ok: boolean
+  code?: string
   device?: string
   stage?: string
   synth_ms?: number
@@ -588,15 +593,19 @@ export interface VoicePlayTestResult {
   error?: string
 }
 
-export const runVoicePlayTest = (opts?: RequestOptions) =>
+export const runVoicePlayTest = (device?: string, opts?: RequestOptions) =>
   request<VoicePlayTestResult>(
     '/api/v0/diagnostics/tests/voice_play',
-    { method: 'POST' },
+    {
+      method: 'POST',
+      ...(device ? { body: JSON.stringify({ device }) } : {}),
+    },
     { timeoutMs: 45000, ...opts },
   )
 
 export interface PlayAssetResult {
   ok: boolean
+  code?: string
   device?: string
   asset?: string
   stage?: string
@@ -607,12 +616,21 @@ export interface PlayAssetResult {
   error?: string
 }
 
-export const runPlayAssetTest = (asset: string, volume?: number, opts?: RequestOptions) =>
+export const runPlayAssetTest = (
+  asset: string,
+  volume?: number,
+  device?: string,
+  opts?: RequestOptions,
+) =>
   request<PlayAssetResult>(
     '/api/v0/diagnostics/tests/play_asset',
     {
       method: 'POST',
-      body: JSON.stringify({ asset, ...(volume !== undefined ? { volume } : {}) }),
+      body: JSON.stringify({
+        asset,
+        ...(volume !== undefined ? { volume } : {}),
+        ...(device ? { device } : {}),
+      }),
     },
     { timeoutMs: 60000, ...opts },
   )
@@ -631,15 +649,48 @@ export interface LoopbackReport {
 
 export interface LoopbackResult {
   ok: boolean
+  code?: string
   error?: string
   play?: PlayAssetResult
   loopback?: LoopbackReport
 }
 
-export const runPlaybackLoopbackTest = (asset?: string, opts?: RequestOptions) =>
+export const runPlaybackLoopbackTest = (asset?: string, device?: string, opts?: RequestOptions) =>
   request<LoopbackResult>(
     '/api/v0/diagnostics/tests/playback_loopback',
-    { method: 'POST', body: JSON.stringify(asset ? { asset } : {}) },
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        ...(asset ? { asset } : {}),
+        ...(device ? { device } : {}),
+      }),
+    },
+    { timeoutMs: 60000, ...opts },
+  )
+
+export interface MicArrayResult {
+  ok: boolean
+  code?: string
+  error?: string
+  play?: PlayAssetResult
+  mics?: {
+    frames: number
+    active_ms: number
+    channels?: unknown[]
+    [k: string]: unknown
+  }
+}
+
+export const runMicArrayTest = (asset?: string, device?: string, opts?: RequestOptions) =>
+  request<MicArrayResult>(
+    '/api/v0/diagnostics/tests/mics',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        ...(asset ? { asset } : {}),
+        ...(device ? { device } : {}),
+      }),
+    },
     { timeoutMs: 60000, ...opts },
   )
 
@@ -710,9 +761,31 @@ export async function postChat(
   opts: ChatOptions = {},
 ): Promise<void> {
   const controller = new AbortController()
-  const timer = window.setTimeout(() => controller.abort(), opts.timeoutMs ?? 120000)
+  const timeoutMs = opts.timeoutMs ?? 120000
+  let timedOut = false
+  const timer = window.setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, timeoutMs)
   const onOuterAbort = (): void => controller.abort()
-  opts.signal?.addEventListener('abort', onOuterAbort, { once: true })
+  if (opts.signal) {
+    if (opts.signal.aborted) {
+      window.clearTimeout(timer)
+      throw new ApiError('aborted', 'chat aborted')
+    }
+    opts.signal.addEventListener('abort', onOuterAbort, { once: true })
+  }
+  const emitLine = (raw: string): void => {
+    const line = raw.trim()
+    if (!line.startsWith('data:')) return
+    const payload = line.slice(5).trim()
+    if (!payload) return
+    try {
+      onEvent(JSON.parse(payload) as ChatEvent)
+    } catch {
+      /* keep-alive or partial chunk */
+    }
+  }
   try {
     const resp = await fetch('/api/v0/chat', {
       method: 'POST',
@@ -720,8 +793,11 @@ export async function postChat(
         'Content-Type': 'application/json',
         ...(authToken.value ? { Authorization: `Bearer ${authToken.value}` } : {}),
       },
-      body: JSON.stringify({ session_id: sessionId ?? undefined, text,
-        ...(opts.scopeBindingId ? { scope_binding_id: opts.scopeBindingId } : {}) }),
+      body: JSON.stringify({
+        session_id: sessionId ?? undefined,
+        text,
+        ...(opts.scopeBindingId ? { scope_binding_id: opts.scopeBindingId } : {}),
+      }),
       signal: controller.signal,
     })
     if (!resp.ok || !resp.body) {
@@ -741,19 +817,15 @@ export async function postChat(
       buf += decoder.decode(value, { stream: true })
       let nl: number
       while ((nl = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, nl).trim()
+        emitLine(buf.slice(0, nl))
         buf = buf.slice(nl + 1)
-        if (!line.startsWith('data:')) continue
-        const payload = line.slice(5).trim()
-        try {
-          onEvent(JSON.parse(payload) as ChatEvent)
-        } catch {
-          /* keep-alive or partial chunk */
-        }
       }
     }
+    buf += decoder.decode()
+    if (buf.trim()) emitLine(buf)
   } catch (err) {
     if (err instanceof ApiError) throw err
+    if (timedOut) throw new ApiError('timeout', `timeout after ${timeoutMs}ms`)
     if (controller.signal.aborted) throw new ApiError('aborted', 'chat aborted')
     throw new ApiError('network', err instanceof Error ? err.message : String(err))
   } finally {

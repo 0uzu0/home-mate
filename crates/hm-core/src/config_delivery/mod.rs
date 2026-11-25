@@ -20,8 +20,9 @@ mod weather;
 mod worker;
 
 pub(crate) use gateway_dispatch::{
-    dispatch_audio_eq_v2, dispatch_duplex_v2, dispatch_reflex_v2, dispatch_unit_acoustics,
-    dispatch_unit_acoustics_parts,
+    dispatch_audio_eq_v2, dispatch_duplex_v2, dispatch_led_v2, dispatch_reflex_v2,
+    dispatch_reflex_v2_reconcile, dispatch_unit_acoustics, dispatch_unit_acoustics_parts,
+    resolve_reflex_config_for_device,
 };
 pub(crate) use home::HomeSnapshot;
 pub use model::*;
@@ -33,6 +34,8 @@ pub(crate) use weather::WeatherSnapshot;
 pub use worker::ConfigApplyCoordinator;
 pub use worker::ConfigApplyCoordinator as ConfigWorker;
 
+#[cfg(test)]
+mod gateway_dispatch_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

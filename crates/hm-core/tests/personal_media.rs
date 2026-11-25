@@ -208,8 +208,11 @@ async fn story_play_registers_in_music_runtime_emits_notices_and_arms_two_second
     let base = format!("http://{api_addr}");
     let client = reqwest::Client::new();
 
-    // Mock 4.5s story stream so playback stays active > 1.2s while PLAY_AHEAD_SECS = 3.0.
-    let nas_app = Router::new().route("/v1/stream/cat:long:1", get(|| async { wav_bytes_secs(5) }));
+    // Mock 22s story stream so playback stays active ~2s while loopback PLAY_AHEAD_SECS = 20.0.
+    let nas_app = Router::new().route(
+        "/v1/stream/cat:long:1",
+        get(|| async { wav_bytes_secs(22) }),
+    );
     let nas_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let nas_addr = nas_listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(nas_listener, nas_app).await.unwrap() });
@@ -288,7 +291,7 @@ async fn story_play_registers_in_music_runtime_emits_notices_and_arms_two_second
     assert_eq!(dev_entry["media_guard"]["play_id"], play_id);
     assert_eq!(dev_entry["media_guard"]["uncertain"], true);
 
-    // Wait for natural stream finish (5s - 3s lookahead = ~2s) -> FakeDevice emits PlayFinished.
+    // Wait for natural stream finish (22s - 20s loopback lookahead = ~2s) -> FakeDevice emits PlayFinished.
     let ended_mode = tokio::time::timeout(std::time::Duration::from_secs(4), async {
         loop {
             let m: Value = client
@@ -465,7 +468,8 @@ async fn story_play_pause_and_resume_bookmark_without_music_configured() {
             let h = hits_clone.clone();
             async move {
                 h.fetch_add(1, Ordering::SeqCst);
-                wav_bytes_secs(8)
+                // > 20s so loopback PLAY_AHEAD_SECS (20s) keeps playback active across pause/resume.
+                wav_bytes_secs(25)
             }
         }),
     );

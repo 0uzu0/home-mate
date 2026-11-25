@@ -36,7 +36,7 @@ pub(in crate::api) async fn config_history_restore(
     let scope = entry["scope"].as_str().unwrap_or_default().to_string();
     let payload = entry["payload"].clone();
     match scope.as_str() {
-        "llm" | "asr" | "tts" => {
+        "llm" | "llm_fallback" | "asr" | "tts" => {
             if payload.get("provider").is_none() {
                 return Err((
                     StatusCode::CONFLICT,
@@ -191,6 +191,22 @@ pub fn build_config_document(state: &AppState, include_secrets: bool) -> Result<
     };
     let reflex = state.config.reflex().unwrap_or_default();
     let audio_eq = state.config.audio_eq().unwrap_or_default();
+    let personal_doc = |key: &str, secret_key: &str| {
+        let cfg = state.config.personal_endpoint(key).unwrap_or_default();
+        let token_set = state
+            .config
+            .personal_token(secret_key)
+            .ok()
+            .flatten()
+            .is_some();
+        json!({
+            "enabled": cfg.enabled,
+            "url": cfg.url,
+            "timeout_ms": cfg.timeout_ms,
+            "bearer_token_set": token_set,
+        })
+    };
+    let agent_md_content = state.agent_md.current_content();
     let mut doc = json!({
         "format": "home-mate-config",
         "version": 1,
@@ -223,6 +239,13 @@ pub fn build_config_document(state: &AppState, include_secrets: bool) -> Result<
             "callback_url": state.master_brain.config().0.callback_url,
             "timeout_ms": state.master_brain.config().0.timeout_ms,
             "bearer_token_set": state.master_brain.config().1.is_some(),
+        },
+        "story": personal_doc(crate::config::STORY_KEY, crate::config::STORY_TOKEN_SECRET),
+        "joke": personal_doc(crate::config::JOKE_KEY, crate::config::JOKE_TOKEN_SECRET),
+        "radio": personal_doc(crate::config::RADIO_KEY, crate::config::RADIO_TOKEN_SECRET),
+        "learning": personal_doc(crate::config::LEARNING_KEY, crate::config::LEARNING_TOKEN_SECRET),
+        "agent_md": {
+            "content": agent_md_content,
         },
         "openapi": {
             "enabled": openapi.enabled,
@@ -343,6 +366,18 @@ pub struct ConfigImportBody {
     /// Bearer token travels in `secrets["master_brain_token"]` only (`?secrets=1` backups).
     #[serde(default)]
     pub master_brain: Option<Value>,
+    /// Personal media & learning endpoints (`story`, `joke`, `radio`, `learning`).
+    #[serde(default)]
+    pub story: Option<Value>,
+    #[serde(default)]
+    pub joke: Option<Value>,
+    #[serde(default)]
+    pub radio: Option<Value>,
+    #[serde(default)]
+    pub learning: Option<Value>,
+    /// Versioned `Agent.md` persona guidance: string or `{ "content": "..." }`.
+    #[serde(default)]
+    pub agent_md: Option<Value>,
     /// OpenAPI adapter (R2-BM6). Import validates the stored catalogue
     /// STRUCTURALLY (GET only, local paths); it never makes an HTTP request.
     #[serde(default)]
@@ -437,7 +472,24 @@ struct ImportRollbackCheckpoint {
     secrets: Vec<(String, String)>,
     config_head: Option<(i64, i64, String, String, String, String)>,
     max_history_id: i64,
+    max_agent_md_id: i64,
     voice_settings: crate::voice::VoiceSettings,
+}
+
+/// Auth & system keys that `apply_config_import` never modifies and must NEVER
+/// snapshot/wipe/resurrect on rollback (e.g. concurrently rotated `api_tokens`
+/// or `auth.lan_gateway_exempt`).
+const CHECKPOINT_EXCLUDED_KV_SQL: &str =
+    "('api_tokens', 'core_id', 'auth.lan_gateway_exempt', 'db.maintenance')";
+
+fn extract_agent_md_content(v: &Value) -> Result<String, String> {
+    if let Some(s) = v.as_str() {
+        Ok(s.to_string())
+    } else if let Some(s) = v.get("content").and_then(Value::as_str) {
+        Ok(s.to_string())
+    } else {
+        Err("agent_md must be a string or an object with a string 'content' field".into())
+    }
 }
 
 fn capture_import_checkpoint(state: &AppState) -> Option<ImportRollbackCheckpoint> {
@@ -446,7 +498,10 @@ fn capture_import_checkpoint(state: &AppState) -> Option<ImportRollbackCheckpoin
     state
         .store
         .with(|c| {
-            let mut kv_stmt = c.prepare("SELECT key, value FROM config_kv")?;
+            let sql = format!(
+                "SELECT key, value FROM config_kv WHERE key NOT IN {CHECKPOINT_EXCLUDED_KV_SQL}"
+            );
+            let mut kv_stmt = c.prepare(&sql)?;
             let config_kv = kv_stmt
                 .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -475,11 +530,17 @@ fn capture_import_checkpoint(state: &AppState) -> Option<ImportRollbackCheckpoin
                 [],
                 |r| r.get(0),
             )?;
+            let max_agent_md_id: i64 = c.query_row(
+                "SELECT COALESCE(MAX(id), 0) FROM agent_md_revisions",
+                [],
+                |r| r.get(0),
+            )?;
             Ok(ImportRollbackCheckpoint {
                 config_kv,
                 secrets,
                 config_head,
                 max_history_id,
+                max_agent_md_id,
                 voice_settings,
             })
         })
@@ -489,7 +550,9 @@ fn capture_import_checkpoint(state: &AppState) -> Option<ImportRollbackCheckpoin
 fn restore_import_checkpoint(state: &AppState, cp: ImportRollbackCheckpoint) {
     let _ = state.store.with(|c| {
         let tx = rusqlite::Transaction::new_unchecked(c, rusqlite::TransactionBehavior::Immediate)?;
-        tx.execute("DELETE FROM config_kv", [])?;
+        let delete_sql =
+            format!("DELETE FROM config_kv WHERE key NOT IN {CHECKPOINT_EXCLUDED_KV_SQL}");
+        tx.execute(&delete_sql, [])?;
         for (k, v) in &cp.config_kv {
             tx.execute(
                 "INSERT INTO config_kv(key, value) VALUES (?1, ?2)",
@@ -510,6 +573,10 @@ fn restore_import_checkpoint(state: &AppState, cp: ImportRollbackCheckpoint) {
             )?;
         }
         tx.execute("DELETE FROM config_history WHERE id > ?1", [cp.max_history_id])?;
+        tx.execute(
+            "DELETE FROM agent_md_revisions WHERE id > ?1",
+            [cp.max_agent_md_id],
+        )?;
         tx.commit()?;
         Ok(())
     });
@@ -615,6 +682,34 @@ fn prevalidate_config_import(
                 .normalized();
         cfg.validate(allow_loopback)
             .map_err(|e| bad_section("master_brain", e))?;
+    }
+    for (name, val_opt) in [
+        (crate::config::STORY_KEY, &body.story),
+        (crate::config::JOKE_KEY, &body.joke),
+        (crate::config::RADIO_KEY, &body.radio),
+        (crate::config::LEARNING_KEY, &body.learning),
+    ] {
+        if let Some(val) = val_opt {
+            let cfg: crate::config::PersonalEndpointConfig =
+                serde_json::from_value::<crate::config::PersonalEndpointConfig>(val.clone())
+                    .map_err(|e| bad_section(name, e))?
+                    .normalized();
+            cfg.validate(name, allow_loopback)
+                .map_err(|e| bad_section(name, e))?;
+        }
+    }
+    if let Some(agent_md) = &body.agent_md {
+        let content = extract_agent_md_content(agent_md).map_err(|e| bad_section("agent_md", e))?;
+        let char_count = content.chars().count();
+        if char_count > crate::agent_md::MAX_AGENT_MD_CHARS {
+            return Err(bad_section(
+                "agent_md",
+                format!(
+                    "Agent.md exceeds maximum length ({char_count} > {} chars)",
+                    crate::agent_md::MAX_AGENT_MD_CHARS
+                ),
+            ));
+        }
     }
     if let Some(openapi) = &body.openapi {
         let mut cfg: crate::config::OpenApiConfig =
@@ -986,6 +1081,57 @@ pub async fn apply_config_import(
             applied.push("master_brain".into());
         }
 
+        for (key, secret_key, val_opt) in [
+            (
+                crate::config::STORY_KEY,
+                crate::config::STORY_TOKEN_SECRET,
+                &body.story,
+            ),
+            (
+                crate::config::JOKE_KEY,
+                crate::config::JOKE_TOKEN_SECRET,
+                &body.joke,
+            ),
+            (
+                crate::config::RADIO_KEY,
+                crate::config::RADIO_TOKEN_SECRET,
+                &body.radio,
+            ),
+            (
+                crate::config::LEARNING_KEY,
+                crate::config::LEARNING_TOKEN_SECRET,
+                &body.learning,
+            ),
+        ] {
+            if let Some(val) = val_opt {
+                let cfg: crate::config::PersonalEndpointConfig = serde_json::from_value(val.clone())
+                    .map_err(|e| bad_section(key, e))?;
+                let tok = secret(secret_key);
+                if tok.is_none() && val["bearer_token_set"].as_bool().unwrap_or(false) {
+                    warnings.push(format!(
+                        "{key}: backup had a stored token but no secret value; the current stored token was kept"
+                    ));
+                }
+                state
+                    .config
+                    .save_personal_endpoint(key, secret_key, cfg, tok.as_deref(), actor)
+                    .map_err(|e| bad_section(key, e))?;
+                applied.push(key.into());
+            }
+        }
+
+        if let Some(agent_md) = &body.agent_md {
+            let content =
+                extract_agent_md_content(agent_md).map_err(|e| bad_section("agent_md", e))?;
+            if content != state.agent_md.current_content() {
+                state
+                    .agent_md
+                    .update(&content, actor, "config import")
+                    .map_err(|e| bad_section("agent_md", e))?;
+                applied.push("agent_md".into());
+            }
+        }
+
         if let Some(search) = &body.search {
             let cfg: crate::config::SearchConfig =
                 serde_json::from_value(search.clone()).map_err(|e| {
@@ -1036,6 +1182,7 @@ pub async fn apply_config_import(
             applied.push("openapi".into());
         }
 
+        let mut reflex_changed = false;
         if let Some(reflex) = &body.reflex {
             let incoming: crate::config::ReflexConfig = serde_json::from_value(reflex.clone())
                 .map_err(|e| {
@@ -1078,20 +1225,7 @@ pub async fn apply_config_import(
                     )
                 })?;
                 applied.push("reflex".into());
-                match state.hub.primary_audio_out() {
-                    Some(device) => {
-                        if let Err(e) = state.voice.deploy_reflex_auto(&device.stable_id).await {
-                            warnings.push(format!(
-                                "reflex: saved, but the spotter on {} was not restarted: {e}",
-                                device.stable_id
-                            ));
-                        }
-                    }
-                    None => warnings.push(
-                        "reflex: saved, but no audio device is online to load it (deploys on next start)"
-                            .into(),
-                    ),
-                }
+                reflex_changed = true;
             }
         }
 
@@ -1113,6 +1247,14 @@ pub async fn apply_config_import(
                 })?;
                 applied.push("audio_eq".into());
                 for device in state.hub.audio_out_devices() {
+                    if state.hub.device_online_with_cap(&device, "config_apply_v2")
+                        && !state
+                            .hub
+                            .device_online_with_cap(&device, "config_block_audio_eq")
+                        && !state.hub.device_online_with_cap(&device, "audio_eq")
+                    {
+                        continue;
+                    }
                     if let Err(e) = state.voice.push_audio_eq(&device) {
                         warnings.push(format!("audio_eq: {device}: {e}"));
                     }
@@ -1120,16 +1262,40 @@ pub async fn apply_config_import(
             }
         }
 
-        if body.mode.is_some() {
-            state.voice.spawn_ack_synthesis();
-        }
-
+        // Complete all fallible SQLite mutations (including `open_sockets`)
+        // BEFORE yielding across any async gateway deploy `.await`, so rollback
+        // on validation/publish error never crosses an async boundary.
         if let Some((source, desired)) = open_sockets_restore {
             crate::config_delivery::ConfigDelivery::import_open_sockets(state, desired, &source, actor)
                 .map_err(open_sockets_error)?;
             applied.push("open_sockets".into());
         } else if body.open_sockets.is_some() {
             warnings.push("open_sockets: node-local settings were kept".into());
+        }
+
+        if reflex_changed {
+            let mut targets = state.hub.devices_with_cap("audio_in");
+            if targets.is_empty() {
+                targets = state.hub.audio_out_devices();
+            }
+            if targets.is_empty() {
+                warnings.push(
+                    "reflex: saved, but no audio device is online to load it (deploys on next start)"
+                        .into(),
+                );
+            } else {
+                for device in targets {
+                    if let Err(e) = state.voice.deploy_reflex_auto(&device).await {
+                        warnings.push(format!(
+                            "reflex: saved, but the spotter on {device} was not restarted: {e}"
+                        ));
+                    }
+                }
+            }
+        }
+
+        if body.mode.is_some() {
+            state.voice.spawn_ack_synthesis();
         }
         Ok(())
     }

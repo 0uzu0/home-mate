@@ -110,8 +110,8 @@ const loadingFirst = computed(() => !mode.value && loading.value)
                beside the physical key, with its own provenance badge. -->
           <MuteCard :device="selected" :gateway-device-id="selectedGateway?.stable_id ?? null" />
           <LedCard :device="selected" :gateway-device="selectedGateway" />
-          <ReminderCard :key="`rem-${selected.device}`" :device="selected" />
-          <MicCard v-if="advancedMode" :device="selected" />
+          <ReminderCard :key="`rem-${selected.device}`" :device="selected" :devices="devices" />
+          <MicCard v-if="advancedMode" :device="selected" :gateway-device="selectedGateway" />
           <AcousticsCard v-if="advancedMode" :key="`ac-${selected.device}`" :device="selected" />
         </section>
       </template>

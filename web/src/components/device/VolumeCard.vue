@@ -35,7 +35,6 @@ const reported = computed(() => props.volume != null)
  * must never be presented as what the device reported (audit 2026-11-14). */
 const reportedLevel = computed(() => Math.round((props.volume ?? 0) * 127))
 const reportedPercent = computed(() => Math.round((props.volume ?? 0) * 100))
-const level = computed(() => Math.round(display.value * 127))
 const percent = computed(() => Math.round(display.value * 100))
 
 const muted = computed(() => props.device?.muted)
@@ -162,12 +161,6 @@ async function apply(): Promise<void> {
         </p>
       </div>
     </div>
-
-    <div class="volume__mute">
-      <p class="volume__mute-title">{{ t('muteTitle') }}</p>
-      <p class="volume__mute-hint">{{ t('muteHint') }}</p>
-      <Pill size="sm" mono>{{ t('deviceSovereign') }}</Pill>
-    </div>
   </Panel>
 </template>
 
@@ -237,26 +230,6 @@ async function apply(): Promise<void> {
 }
 
 .volume__reported {
-  font-size: var(--fs-xs);
-  color: var(--muted);
-}
-
-.volume__mute {
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-1);
-  padding: var(--sp-3);
-  border: 1px solid var(--line);
-  border-radius: var(--r-sm);
-  background: var(--surface-2);
-}
-
-.volume__mute-title {
-  font-size: var(--fs-sm);
-  font-weight: 650;
-}
-
-.volume__mute-hint {
   font-size: var(--fs-xs);
   color: var(--muted);
 }

@@ -69,7 +69,7 @@ async fn paired_router_reviews_commits_reads_and_refuses_stale_authority() {
             async move {
                 if remote.load(std::sync::atomic::Ordering::SeqCst) {
                     req.extensions_mut().insert(axum::extract::ConnectInfo(
-                        "192.0.2.10:5000".parse::<SocketAddr>().unwrap(),
+                        "192.168.1.10:5000".parse::<SocketAddr>().unwrap(),
                     ));
                 }
                 next.run(req).await

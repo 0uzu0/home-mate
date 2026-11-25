@@ -52,14 +52,43 @@ use crate::config::{ConfigService, MusicConfig};
 use crate::gateway::DeviceHub;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-/// How far ahead of the speaker the core may push (seconds of audio). The
-/// firmware has its own 180 s backstop; this keeps the device buffer small
-/// enough that a stop is heard immediately.
-const PLAY_AHEAD_SECS: f64 = 20.0;
+/// How far ahead of the speaker the core may push (seconds of audio) on local
+/// loopback gateways. The firmware has its own 180 s backstop; this keeps the
+/// device buffer small enough that a stop is heard immediately.
+pub(crate) const PLAY_AHEAD_SECS: f64 = 20.0;
+/// Smaller play-ahead cap (seconds of audio) for non-loopback LAN/Tailscale
+/// gateways so media PCM never fills multi-megabyte TCP send buffers and stalls
+/// `Stop` / `wake_ack` preemption (`#282`).
+pub(crate) const REMOTE_PLAY_AHEAD_SECS: f64 = 3.0;
+/// Initial startup burst (seconds of audio) pushed immediately on non-loopback
+/// media start (`#297`): comfortably exceeds Android's 480 ms initial prebuffer
+/// so music starts with zero extra delay on LAN and WAN, while avoiding an
+/// instantaneous 3.0 s (~200 KB) `SO_SNDBUF` flood right before `"正在播放..."`.
+pub(crate) const REMOTE_INITIAL_PLAY_AHEAD_SECS: f64 = 0.65;
+/// Smooth ramp rate (extra seconds of play-ahead gained per elapsed second)
+/// from `REMOTE_INITIAL_PLAY_AHEAD_SECS` up to `REMOTE_PLAY_AHEAD_SECS`
+/// (`0.65 s -> 3.0 s` over ~5.2 s, i.e. 1.45x real-time pace).
+pub(crate) const REMOTE_PLAY_AHEAD_RAMP_RATE: f64 = 0.45;
+/// Soft user-space `media_tx` queue backpressure threshold (chunks = 1.28 s)
+/// for non-loopback media pumps (`#297`) so stalled remote sockets do not
+/// accumulate 200+ chunk backlogs while wall clock advances.
+pub(crate) const REMOTE_MEDIA_QUEUE_HIGH_WATER: usize = 32;
+/// Continuous queue-backpressure duration after which `MusicRuntime::pump`
+/// latches `media_congested` on a slow non-loopback link so subsequent tracks
+/// automatically drop to `<= 24 kHz` compact mode.
+pub(crate) const REMOTE_MEDIA_CONGESTION_WAIT_MS: u64 = 1_500;
+
+/// Compute the smooth remote play-ahead budget (in seconds) at `elapsed_secs`
+/// since playback started (`#297`). Loopback speakers keep `PLAY_AHEAD_SECS`.
+pub(crate) fn remote_play_ahead_budget_secs(elapsed_secs: f64) -> f64 {
+    let elapsed = elapsed_secs.max(0.0);
+    (REMOTE_INITIAL_PLAY_AHEAD_SECS + elapsed * REMOTE_PLAY_AHEAD_RAMP_RATE)
+        .min(REMOTE_PLAY_AHEAD_SECS)
+}
 /// Chunk size pushed to the device (PCM s16le mono ≈ 40 ms at 24 kHz).
 const PUSH_CHUNK_SECS: f64 = 0.04;
 /// A search answer is at most this many tracks (the model picks, the user
@@ -299,6 +328,44 @@ struct Secrets {
     online: Option<String>,
 }
 
+const CANDIDATE_CACHE_CAP: usize = 64;
+
+/// Bounded FIFO/oldest-entry eviction cache for per-turn track candidates (`MG-P1-06`).
+/// Evicting only the oldest entry preserves sibling devices' in-flight selections.
+#[derive(Default)]
+struct BoundedCandidateCache {
+    map: HashMap<String, Vec<Track>>,
+    order: VecDeque<String>,
+}
+
+impl BoundedCandidateCache {
+    fn touch_order(&mut self, key: &str) {
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(key.to_string());
+    }
+
+    fn entry_mut(&mut self, key: &str) -> &mut Vec<Track> {
+        if !self.map.contains_key(key) {
+            while self.map.len() >= CANDIDATE_CACHE_CAP {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.map.remove(&oldest);
+                } else {
+                    break;
+                }
+            }
+            self.map.insert(key.to_string(), Vec::new());
+        }
+        self.touch_order(key);
+        self.map.get_mut(key).expect("just inserted")
+    }
+
+    fn get(&self, key: &str) -> Option<&Vec<Track>> {
+        self.map.get(key)
+    }
+}
+
 /// Shared music state: config access, per-turn search results, and the live
 /// media sessions (one per device; a new play stops the old one).
 pub struct MusicRuntime {
@@ -314,8 +381,8 @@ pub struct MusicRuntime {
     /// Story streams use the same per-read streaming timeouts as `stream_client`
     /// plus `Policy::none()` redirects so `validate_news_url` cannot be bypassed.
     story_stream_client: reqwest::Client,
-    /// task_id → ids this turn's search actually returned.
-    candidates: Mutex<HashMap<String, Vec<Track>>>,
+    /// task_id → ids this turn's search actually returned (bounded FIFO eviction).
+    candidates: Mutex<BoundedCandidateCache>,
     /// M3: device → the media session (queue + position). One per device;
     /// a new play replaces it, a pause keeps it, a stop removes it.
     media: Mutex<HashMap<String, MediaSession>>,
@@ -374,7 +441,7 @@ impl MusicRuntime {
             .read_timeout(Duration::from_secs(30))
             .build()
             .unwrap_or_default(),
-            candidates: Mutex::new(HashMap::new()),
+            candidates: Mutex::new(BoundedCandidateCache::default()),
             media: Mutex::new(HashMap::new()),
             media_epochs: Mutex::new(HashMap::new()),
             playback: Mutex::new(lifecycle::PlaybackState::default()),
@@ -400,7 +467,7 @@ impl MusicRuntime {
             stream_client: client.clone(),
             story_stream_client: client.clone(),
             client,
-            candidates: Mutex::new(HashMap::new()),
+            candidates: Mutex::new(BoundedCandidateCache::default()),
             media: Mutex::new(HashMap::new()),
             media_epochs: Mutex::new(HashMap::new()),
             playback: Mutex::new(lifecycle::PlaybackState::default()),
@@ -528,12 +595,17 @@ impl MusicRuntime {
         v
     }
 
+    pub fn remember_candidates(&self, task_id: &str, tracks: &[Track]) {
+        self.remember(task_id, tracks);
+    }
+
+    pub fn has_candidate(&self, task_id: &str, source: Source, id: &str) -> bool {
+        self.queue_for_with_ids(task_id, source, id, None).is_some()
+    }
+
     fn remember(&self, task_id: &str, tracks: &[Track]) {
         let mut m = crate::lock_or_recover(&self.candidates, "music.candidates");
-        if m.len() > 64 && !m.contains_key(task_id) {
-            m.clear();
-        }
-        let slot = m.entry(task_id.to_string()).or_default();
+        let slot = m.entry_mut(task_id);
         for t in tracks {
             if let Some(existing) = slot
                 .iter_mut()

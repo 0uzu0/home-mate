@@ -21,9 +21,11 @@ import {
   deviceRoom,
   devices,
   refresh as refreshDevices,
+  refreshSilent as refreshDevicesSilent,
   selectDevice,
   selected,
   selectedId,
+  setStatusSnapshot,
 } from './stores/devices'
 import type { IconName } from './components/icons'
 import Toast from './components/Toast.vue'
@@ -44,6 +46,7 @@ type AuthView = 'checking' | 'setup' | 'pair' | 'corrupt' | 'ready'
 const authView = ref<AuthView>('checking')
 
 async function bootAuth(): Promise<void> {
+  pairingRequired.value = false
   authView.value = 'checking'
   try {
     const state = await getAuthStatus({ timeoutMs: 4000 })
@@ -60,27 +63,41 @@ async function bootAuth(): Promise<void> {
 }
 
 onMounted(bootAuth)
-// Any 401 anywhere in the app (rotation in another tab, revoked token) flips
-// this; the shell is replaced by the pairing card instead of a wall of errors.
+// Any 401 anywhere in the app (rotation in another tab, revoked token, factory
+// reset) flips this; ignore during first-boot setup so the one-time token is
+// never unmounted mid-copy, and re-probe via bootAuth() on ready -> unauthorized
+// so factory-reset devices land on 'setup' instead of looping on 'pair'.
 watch(pairingRequired, (needs) => {
-  if (needs) authView.value = 'pair'
+  if (!needs || authView.value === 'setup') return
+  if (authView.value === 'ready') {
+    void bootAuth()
+  }
 })
 
-const status = useResource((signal) => getStatus({ signal }), { timeoutMs: 5000, retries: 1 })
-// The connection poll must NOT wait for the auth view. It used to be gated on
-// `authView === 'ready'`, so a failed /auth probe left the poll dead and the
-// shell showed "core not connected" forever (2026-11-14 audit). /status also
-// answers before pairing (auth configured:false), and a 401 flips the pairing
-// card through `pairingRequired` anyway.
-usePoll(() => status.load(), 10000)
-// ...but the moment a token is accepted, re-read immediately: the poll that
-// ran before pairing failed with 401 and left `data` null, so without this the
-// shell showed "core not connected" for up to 10 s after the pairing card
-// disappeared (measured in the browser, 2026-11-15).
+const status = useResource(
+  (signal) => getStatus({ signal, device: selectedId.value || undefined }),
+  { timeoutMs: 5000, retries: 1 },
+)
+watch(
+  () => status.data.value,
+  (snap) => {
+    setStatusSnapshot(snap)
+  },
+  { immediate: true },
+)
+// Pause background status polling while the auth gate is visible so an
+// unauthenticated /status request cannot 401 right after first-boot provision
+// and destroy the one-time token screen mid-copy.
+usePoll(() => (authView.value === 'ready' ? status.load() : Promise.resolve()), 10000)
+// The moment a token is accepted (or bootAuth finishes ready), load status and
+// devices immediately instead of waiting for the next poll interval.
 watch(authView, (view, previous) => {
-  if (view === 'ready' && previous !== 'ready') void status.load()
+  if (view === 'ready' && previous !== 'ready') {
+    void status.load()
+    void refreshDevices()
+  }
 })
-usePoll(() => (authView.value === 'ready' ? refreshDevices() : Promise.resolve()), 500)
+usePoll(() => (authView.value === 'ready' ? refreshDevicesSilent() : Promise.resolve()), 500)
 
 const allLinks: Array<{ path: string; key: Key; icon: IconName; advanced?: boolean }> = [
   { path: '/status', key: 'navStatus', icon: 'status' },
@@ -228,7 +245,10 @@ watch(
 
 watch(
   selectedId,
-  (id) => {
+  (id, prev) => {
+    if (authView.value === 'ready' && id && prev && id !== prev) {
+      void status.load()
+    }
     if ((route.query.device ?? null) === (id ?? null)) return
     const query = { ...route.query }
     if (id) query.device = id

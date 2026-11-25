@@ -325,7 +325,7 @@ pub fn firmware_identity(bytes: &[u8]) -> Option<(String, Option<String>)> {
     let version = parts.next()?.to_string();
     let build = parts
         .next()
-        .filter(|t| !t.starts_with('(') && !t.starts_with('(') && *t != "(emos)")
+        .filter(|t| !t.starts_with('('))
         .map(|t| t.to_string());
     Some((version, build))
 }

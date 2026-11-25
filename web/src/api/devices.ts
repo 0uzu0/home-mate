@@ -1,4 +1,10 @@
-import { request, type GatewaySnapshot, type RequestOptions, type RingEvent } from './client'
+import {
+  request,
+  type GatewayDevice,
+  type GatewaySnapshot,
+  type RequestOptions,
+  type RingEvent,
+} from './client'
 import type { HomeStatus } from './services'
 
 export const getDevices = (opts?: RequestOptions) =>
@@ -132,6 +138,7 @@ export interface MicTelemetry {
   session: boolean | null
   detail?: string | null
   in_speech: boolean
+  idle_gated?: boolean
   last_chunk_ms?: number | null
   chunks_per_sec?: number | null
   blocks_seen?: number
@@ -302,6 +309,23 @@ export interface ModeDevice {
     confirm_mean_ms: number
     confirm_max_ms: number
   } | null
+  media_trim_db?: number
+  tail_blind_ms?: number
+  wake_words?: string[]
+  retreat_words?: string[]
+  barge_in?: boolean
+  barge_protect_ms?: number
+  keyword_interrupt?: boolean
+  follow_window_enabled?: boolean
+  follow_window_ms?: number
+  context_window_ms?: number
+  followup_credits?: number | null
+  kws_threshold?: number
+  kws_score?: number
+  asr_wake_fallback?: boolean
+  proactive_asr_wake?: boolean
+  wake_arbitration?: WakeArbitration['mode']
+  has_device_override?: boolean
   outputs: Array<{
     play_id: string
     channel: string
@@ -332,6 +356,10 @@ export interface StopIntentConfig {
 }
 
 export interface ModeSnapshot {
+  scope?: 'global' | 'device'
+  device?: string
+  has_device_override?: boolean
+  device_overrides?: Record<string, Partial<ModePatch>>
   assistant_name?: string
   persona_prompt?: string
   system_prompt_override?: string | null
@@ -373,8 +401,11 @@ export interface ModeSnapshot {
   devices: ModeDevice[]
 }
 
-export const getMode = (opts?: RequestOptions) =>
-  request<ModeSnapshot>('/api/v0/mode', {}, opts)
+export const getMode = (opts?: RequestOptions & { device?: string }) => {
+  const { device, ...reqOpts } = opts ?? {}
+  const q = device?.trim() ? `?device=${encodeURIComponent(device.trim())}` : ''
+  return request<ModeSnapshot>(`/api/v0/mode${q}`, {}, reqOpts)
+}
 
 export interface WakeArbitration {
   mode: 'off' | 'observe' | 'enforce'
@@ -429,11 +460,53 @@ export interface ModePatch {
 }
 
 export const putMode = (device: string, patch: ModePatch, opts?: RequestOptions) =>
-  request<ModeDevice & { reason?: string | null }>(
+  request<ModeDevice & { scope?: string; reason?: string | null }>(
     `/api/v0/mode/${encodeURIComponent(device)}`,
     { method: 'PUT', body: JSON.stringify(patch) },
     opts,
   )
+
+export const putGlobalMode = (patch: ModePatch, opts?: RequestOptions) =>
+  request<ModeSnapshot & { scope?: string; reason?: string | null }>(
+    '/api/v0/mode',
+    { method: 'PUT', body: JSON.stringify(patch) },
+    opts,
+  )
+
+/**
+ * Mirrors backend `diagnostics.rs:155-176` & `gateway/outbound.rs:1108-1216` (`MG-P2-03`):
+ * mobile/offline-KWS gateways (explicit `idle_gated_*` capabilities or `android-v2`/`android-*`
+ * mobile profile) intentionally pause uplink audio chunks while idle on local KWS.
+ * Fixed LAN/Tailscale continuous speakers (`loopback: false`) are NEVER inferred as idle-gated.
+ */
+export function isDeviceIdleGated(
+  device: ModeDevice | null | undefined,
+  gatewayDevice?: GatewayDevice | null,
+): boolean {
+  if (!device) return false
+  if (device.mic?.idle_gated === true) return true
+  const online = gatewayDevice ? gatewayDevice.online : true
+  const muted = device.muted === true
+  const session = device.mic?.session === true
+  const kwsRunning = device.kws?.state === 'running'
+  const inSpeech = device.mic?.in_speech === true
+  const sessionOpen = Boolean(device.participation && device.participation !== 'idle')
+  const caps = gatewayDevice?.capabilities ?? []
+  const hasIdleGateCap = caps.some(
+    (c) => c === 'idle_gated_mic' || c === 'idle_gated_audio' || c === 'offline_kws_idle_gate',
+  )
+  const pv = (gatewayDevice?.profile_version ?? '').trim().toLowerCase()
+  const isMobileProfile = pv === 'android-v2' || pv.startsWith('android-')
+  return (
+    (hasIdleGateCap || isMobileProfile) &&
+    online &&
+    !muted &&
+    session &&
+    kwsRunning &&
+    !inSpeech &&
+    !sessionOpen
+  )
+}
 
 export interface VoiceEvent {
   kind: string
@@ -539,14 +612,14 @@ export const putReflex = (
   request<ReflexState & { deploy?: unknown; state: string }>(
     '/api/v0/reflex',
     { method: 'PUT', body: JSON.stringify(body) },
-    { timeoutMs: 15000, ...opts },
+    { timeoutMs: 35000, ...opts },
   )
 
 export const deployReflex = (body: { device?: string } = {}, opts?: RequestOptions) =>
   request<{ state: string; hash: string; words: number; device: string; keywords_file: string }>(
     '/api/v0/reflex/deploy',
     { method: 'POST', body: JSON.stringify(body) },
-    { timeoutMs: 15000, ...opts },
+    { timeoutMs: 35000, ...opts },
   )
 
 export interface FirmwareSlotInfo {

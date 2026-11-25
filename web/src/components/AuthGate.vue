@@ -14,7 +14,7 @@
  *   recovery is a root/serial action, not something a console may do.
  */
 import { computed, ref } from 'vue'
-import { getStatus, provisionAuth, type ApiError } from '../api'
+import { getAuthStatus, getStatus, provisionAuth, type ApiError } from '../api'
 import { setAuthToken, clearAuthToken } from '../auth'
 import { locale, setLocale, t } from '../i18n'
 import { cycleTheme, themePref } from '../theme'
@@ -59,7 +59,7 @@ async function generate(): Promise<void> {
   } catch (err) {
     // 409 = another tab/client paired first; re-check rather than overwrite.
     error.value = detail(err)
-    emit('retry')
+    if ((err as ApiError)?.status === 409) emit('retry')
   } finally {
     busy.value = false
   }
@@ -83,13 +83,33 @@ function enter(): void {
   emit('ready')
 }
 
+function sanitizeToken(raw: string): string {
+  let value = raw.replace(/[\r\n]+/g, '')
+  let prev = ''
+  while (value !== prev) {
+    prev = value
+    value = value
+      .trim()
+      .replace(/^["'`]+|["'`]+$/g, '')
+      .replace(/^\s*bearer(?:\s+|$)/i, '')
+      .trim()
+  }
+  return value
+}
+
 async function pair(): Promise<void> {
-  const value = candidate.value.trim()
+  const value = sanitizeToken(candidate.value)
   if (!value) return
   busy.value = true
   error.value = ''
-  setAuthToken(value)
   try {
+    const auth = await getAuthStatus({ timeoutMs: 5000 })
+    if (!auth.configured || auth.corrupt) {
+      clearAuthToken()
+      emit('retry')
+      return
+    }
+    setAuthToken(value)
     await getStatus({ timeoutMs: 5000 })
     emit('ready')
   } catch (err) {
@@ -132,6 +152,7 @@ async function pair(): Promise<void> {
             </h1>
             <p class="card__lead">{{ t('authSetupBody') }}</p>
             <p class="card__warn">{{ t('authSetupWarn') }}</p>
+            <p v-if="error" class="card__error">{{ error }}</p>
             <button type="button" class="btn btn--primary" :disabled="busy" @click="generate">
               <AppIcon name="check" :size="14" />
               {{ busy ? t('authChecking') : t('authGenerate') }}
@@ -183,7 +204,7 @@ async function pair(): Promise<void> {
             <button
               type="button"
               class="btn btn--primary"
-              :disabled="busy || !candidate.trim()"
+              :disabled="busy || !sanitizeToken(candidate)"
               @click="pair"
             >
               {{ t('authPairAction') }}

@@ -1227,6 +1227,18 @@ impl Tool for OpenApiCallTool {
             .iter()
             .map(|o| Value::String(o.id.clone()))
             .collect();
+        let operation_schema = if enum_values.is_empty() {
+            json!({
+                "type": "string",
+                "description": "白名单里的操作 id"
+            })
+        } else {
+            json!({
+                "type": "string",
+                "enum": enum_values,
+                "description": "白名单里的操作 id"
+            })
+        };
         ToolDescriptor {
             name: "openapi.call".into(),
             service: "openapi".into(),
@@ -1235,11 +1247,7 @@ impl Tool for OpenApiCallTool {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "operation": {
-                        "type": "string",
-                        "enum": enum_values,
-                        "description": "白名单里的操作 id"
-                    },
+                    "operation": operation_schema,
                     "arguments": {
                         "type": "object",
                         "description": "该操作声明的参数子集（未声明的参数会被拒绝）"
@@ -1273,6 +1281,15 @@ impl Tool for OpenApiCallTool {
                         false,
                     ),
                 }
+            }
+            Ok(prepared)
+                if prepared.op.effect_level == EffectLevel::Mutate && ctx.is_lan_exempt() =>
+            {
+                ToolResult::failed(
+                    "PAIRING_REQUIRED",
+                    "未认证的局域网访问不允许执行变更类 OpenAPI 操作，请使用配对令牌认证",
+                    false,
+                )
             }
             Ok(prepared) => {
                 self.rt

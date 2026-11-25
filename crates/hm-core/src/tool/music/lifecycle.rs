@@ -56,8 +56,10 @@ impl MusicRuntime {
             .active
             .insert(device.into(), (fact.clone(), Instant::now()));
         drop(state);
-        if let Some(voice) = self.voice() {
-            voice.sovereignty.record_local_music(fact.clone());
+        if self.hub.device_in_household_acoustic_domain(device) {
+            if let Some(voice) = self.voice() {
+                voice.sovereignty.record_local_music(fact.clone());
+            }
         }
         self.note("music_playback_notice", serde_json::to_value(fact).unwrap());
     }
@@ -76,8 +78,10 @@ impl MusicRuntime {
         fact.sequence = state.sequence;
         fact.active = false;
         drop(state);
-        if let Some(voice) = self.voice() {
-            voice.sovereignty.record_local_music(fact.clone());
+        if self.hub.device_in_household_acoustic_domain(device) {
+            if let Some(voice) = self.voice() {
+                voice.sovereignty.record_local_music(fact.clone());
+            }
         }
         self.note("music_playback_notice", serde_json::to_value(fact).unwrap());
     }

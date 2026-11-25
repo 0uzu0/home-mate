@@ -48,23 +48,12 @@ export function formatDuration(ms: number | null | undefined): string {
   return `${hour} ${t('unitHour')} ${String(min % 60).padStart(2, '0')} ${t('unitMin')}`
 }
 
-/** Numbers of characters (回答长度上限). English says "chars", Chinese 字. */
-export function formatChars(n: number | null | undefined): string {
-  if (n == null || !Number.isFinite(n)) return '—'
-  return `${formatNumber(n)} ${t('unitChars')}`
-}
-
 export function formatNumber(value: number | null | undefined, digits = 0): string {
   if (value == null || !Number.isFinite(value)) return '—'
   return new Intl.NumberFormat(tag(), {
     minimumFractionDigits: digits,
     maximumFractionDigits: digits,
   }).format(value)
-}
-
-export function formatPercent(value: number | null | undefined, digits = 0): string {
-  if (value == null || !Number.isFinite(value)) return '—'
-  return `${value.toFixed(digits)}%`
 }
 
 export function formatDb(value: number | null | undefined, digits = 1): string {
@@ -77,18 +66,6 @@ export function formatBytes(bytes: number | null | undefined): string {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
   return `${(bytes / 1024 / 1024).toFixed(2)} MB`
-}
-
-export function formatValue(value: unknown): string {
-  if (value === null || value === undefined || value === '') return t('none')
-  if (typeof value === 'boolean') return value ? t('yes') : t('no')
-  if (typeof value === 'number') return String(value)
-  if (typeof value === 'string') return value
-  try {
-    return JSON.stringify(value)
-  } catch {
-    return String(value)
-  }
 }
 
 export function errorDetail(err: unknown): string {

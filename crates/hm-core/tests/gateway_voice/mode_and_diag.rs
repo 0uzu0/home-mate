@@ -532,7 +532,8 @@ async fn wake_words_editable_via_mode_api() {
         .iter()
         .find(|e| {
             e["scope"] == json!("voice")
-                && e["payload"]["wake_words"] == json!(["小达", "你好高达"])
+                && e["payload"]["device_overrides"]["dot2-d"]["wake_words"]
+                    == json!(["小达", "你好高达"])
         })
         .expect("voice history row with the new wake words");
     let id = entry["id"].as_i64().unwrap();
@@ -721,7 +722,10 @@ async fn tail_blind_ms_editable_via_mode_api() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|e| e["scope"] == json!("voice") && e["payload"]["tail_blind_ms"] == json!(0))
+        .find(|e| {
+            e["scope"] == json!("voice")
+                && e["payload"]["device_overrides"]["dot2-d"]["tail_blind_ms"] == json!(0)
+        })
         .expect("voice history row with tail_blind_ms=0");
     let id = entry["id"].as_i64().unwrap();
 
@@ -1153,9 +1157,40 @@ async fn retreat_intent_stops_and_closes_window() {
         retreat["session_messages_cleared"].as_u64().unwrap_or(0) >= 2,
         "退下 must clear the conversation context: {retreat:?}"
     );
+    let current_session = state.sessions.device_session_id("dot2-d").unwrap();
+    assert_ne!(
+        current_session, session,
+        "退下 must rotate the active context so the next turn starts clean"
+    );
     assert!(
-        state.sessions.messages(&session).unwrap().is_empty(),
+        state
+            .sessions
+            .messages(&current_session)
+            .unwrap()
+            .is_empty(),
         "the model's next turn must start with no history"
+    );
+    assert!(
+        state
+            .sessions
+            .history(&current_session, 50)
+            .unwrap()
+            .is_empty(),
+        "the model's next turn must start with 0 carried-over turns"
+    );
+    assert_eq!(
+        state.sessions.messages(&session).unwrap().len(),
+        2,
+        "archived conversation history must be preserved across retreat"
+    );
+    assert!(
+        state
+            .sessions
+            .device_contexts("dot2-d", None, 10)
+            .unwrap()
+            .iter()
+            .any(|c| c.session_id == session),
+        "retreated session must appear in archived device_contexts"
     );
 }
 

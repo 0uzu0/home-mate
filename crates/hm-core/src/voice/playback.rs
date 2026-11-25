@@ -130,6 +130,13 @@ impl VoicePipeline {
         for p in &s.wake_ack.phrases {
             push_unique(p.trim().to_string());
         }
+        for ov in s.device_overrides.values() {
+            if let Some(ack) = &ov.wake_ack {
+                for p in &ack.phrases {
+                    push_unique(p.trim().to_string());
+                }
+            }
+        }
         push_unique(s.retreat_ack.trim().to_string());
         push_unique(s.window_close_ack.trim().to_string());
         push_unique(s.truncation_notice.trim().to_string());
@@ -175,13 +182,14 @@ impl VoicePipeline {
     }
 
     /// Pick a random ready phrase (xorshift on the clock — no rand dep).
-    pub(super) fn pick_ack_phrase(&self) -> Option<String> {
-        let settings = crate::lock_or_recover(&self.settings, "voice.settings");
-        if !settings.wake_ack.enabled || settings.wake_ack.phrases.is_empty() {
+    pub(super) fn pick_ack_phrase_for(&self, device: &str) -> Option<String> {
+        let wake_ack = crate::lock_or_recover(&self.settings, "voice.settings")
+            .effective_for(device)
+            .wake_ack;
+        if !wake_ack.enabled || wake_ack.phrases.is_empty() {
             return None;
         }
-        let phrases = settings.wake_ack.phrases.clone();
-        drop(settings);
+        let phrases = wake_ack.phrases;
         let manifest = self.load_ack_manifest();
         let ready: Vec<String> = phrases
             .into_iter()
@@ -322,12 +330,13 @@ impl VoicePipeline {
     }
     pub(super) async fn speak_wake_ack(&self, device: &str, permit: OutputPermit) -> AckOutcome {
         if !crate::lock_or_recover(&self.settings, "voice.settings")
+            .effective_for(device)
             .wake_ack
             .enabled
         {
             return AckOutcome::NotPlayed;
         }
-        let Some(phrase) = self.pick_ack_phrase() else {
+        let Some(phrase) = self.pick_ack_phrase_for(device) else {
             return AckOutcome::NotPlayed;
         };
         let Some(ticket) = self.play_local_ack_at(device, &phrase, "wake_ack", permit) else {
@@ -1891,6 +1900,11 @@ impl VoicePipeline {
         let phrases = {
             let s = crate::lock_or_recover(&self.settings, "voice.settings");
             let mut all = s.wake_ack.phrases.clone();
+            for ov in s.device_overrides.values() {
+                if let Some(ack) = &ov.wake_ack {
+                    all.extend(ack.phrases.iter().cloned());
+                }
+            }
             all.push(s.retreat_ack.clone());
             all.push(s.window_close_ack.clone());
             if !s.truncation_notice.trim().is_empty() {

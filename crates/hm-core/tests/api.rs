@@ -536,7 +536,11 @@ async fn config_backup_roundtrips_services_music_and_mode() {
         )
         .unwrap();
     assert_eq!(
-        state.voice.settings_snapshot().wake_words,
+        state
+            .voice
+            .settings_snapshot()
+            .effective_for("dot2-d")
+            .wake_words,
         vec!["别的".to_string()]
     );
 
@@ -576,10 +580,21 @@ async fn config_backup_roundtrips_services_music_and_mode() {
         "the secret comes back through the import"
     );
     assert_eq!(
-        state.voice.settings_snapshot().wake_words,
+        state
+            .voice
+            .settings_snapshot()
+            .effective_for("dot2-d")
+            .wake_words,
         vec!["你好高达".to_string()]
     );
-    assert_eq!(state.voice.settings_snapshot().tail_blind_ms, 200);
+    assert_eq!(
+        state
+            .voice
+            .settings_snapshot()
+            .effective_for("dot2-d")
+            .tail_blind_ms,
+        200
+    );
 
     // Import lands in the change record with its own actor.
     let hist: Value = client

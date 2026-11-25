@@ -250,7 +250,7 @@ impl VoicePipeline {
         input_id: u64,
         expected: Identity,
     ) -> Option<(Identity, crate::session::ContextTicket)> {
-        let (policy, context_ms) = self.context_policy();
+        let (policy, context_ms) = self.context_policy_for(device);
         let mut states = crate::lock_or_recover(&self.states, "voice.states");
         self.activate_consumed_input_locked(
             device,
@@ -307,9 +307,16 @@ impl VoicePipeline {
         device: &str,
         expected: Identity,
         input_id: u64,
+        pre_paused_media: Option<serde_json::Value>,
     ) -> Option<Identity> {
-        self.honor_wake_word(device, "utterance", expected, Some(input_id))
-            .map(|(_, identity)| identity)
+        self.honor_wake_word(
+            device,
+            "utterance",
+            expected,
+            Some(input_id),
+            pre_paused_media,
+        )
+        .map(|(_, identity)| identity)
     }
 
     /// Only the exact active physical onset may cross this one KWS wake.
@@ -342,19 +349,20 @@ impl VoicePipeline {
         st: &mut DeviceVoiceState,
     ) {
         let Some((origin, onset, cap, confirmed)) = ({
-            let mic = crate::lock_or_recover(&self.mic, "voice.mic");
-            mic.get(device)
-                .filter(|p| p.in_speech() || p.onset_pending())
-                .and_then(|p| {
-                    p.onset().map(|onset| {
-                        (
-                            p.onset_provenance(),
-                            onset,
-                            Duration::from_millis((p.config().max_blocks as u64 * 80).min(30_000)),
-                            p.in_speech(),
-                        )
-                    })
+            self.mic_arc(device).and_then(|arc| {
+                let p = crate::lock_or_recover(&arc, "voice.mic.dev");
+                if !(p.in_speech() || p.onset_pending()) {
+                    return None;
+                }
+                p.onset().map(|onset| {
+                    (
+                        p.onset_provenance(),
+                        onset,
+                        Duration::from_millis((p.config().max_blocks as u64 * 80).min(30_000)),
+                        p.in_speech(),
+                    )
                 })
+            })
         }) else {
             return;
         };
@@ -407,12 +415,11 @@ impl VoicePipeline {
                     .flatten()
                     .is_some_and(|current| current.ticket() == context)
             })
-            && crate::lock_or_recover(&self.mic, "voice.mic")
-                .get(device)
-                .is_some_and(|mic| {
-                    (mic.in_speech() || mic.onset_pending())
-                        && mic.onset().is_some_and(|(_, start)| start == input.start)
-                });
+            && self.mic_arc(device).is_some_and(|arc| {
+                let mic = crate::lock_or_recover(&arc, "voice.mic.dev");
+                (mic.in_speech() || mic.onset_pending())
+                    && mic.onset().is_some_and(|(_, start)| start == input.start)
+            });
         if valid {
             Some(input)
         } else {
@@ -446,17 +453,17 @@ impl VoicePipeline {
         {
             return;
         }
-        let mut mic = crate::lock_or_recover(&self.mic, "voice.mic");
-        let Some(p) = mic.get_mut(device) else {
+        let Some(arc) = self.mic_arc(device) else {
             return;
         };
+        let mut p = crate::lock_or_recover(&arc, "voice.mic.dev");
         if !((p.in_speech() || p.onset_pending())
             && p.onset().is_some_and(|(_, start)| start == input.start))
         {
             return;
         }
         p.promote_wake_capture();
-        drop(mic);
+        drop(p);
         let old_generation = input.generation;
         input.generation = st.participation.generation();
         input.stop_epoch = st.stop_epoch;
@@ -545,10 +552,10 @@ impl VoicePipeline {
 
     pub(super) fn start_input(&self, device: &str) {
         let (origin, onset, cap, confirmed) = {
-            let mic = crate::lock_or_recover(&self.mic, "voice.mic");
-            let Some(p) = mic.get(device) else {
+            let Some(arc) = self.mic_arc(device) else {
                 return;
             };
+            let p = crate::lock_or_recover(&arc, "voice.mic.dev");
             (
                 p.onset_provenance(),
                 p.onset().unwrap_or((id::now_ms(), Instant::now())),
@@ -556,7 +563,9 @@ impl VoicePipeline {
                 p.in_speech(),
             )
         };
-        let proactive = crate::lock_or_recover(&self.settings, "voice.settings").proactive_asr_wake;
+        let proactive = crate::lock_or_recover(&self.settings, "voice.settings")
+            .effective_for(device)
+            .proactive_asr_wake;
         let live = self.effective_hub_live(device);
         let mut states = crate::lock_or_recover(&self.states, "voice.states");
         let st = states.entry(device.to_owned()).or_default();
@@ -578,10 +587,11 @@ impl VoicePipeline {
         if st.input.is_some() {
             st.revoke_input("expired");
         }
+        let cover_now = id::now_ms().max(onset.0);
         let control = origin.spans.iter().any(|s| s.control_only);
         let eligibility = if control {
             "control"
-        } else if st.session_covers_with_live(onset.0, onset.0, onset.0, live) {
+        } else if st.session_covers_with_live(onset.0, cover_now, cover_now, live) {
             "session"
         } else if proactive {
             "asr_fallback"
@@ -594,8 +604,8 @@ impl VoicePipeline {
                 && origin
                     .spans
                     .iter()
-                    .all(|s| !s.control_only || s.wake_ack_overlap)
-                && st.session_covers_with_live(onset.0, onset.0, onset.0, live))
+                    .all(|s| !s.control_only || s.wake_ack_overlap || s.tail_blind_only)
+                && st.session_covers_with_live(onset.0, cover_now, cover_now, live))
         {
             crate::session::SessionStore::new(self.store.clone())
                 .current_device_context(device)
@@ -628,10 +638,10 @@ impl VoicePipeline {
     /// lag crosses the idle boundary; no upload occurs until SpeechStarted.
     pub(super) fn observe_input_onset(&self, device: &str) {
         let (pending, speaking) = {
-            let mic = crate::lock_or_recover(&self.mic, "voice.mic");
-            let Some(p) = mic.get(device) else {
+            let Some(arc) = self.mic_arc(device) else {
                 return;
             };
+            let p = crate::lock_or_recover(&arc, "voice.mic.dev");
             (p.onset_pending(), p.in_speech())
         };
         if pending || speaking {
@@ -676,8 +686,8 @@ impl VoicePipeline {
                         || (!i.recognizing && Instant::now() >= i.capture_deadline)
                 });
                 st.revoke_input(if expired { "expired" } else { "cancelled" });
-                if let Some(p) = crate::lock_or_recover(&self.mic, "voice.mic").get_mut(device) {
-                    p.reset();
+                if let Some(arc) = self.mic_arc(device) {
+                    crate::lock_or_recover(&arc, "voice.mic.dev").reset();
                 }
                 self.note(
                     "mic_input_released",
@@ -801,7 +811,10 @@ mod tests {
                 mic.feed_with_provenance(vec![0; 1280], 16000, provenance(true));
             }
             mic.feed_with_provenance(vec![12000; 1280], 16000, provenance(control_onset));
-            p.mic.lock().unwrap().insert("test".into(), mic);
+            p.mic
+                .lock()
+                .unwrap()
+                .insert("test".into(), Arc::new(Mutex::new(mic)));
             p.start_input("test");
             let states = p.states.lock().unwrap();
             let input = states["test"].input.as_ref().unwrap();
@@ -822,8 +835,8 @@ mod tests {
             drop(states);
             // The DSP still retains its complete pre-roll; admission does not
             // rewrite or delete source spans to obtain the desired permission.
-            let mut processors = p.mic.lock().unwrap();
-            let mic = processors.get_mut("test").unwrap();
+            let mic_arc = p.mic_arc("test").unwrap();
+            let mut mic = mic_arc.lock().unwrap();
             mic.feed_with_provenance(vec![12000; 1280], 16000, provenance(false));
             assert!(matches!(
                 mic.feed_with_provenance(vec![12000; 1280], 16000, provenance(false)),

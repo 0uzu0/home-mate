@@ -19,6 +19,7 @@ import {
   selected,
 } from '../stores/devices'
 import AppIcon from '../components/AppIcon.vue'
+import Pill from '../components/Pill.vue'
 import LoadingBlock from '../components/LoadingBlock.vue'
 import DeviceFreshnessNotice from '../components/DeviceFreshnessNotice.vue'
 import EmptyState from '../components/EmptyState.vue'
@@ -46,9 +47,14 @@ async function refreshAll(): Promise<void> {
         <h1 class="page__title">{{ t('interactionTitle') }}</h1>
         <p class="page__sub">{{ t('interactionSub') }}</p>
       </div>
-      <button type="button" class="btn" :disabled="loading" @click="refreshAll">
-        <AppIcon name="reload" :size="14" /> {{ loading ? t('loading') : t('refresh') }}
-      </button>
+      <div class="page__actions">
+        <Pill v-if="selected" size="sm" tone="accent" mono>
+          {{ t('scopeThisDevice', { device: selected.device }) }}
+        </Pill>
+        <button type="button" class="btn" :disabled="loading" @click="refreshAll">
+          <AppIcon name="reload" :size="14" /> {{ loading ? t('loading') : t('refresh') }}
+        </button>
+      </div>
     </header>
 
     <DeviceFreshnessNotice />
@@ -101,6 +107,13 @@ async function refreshAll(): Promise<void> {
   align-items: flex-end;
   justify-content: space-between;
   gap: var(--sp-3);
+  flex-wrap: wrap;
+}
+
+.page__actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
   flex-wrap: wrap;
 }
 

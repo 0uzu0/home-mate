@@ -58,8 +58,8 @@ pub(in crate::api) async fn diagnostics_get(State(state): State<Arc<AppState>>) 
 
     let mode = state.voice.mode_snapshot();
     let mut gateway = state.hub.snapshot();
-    let tail_blind_ms = state.voice.settings_snapshot().tail_blind_ms;
-    super::enrich_gateway_tail_mismatch(&mut gateway, tail_blind_ms);
+    let voice_settings = state.voice.settings_snapshot();
+    super::enrich_gateway_tail_mismatch(&mut gateway, &voice_settings);
     Json(json!({
         "services": services,
         "gateway": gateway,
@@ -78,6 +78,8 @@ pub(in crate::api) struct SelfCheckBody {
     /// synthesis, service probes). Still never an audible play.
     #[serde(default)]
     deep: bool,
+    #[serde(default)]
+    device: Option<String>,
 }
 
 /// R2-BM6: one-click self check. Passive by default (no outbound request, no
@@ -86,7 +88,9 @@ pub(in crate::api) async fn diagnostics_self_check(
     State(state): State<Arc<AppState>>,
     body: Option<Json<SelfCheckBody>>,
 ) -> Json<Value> {
-    let deep = body.map(|b| b.0.deep).unwrap_or(false);
+    let (deep, device) = body
+        .map(|b| (b.0.deep, b.0.device))
+        .unwrap_or((false, None));
     let input = crate::diagnostics::SelfCheckInput {
         config: &state.config,
         voice: &state.voice,
@@ -99,14 +103,54 @@ pub(in crate::api) async fn diagnostics_self_check(
         openapi: &state.openapi,
         search: &state.search,
     };
-    Json(crate::diagnostics::run(&input, deep).await)
+    Json(crate::diagnostics::run_for_device(&input, deep, device.as_deref()).await)
+}
+
+#[derive(Deserialize, Default)]
+pub(in crate::api) struct VoicePlayBody {
+    #[serde(default)]
+    device: Option<String>,
+}
+
+fn require_explicit_device_if_multi(
+    state: &AppState,
+    device: Option<&str>,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let explicit = device.map(str::trim).filter(|s| !s.is_empty());
+    if explicit.is_none() && state.hub.online_device_count() > 1 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "code": "DEVICE_REQUIRED",
+                "error": "DEVICE_REQUIRED: multiple devices are online; specify target device explicitly",
+            })),
+        ));
+    }
+    Ok(())
 }
 
 /// ACTIVE test: full voice-chain probe (audible on the device).
 pub(in crate::api) async fn diagnostics_voice_play(
     State(state): State<Arc<AppState>>,
-) -> Json<Value> {
-    Json(state.voice.diagnostic_voice_play().await)
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let device = if body.is_empty() {
+        None
+    } else {
+        serde_json::from_slice::<VoicePlayBody>(&body)
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": format!("body: {e}") })),
+                )
+            })?
+            .device
+    };
+    require_explicit_device_if_multi(&state, device.as_deref())?;
+    Ok(Json(
+        state.voice.diagnostic_voice_play(device.as_deref()).await,
+    ))
 }
 
 /// ACTIVE test: play a fixed audio asset from `<data_dir>/assets/`
@@ -122,12 +166,13 @@ pub(in crate::api) struct PlayAssetBody {
 pub(in crate::api) async fn diagnostics_play_asset(
     State(state): State<Arc<AppState>>,
     Json(body): Json<PlayAssetBody>,
-) -> Json<Value> {
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    require_explicit_device_if_multi(&state, body.device.as_deref())?;
     let channel = match body.channel.as_deref() {
         Some("media") => "media",
         _ => "voice",
     };
-    Json(
+    Ok(Json(
         state
             .voice
             .diagnostic_play_asset(
@@ -138,7 +183,7 @@ pub(in crate::api) async fn diagnostics_play_asset(
                 body.volume,
             )
             .await,
-    )
+    ))
 }
 
 /// Task B: ch8 playback-loopback self-check (DAC-side track vs ch8).
@@ -152,9 +197,10 @@ pub(in crate::api) struct LoopbackBody {
 pub(in crate::api) async fn diagnostics_playback_loopback(
     State(state): State<Arc<AppState>>,
     body: Option<Json<LoopbackBody>>,
-) -> Json<Value> {
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let (device, asset) = body.map(|b| (b.0.device, b.0.asset)).unwrap_or_default();
-    Json(
+    require_explicit_device_if_multi(&state, device.as_deref())?;
+    Ok(Json(
         state
             .voice
             .diagnostic_playback_loopback(
@@ -163,16 +209,17 @@ pub(in crate::api) async fn diagnostics_playback_loopback(
                 asset.as_deref(),
             )
             .await,
-    )
+    ))
 }
 
 /// Task C: 7-mic array measurement (per-mic level/SNR + arrival lags).
 pub(in crate::api) async fn diagnostics_mic_array(
     State(state): State<Arc<AppState>>,
     body: Option<Json<LoopbackBody>>,
-) -> Json<Value> {
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let (device, asset) = body.map(|b| (b.0.device, b.0.asset)).unwrap_or_default();
-    Json(
+    require_explicit_device_if_multi(&state, device.as_deref())?;
+    Ok(Json(
         state
             .voice
             .diagnostic_mic_array(
@@ -181,7 +228,7 @@ pub(in crate::api) async fn diagnostics_mic_array(
                 asset.as_deref(),
             )
             .await,
-    )
+    ))
 }
 
 /// REPAIR: re-send the persisted duplex request to one device.
@@ -547,15 +594,17 @@ pub(in crate::api) async fn reminders_add(
     let svc = crate::reminder::ReminderService::new(state.store.clone());
     let when = match (body.delay_minutes, body.hour, body.minute) {
         (Some(m), _, _) => crate::reminder::When::DelayMinutes(m),
-        (None, Some(h), Some(mi)) => crate::reminder::When::At {
+        (None, Some(h), mi) => crate::reminder::When::At {
             day_offset: body.day_offset,
             hour: h as u32,
-            minute: mi as u32,
+            minute: mi.unwrap_or(0) as u32,
         },
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "REMINDER_BAD_ARGS: 要给 delay_minutes，或 hour+minute" })),
+                Json(
+                    json!({ "error": "REMINDER_BAD_ARGS: 要给 delay_minutes，或 hour（可选 minute）" }),
+                ),
             ))
         }
     };
@@ -570,19 +619,35 @@ pub(in crate::api) async fn reminders_add(
             Json(json!({ "error": e.to_string() })),
         )
     })?;
+    require_explicit_device_if_multi(&state, body.device.as_deref())?;
     let device = body
         .device
-        .filter(|d| !d.trim().is_empty())
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map(str::to_string)
         .unwrap_or_else(|| {
-            state.hub.snapshot()["devices"]
-                .as_array()
-                .and_then(|a| {
-                    a.iter()
-                        .find(|d| d["online"].as_bool().unwrap_or(false))
-                        .and_then(|d| d["stable_id"].as_str())
+            state
+                .hub
+                .primary_audio_out()
+                .map(|d| d.stable_id)
+                .or_else(|| {
+                    state.hub.snapshot()["devices"]
+                        .as_array()
+                        .and_then(|a| {
+                            a.iter()
+                                .find(|d| d["online"].as_bool().unwrap_or(false))
+                                .and_then(|d| d["stable_id"].as_str())
+                        })
+                        .map(str::to_string)
                 })
-                .map(str::to_string)
-                .unwrap_or_else(|| "dot2-d".into())
+                .or_else(|| {
+                    std::env::var("HM_NODE_ID")
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                })
+                .unwrap_or_else(|| state.auth.core_id().to_string())
         });
     match svc.create(&device, due_ms, &body.note, crate::id::now_ms()) {
         Ok(r) => Ok(Json(serde_json::to_value(r).unwrap_or_else(|_| json!({})))),
@@ -854,8 +919,12 @@ pub(in crate::api) async fn working_memory_delete_by_key(
 
 pub(in crate::api) async fn working_memory_clear(
     State(state): State<Arc<AppState>>,
+    Query(q): Query<WorkingMemoryQuery>,
 ) -> Json<Value> {
-    match state.working_memory.clear() {
+    match state
+        .working_memory
+        .clear_scoped(q.scope_person.as_deref(), q.scope_device.as_deref())
+    {
         Ok(n) => Json(json!({ "state": "cleared", "deleted": n })),
         Err(e) => Json(json!({ "error": e })),
     }

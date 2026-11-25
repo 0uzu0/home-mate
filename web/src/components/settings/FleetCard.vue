@@ -30,7 +30,7 @@ import {
   type Status,
 } from '../../api'
 import { t } from '../../i18n'
-import { formatRelative, formatTime } from '../../format'
+import { formatRelative } from '../../format'
 import { useResource } from '../../hooks/useResource'
 import { useSave } from '../../hooks/useSave'
 import Panel from '../Panel.vue'

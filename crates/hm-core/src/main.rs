@@ -208,7 +208,6 @@ async fn main() {
     // Demo-scale failure injection via env (see scripts/verify_m1.py):
     //   HM_INJECT_HOTLIST_DELAY_MS=3000   — slow the chart tool down
     //   HM_INJECT_PLAY_FAIL=t01           — force play failures for a track
-    //   HM_INJECT_LIGHT_OFFLINE=1         — home backend "offline"
     let inject = MockInject {
         hotlist_delay_ms: std::env::var("HM_INJECT_HOTLIST_DELAY_MS")
             .ok()

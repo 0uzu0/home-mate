@@ -1,6 +1,45 @@
-use super::transport_metrics::{OutboundMetrics, OUTBOUND_CONTROL_CAP, OUTBOUND_PLAY_CAP};
+use super::transport_metrics::{
+    OutboundMetrics, OUTBOUND_CONTROL_CAP, OUTBOUND_PLAY_CAP, OUTBOUND_VOICE_CAP,
+};
 use super::*;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+/// Smoothed TCP RTT threshold (`50 ms`) above which a non-loopback gateway link
+/// (including Tailscale Subnet Router connections SNATed onto RFC1918 LAN) is
+/// treated as a constrained WAN/cellular path for media bitrate adaptation.
+/// Normal home LAN Wi-Fi sits at `1.5–15 ms` and always keeps native Hi-Fi.
+pub const CONSTRAINED_LINK_RTT_US: u32 = 50_000;
+
+/// Outbound media queue depth (`96` chunks = `3.84 s`, strictly above the
+/// `3.0 s` / `75`-chunk `REMOTE_PLAY_AHEAD_SECS` ceiling) proving the socket
+/// cannot sustain real-time `1.0x` media drain at native bitrate.
+pub const CONGESTED_MEDIA_QUEUE_CHUNKS: usize = 96;
+
+#[derive(Default)]
+pub(super) struct LinkHealth {
+    rtt_us: AtomicU32,
+    media_congested: AtomicBool,
+}
+
+impl LinkHealth {
+    pub(super) fn set_rtt_us(&self, rtt_us: u32) {
+        if rtt_us > 0 {
+            self.rtt_us.store(rtt_us, Ordering::Relaxed);
+        }
+    }
+
+    pub(super) fn rtt_us(&self) -> u32 {
+        self.rtt_us.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn mark_media_congested(&self) {
+        self.media_congested.store(true, Ordering::Relaxed);
+    }
+
+    pub(super) fn is_media_congested(&self) -> bool {
+        self.media_congested.load(Ordering::Relaxed)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum OutboundSendError {
@@ -8,16 +47,44 @@ pub(super) enum OutboundSendError {
     Closed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OutboundTier {
+    /// Highest priority: preemption and link-control frames (`Stop`, `MuteSet`,
+    /// `VolumeSet`, `HelloAck`, `TimeSet`, `ModeSet`, `MicSession`, `KwsDeploy`,
+    /// `AudioEq`, `LedConfig`, `WifiConfig`, `Config*`).
+    Control,
+    /// Second priority: low-latency voice TTS / `wake_ack` / filler / prompt
+    /// audio plus `AssistantState` presentation frames (kept ordered with voice
+    /// `PlayBegin` while never blocked behind bulk media PCM).
+    Voice,
+    /// Third priority: bulk media (`channel == "media"`) music/story/radio PCM.
+    Media,
+}
+
 #[derive(Clone)]
 pub(super) struct OutboundSender {
     control_tx: mpsc::Sender<CoreFrame>,
-    play_tx: mpsc::Sender<CoreFrame>,
+    voice_tx: mpsc::Sender<CoreFrame>,
+    media_tx: mpsc::Sender<CoreFrame>,
     metrics: Arc<OutboundMetrics>,
+    link_health: Arc<LinkHealth>,
 }
+
+/// Maximum time `OutboundReceiver` holds bulk `Media` frames in user space
+/// while a streaming `Voice` play (`PlayBegin`..`PlayEnd`/`Stop`) is actively
+/// transmitting chunks on the same connection (`#297`). Short TTS prompts
+/// ("正在播放...") finish streaming in ~350–600 ms and immediately release the
+/// yield on `PlayEnd`, while long monologues automatically release after 1.5 s
+/// so background media buffers never starve.
+pub(super) const VOICE_STREAM_MEDIA_YIELD_MAX: std::time::Duration =
+    std::time::Duration::from_millis(1_500);
 
 pub(super) struct OutboundReceiver {
     control_rx: mpsc::Receiver<CoreFrame>,
-    play_rx: mpsc::Receiver<CoreFrame>,
+    voice_rx: mpsc::Receiver<CoreFrame>,
+    media_rx: mpsc::Receiver<CoreFrame>,
+    active_voice_play: Option<String>,
+    voice_media_yield_until: Option<tokio::time::Instant>,
 }
 
 #[cfg(test)]
@@ -29,36 +96,62 @@ pub(super) fn outbound_channel_with_metrics(
     metrics: Arc<OutboundMetrics>,
 ) -> (OutboundSender, OutboundReceiver) {
     let (control_tx, control_rx) = mpsc::channel(OUTBOUND_CONTROL_CAP);
-    let (play_tx, play_rx) = mpsc::channel(OUTBOUND_PLAY_CAP);
+    let (voice_tx, voice_rx) = mpsc::channel(OUTBOUND_VOICE_CAP);
+    let (media_tx, media_rx) = mpsc::channel(OUTBOUND_PLAY_CAP);
     (
         OutboundSender {
             control_tx,
-            play_tx,
+            voice_tx,
+            media_tx,
             metrics,
+            link_health: Arc::new(LinkHealth::default()),
         },
         OutboundReceiver {
             control_rx,
-            play_rx,
+            voice_rx,
+            media_rx,
+            active_voice_play: None,
+            voice_media_yield_until: None,
         },
     )
 }
 
 impl OutboundSender {
-    /// Urgent preemption and link-control frames that must bypass a backed-up
-    /// audio chunk queue (`Stop`, `MuteSet`, `VolumeSet`, `HelloAck`, `TimeSet`).
-    /// Presentation frames (`AssistantState`) share the play FIFO queue so
-    /// `AssistantState { state: "speaking" }` never overtakes the `PlayBegin`
-    /// that triggered it.
-    fn is_priority_control_frame(frame: &CoreFrame) -> bool {
-        matches!(
-            frame,
+    pub(super) fn link_health(&self) -> Arc<LinkHealth> {
+        self.link_health.clone()
+    }
+
+    /// Classify a frame when the caller does not specify an explicit audio
+    /// channel tier (`PlayChunk`/`PlayEnd` callers that know the active play's
+    /// channel route directly through [`Self::send_tier`]).
+    fn default_tier_for(frame: &CoreFrame) -> OutboundTier {
+        match frame {
             CoreFrame::HelloAck { .. }
-                | CoreFrame::HelloReject { .. }
-                | CoreFrame::TimeSet { .. }
-                | CoreFrame::Stop { .. }
-                | CoreFrame::MuteSet { .. }
-                | CoreFrame::VolumeSet { .. }
-        )
+            | CoreFrame::HelloReject { .. }
+            | CoreFrame::TimeSet { .. }
+            | CoreFrame::Stop { .. }
+            | CoreFrame::MuteSet { .. }
+            | CoreFrame::VolumeSet { .. }
+            | CoreFrame::ModeSet { .. }
+            | CoreFrame::MicSession { .. }
+            | CoreFrame::KwsDeploy { .. }
+            | CoreFrame::AudioEq { .. }
+            | CoreFrame::LedConfig { .. }
+            | CoreFrame::WifiConfig { .. }
+            | CoreFrame::ConfigStateGet { .. }
+            | CoreFrame::ConfigValidate { .. }
+            | CoreFrame::ConfigApply { .. } => OutboundTier::Control,
+            CoreFrame::Play { channel, .. } | CoreFrame::PlayBegin { channel, .. }
+                if channel.as_deref() == Some("media") =>
+            {
+                OutboundTier::Media
+            }
+            CoreFrame::AssistantState { .. }
+            | CoreFrame::Play { .. }
+            | CoreFrame::PlayBegin { .. }
+            | CoreFrame::PlayChunk { .. }
+            | CoreFrame::PlayEnd { .. } => OutboundTier::Voice,
+        }
     }
 
     pub fn queued_control(&self) -> usize {
@@ -67,27 +160,30 @@ impl OutboundSender {
             .saturating_sub(self.control_tx.capacity())
     }
 
-    pub fn queued_play(&self) -> usize {
-        self.play_tx
+    pub fn queued_voice(&self) -> usize {
+        self.voice_tx
             .max_capacity()
-            .saturating_sub(self.play_tx.capacity())
+            .saturating_sub(self.voice_tx.capacity())
+    }
+
+    pub fn queued_media(&self) -> usize {
+        self.media_tx
+            .max_capacity()
+            .saturating_sub(self.media_tx.capacity())
+    }
+
+    pub fn queued_play(&self) -> usize {
+        self.queued_voice() + self.queued_media()
     }
 
     pub fn send(&self, frame: CoreFrame) -> Result<(), OutboundSendError> {
-        if !Self::is_priority_control_frame(&frame) {
-            match self.play_tx.try_send(frame) {
-                Ok(()) => {
-                    self.metrics.observe_play_depth(self.queued_play());
-                    Ok(())
-                }
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    self.metrics.play_dropped.fetch_add(1, Ordering::SeqCst);
-                    Err(OutboundSendError::Full("play"))
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => Err(OutboundSendError::Closed),
-            }
-        } else {
-            match self.control_tx.try_send(frame) {
+        let tier = Self::default_tier_for(&frame);
+        self.send_tier(tier, frame)
+    }
+
+    pub fn send_tier(&self, tier: OutboundTier, frame: CoreFrame) -> Result<(), OutboundSendError> {
+        match tier {
+            OutboundTier::Control => match self.control_tx.try_send(frame) {
                 Ok(()) => {
                     self.metrics.observe_control_depth(self.queued_control());
                     Ok(())
@@ -97,35 +193,184 @@ impl OutboundSender {
                     Err(OutboundSendError::Full("control"))
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => Err(OutboundSendError::Closed),
-            }
+            },
+            OutboundTier::Voice => match self.voice_tx.try_send(frame) {
+                Ok(()) => {
+                    self.metrics.observe_voice_depth(self.queued_voice());
+                    self.metrics.observe_play_depth(self.queued_play());
+                    Ok(())
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    self.metrics.voice_dropped.fetch_add(1, Ordering::SeqCst);
+                    Err(OutboundSendError::Full("voice"))
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => Err(OutboundSendError::Closed),
+            },
+            OutboundTier::Media => match self.media_tx.try_send(frame) {
+                Ok(()) => {
+                    let media_depth = self.queued_media();
+                    if media_depth >= CONGESTED_MEDIA_QUEUE_CHUNKS {
+                        self.link_health.mark_media_congested();
+                    }
+                    self.metrics
+                        .observe_play_depth(self.queued_voice() + media_depth);
+                    Ok(())
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    self.link_health.mark_media_congested();
+                    self.metrics.play_dropped.fetch_add(1, Ordering::SeqCst);
+                    Err(OutboundSendError::Full("play"))
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => Err(OutboundSendError::Closed),
+            },
         }
     }
 }
 
 impl OutboundReceiver {
-    pub async fn recv(&mut self) -> Option<CoreFrame> {
-        tokio::select! {
-            biased;
-            ctrl = self.control_rx.recv() => match ctrl {
-                Some(f) => Some(f),
-                None => self.play_rx.recv().await,
-            },
-            play = self.play_rx.recv() => match play {
-                Some(f) => Some(f),
-                None => self.control_rx.recv().await,
-            },
+    fn observe_emitted(&mut self, frame: &CoreFrame) {
+        match frame {
+            CoreFrame::PlayBegin {
+                task_id, channel, ..
+            } if channel.as_deref() != Some("media") => {
+                self.active_voice_play = Some(task_id.clone());
+                self.voice_media_yield_until =
+                    Some(tokio::time::Instant::now() + VOICE_STREAM_MEDIA_YIELD_MAX);
+            }
+            CoreFrame::PlayEnd { task_id } | CoreFrame::Stop { task_id, .. }
+                if self.active_voice_play.as_deref() == Some(task_id.as_str()) =>
+            {
+                self.active_voice_play = None;
+                self.voice_media_yield_until = None;
+            }
+            _ => {}
         }
     }
 
-    #[cfg(test)]
+    fn media_yield_deadline(&mut self) -> Option<tokio::time::Instant> {
+        let deadline = self.voice_media_yield_until?;
+        if tokio::time::Instant::now() < deadline {
+            Some(deadline)
+        } else {
+            self.active_voice_play = None;
+            self.voice_media_yield_until = None;
+            None
+        }
+    }
+
+    pub async fn recv(&mut self) -> Option<CoreFrame> {
+        if let Ok(f) = self.control_rx.try_recv() {
+            self.observe_emitted(&f);
+            return Some(f);
+        }
+        if let Ok(f) = self.voice_rx.try_recv() {
+            self.observe_emitted(&f);
+            return Some(f);
+        }
+        if self.media_yield_deadline().is_none() {
+            if let Ok(f) = self.media_rx.try_recv() {
+                self.observe_emitted(&f);
+                return Some(f);
+            }
+        }
+        let mut ctrl_open = true;
+        let mut voice_open = true;
+        let mut media_open = true;
+        while ctrl_open || voice_open || media_open {
+            if !ctrl_open && !voice_open {
+                // No further control/voice frames can ever arrive; flush
+                // remaining media immediately instead of waiting for yield TTL.
+                self.active_voice_play = None;
+                self.voice_media_yield_until = None;
+            }
+            let yield_deadline = if media_open {
+                self.media_yield_deadline()
+            } else {
+                None
+            };
+            let poll_media = media_open && yield_deadline.is_none();
+            let sleep_yield = async {
+                match yield_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::select! {
+                biased;
+                res = self.control_rx.recv(), if ctrl_open => match res {
+                    Some(f) => {
+                        self.observe_emitted(&f);
+                        return Some(f);
+                    }
+                    None => ctrl_open = false,
+                },
+                res = self.voice_rx.recv(), if voice_open => match res {
+                    Some(f) => {
+                        self.observe_emitted(&f);
+                        return Some(f);
+                    }
+                    None => voice_open = false,
+                },
+                res = self.media_rx.recv(), if poll_media => match res {
+                    Some(f) => {
+                        self.observe_emitted(&f);
+                        return Some(f);
+                    }
+                    None => media_open = false,
+                },
+                _ = sleep_yield, if yield_deadline.is_some() => {
+                    self.active_voice_play = None;
+                    self.voice_media_yield_until = None;
+                }
+            }
+        }
+        None
+    }
+
     pub fn try_recv(&mut self) -> Result<CoreFrame, mpsc::error::TryRecvError> {
+        let mut saw_empty = false;
+        let mut higher_open = false;
         match self.control_rx.try_recv() {
-            Ok(f) => Ok(f),
-            Err(mpsc::error::TryRecvError::Empty) => self.play_rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Disconnected) => match self.play_rx.try_recv() {
-                Ok(f) => Ok(f),
-                Err(e) => Err(e),
-            },
+            Ok(f) => {
+                self.observe_emitted(&f);
+                return Ok(f);
+            }
+            Err(mpsc::error::TryRecvError::Empty) => {
+                saw_empty = true;
+                higher_open = true;
+            }
+            Err(mpsc::error::TryRecvError::Disconnected) => {}
+        }
+        match self.voice_rx.try_recv() {
+            Ok(f) => {
+                self.observe_emitted(&f);
+                return Ok(f);
+            }
+            Err(mpsc::error::TryRecvError::Empty) => {
+                saw_empty = true;
+                higher_open = true;
+            }
+            Err(mpsc::error::TryRecvError::Disconnected) => {}
+        }
+        if !higher_open {
+            self.active_voice_play = None;
+            self.voice_media_yield_until = None;
+        }
+        if self.media_yield_deadline().is_some() {
+            return Err(mpsc::error::TryRecvError::Empty);
+        }
+        match self.media_rx.try_recv() {
+            Ok(f) => {
+                self.observe_emitted(&f);
+                return Ok(f);
+            }
+            Err(mpsc::error::TryRecvError::Empty) => saw_empty = true,
+            Err(mpsc::error::TryRecvError::Disconnected) => {}
+        }
+        if saw_empty {
+            Err(mpsc::error::TryRecvError::Empty)
+        } else {
+            Err(mpsc::error::TryRecvError::Disconnected)
         }
     }
 }
@@ -169,7 +414,17 @@ impl DeviceHub {
     }
 
     fn send_via_outbound(&self, tx: &OutboundSender, frame: CoreFrame) -> Result<(), String> {
-        match tx.send(frame) {
+        let tier = OutboundSender::default_tier_for(&frame);
+        self.send_via_outbound_tier(tx, tier, frame)
+    }
+
+    fn send_via_outbound_tier(
+        &self,
+        tx: &OutboundSender,
+        tier: OutboundTier,
+        frame: CoreFrame,
+    ) -> Result<(), String> {
+        match tx.send_tier(tier, frame) {
             Ok(()) => Ok(()),
             Err(OutboundSendError::Full(tier)) => {
                 let mut st = self.lock_state();
@@ -178,8 +433,11 @@ impl DeviceHub {
                     json!({
                         "tier": tier,
                         "control_queued": tx.queued_control(),
+                        "voice_queued": tx.queued_voice(),
+                        "media_queued": tx.queued_media(),
                         "play_queued": tx.queued_play(),
                         "control_dropped": self.transport_tasks.outbound.control_dropped.load(Ordering::SeqCst),
+                        "voice_dropped": self.transport_tasks.outbound.voice_dropped.load(Ordering::SeqCst),
                         "play_dropped": self.transport_tasks.outbound.play_dropped.load(Ordering::SeqCst),
                     }),
                 );
@@ -198,20 +456,29 @@ impl DeviceHub {
     }
 
     pub(super) fn send_to_play(&self, play_id: &str, frame: CoreFrame) -> Result<(), String> {
-        let tx = {
+        let (tx, tier) = {
             let st = self.lock_state();
             if let Some(play) = st.active_plays.get(play_id) {
-                st.connections
+                let tx = st
+                    .connections
                     .get(&play.generation)
                     .map(|c| c.outbound.clone())
-                    .ok_or_else(|| "gateway connection closed".to_string())?
+                    .ok_or_else(|| "gateway connection closed".to_string())?;
+                let tier = if matches!(frame, CoreFrame::Stop { .. }) {
+                    OutboundTier::Control
+                } else if play.channel == "media" {
+                    OutboundTier::Media
+                } else {
+                    OutboundTier::Voice
+                };
+                (tx, tier)
             } else if st.connections.is_empty() {
                 return Err("no gateway connected".into());
             } else {
                 return Err(format!("no active gateway for play '{play_id}'"));
             }
         };
-        self.send_via_outbound(&tx, frame)
+        self.send_via_outbound_tier(&tx, tier, frame)
     }
 
     pub(super) fn device_generation(st: &HubState, device: &str) -> u64 {
@@ -334,14 +601,47 @@ impl DeviceHub {
         )
     }
 
-    /// Update the media trim (dB, ≤0). Called on startup and on every
-    /// accepted PUT /mode so a saved value takes effect without a restart.
+    /// Update the node-default media trim (dB, ≤0). Called on startup and on
+    /// global/single-device PUT /mode so a saved value takes effect without restart.
     pub fn set_media_trim_db(&self, db: f64) {
         *crate::lock_or_recover(&self.media_trim_db, "hub.media_trim_db") = db.clamp(-12.0, 0.0);
     }
 
+    /// Update a specific device's media trim override (dB, ≤0) without
+    /// altering other gateways connected to the same Core.
+    pub fn set_device_media_trim_db(&self, device: &str, db: f64) {
+        crate::lock_or_recover(&self.media_trim_by_device, "hub.media_trim_by_device")
+            .insert(device.to_string(), db.clamp(-12.0, 0.0));
+    }
+
+    /// Replace both default and per-device media trim values atomically.
+    pub fn set_media_trim_map(&self, default_db: f64, by_device: HashMap<String, f64>) {
+        *crate::lock_or_recover(&self.media_trim_db, "hub.media_trim_db") =
+            default_db.clamp(-12.0, 0.0);
+        let mut map =
+            crate::lock_or_recover(&self.media_trim_by_device, "hub.media_trim_by_device");
+        map.clear();
+        for (dev, db) in by_device {
+            map.insert(dev, db.clamp(-12.0, 0.0));
+        }
+    }
+
     pub fn media_trim_db(&self) -> f64 {
         *crate::lock_or_recover(&self.media_trim_db, "hub.media_trim_db")
+    }
+
+    pub fn media_trim_db_for(&self, device: &str) -> f64 {
+        if let Some(&db) =
+            crate::lock_or_recover(&self.media_trim_by_device, "hub.media_trim_by_device")
+                .get(device)
+        {
+            return db;
+        }
+        self.media_trim_db()
+    }
+
+    pub fn known_device_count(&self) -> usize {
+        self.lock_state().devices.len()
     }
 
     pub fn play(&self, req: PlayRequest) -> Result<PlayTicket, String> {
@@ -368,10 +668,15 @@ impl DeviceHub {
             (generation, outbound)
         };
         let _ = generation;
+        let audio_tier = if req.channel == "media" {
+            OutboundTier::Media
+        } else {
+            OutboundTier::Voice
+        };
         if let Some(wav) = req.audio {
             use base64::Engine;
             let wav = if req.channel == "media" {
-                let db = self.media_trim_db();
+                let db = self.media_trim_db_for(&req.device);
                 if db < 0.0 {
                     crate::speech::wav_gain_db(&wav, db)
                 } else {
@@ -388,7 +693,17 @@ impl DeviceHub {
                     wav.as_slice(),
                 ),
             };
-            let cleanup = || {
+            let cleanup = |begin_queued: bool| {
+                if begin_queued {
+                    let _ = self.send_via_outbound_tier(
+                        &outbound,
+                        OutboundTier::Control,
+                        CoreFrame::Stop {
+                            task_id: play_id.clone(),
+                            flush: true,
+                        },
+                    );
+                }
                 let mut st = self.lock_state();
                 st.pending.remove(&play_id);
                 st.active_plays.remove(&play_id);
@@ -407,8 +722,8 @@ impl DeviceHub {
                 text: req.text,
                 barge_in: Some("stop_current".into()),
             };
-            if let Err(e) = self.send_via_outbound(&outbound, begin) {
-                cleanup();
+            if let Err(e) = self.send_via_outbound_tier(&outbound, audio_tier, begin) {
+                cleanup(false);
                 return Err(e);
             }
             let frame_bytes = (channels.max(1) as usize) * 2;
@@ -419,18 +734,19 @@ impl DeviceHub {
                     seq: seq as u64,
                     audio_b64: base64::engine::general_purpose::STANDARD.encode(chunk),
                 };
-                if let Err(e) = self.send_via_outbound(&outbound, frame) {
-                    cleanup();
+                if let Err(e) = self.send_via_outbound_tier(&outbound, audio_tier, frame) {
+                    cleanup(true);
                     return Err(e);
                 }
             }
-            if let Err(e) = self.send_via_outbound(
+            if let Err(e) = self.send_via_outbound_tier(
                 &outbound,
+                audio_tier,
                 CoreFrame::PlayEnd {
                     task_id: play_id.clone(),
                 },
             ) {
-                cleanup();
+                cleanup(true);
                 return Err(e);
             }
             return Ok(PlayTicket {
@@ -449,7 +765,7 @@ impl DeviceHub {
             simulated_ms: req.simulated_ms,
             barge_in: Some("stop_current".into()),
         };
-        if let Err(e) = self.send_via_outbound(&outbound, frame) {
+        if let Err(e) = self.send_via_outbound_tier(&outbound, audio_tier, frame) {
             let mut st = self.lock_state();
             st.pending.remove(&play_id);
             st.active_plays.remove(&play_id);
@@ -536,7 +852,12 @@ impl DeviceHub {
             text,
             barge_in: Some("stop_current".into()),
         };
-        if let Err(e) = self.send_via_outbound(&outbound, frame) {
+        let audio_tier = if channel == "media" {
+            OutboundTier::Media
+        } else {
+            OutboundTier::Voice
+        };
+        if let Err(e) = self.send_via_outbound_tier(&outbound, audio_tier, frame) {
             let mut st = self.lock_state();
             st.pending.remove(&play_id);
             st.active_plays.remove(&play_id);
@@ -670,15 +991,83 @@ impl DeviceHub {
         self.lock_state().devices.contains_key(device)
     }
 
+    /// True when `device` is an Android mobile/panel gateway (detected from its
+    /// announced `audio_profile`, `model`, `profile_version`, or owning `gateway`
+    /// name, falling back to the `android-` stable_id prefix).
+    pub fn is_android_device(&self, device: &str) -> bool {
+        let st = self.lock_state();
+        if let Some(slot) = st.devices.get(device) {
+            let profile = slot.descriptor.audio_profile.to_ascii_lowercase();
+            if profile.starts_with("android_") || profile == "android" {
+                return true;
+            }
+            if slot
+                .descriptor
+                .model
+                .to_ascii_lowercase()
+                .contains("android")
+            {
+                return true;
+            }
+            if Self::is_mobile_profile_version(slot.profile_version.as_deref()) {
+                return true;
+            }
+            if let Some(conn) = st.connections.get(&slot.generation) {
+                if conn.gateway.to_ascii_lowercase().contains("android") {
+                    return true;
+                }
+            }
+        }
+        device.to_ascii_lowercase().starts_with("android-")
+    }
+
+    /// True when `device` is a Xiaomi AI Speaker Pro (`LX06`) gateway (detected
+    /// from its announced `model`, `audio_profile`, or owning `gateway` name,
+    /// falling back to the `lx06` stable_id prefix).
+    pub fn is_lx06_device(&self, device: &str) -> bool {
+        let st = self.lock_state();
+        if let Some(slot) = st.devices.get(device) {
+            if slot.descriptor.model.eq_ignore_ascii_case("lx06") {
+                return true;
+            }
+            let profile = slot.descriptor.audio_profile.to_ascii_lowercase();
+            if profile.starts_with("lx06_") || profile == "lx06" {
+                return true;
+            }
+            if let Some(conn) = st.connections.get(&slot.generation) {
+                if conn.gateway.to_ascii_lowercase().contains("lx06") {
+                    return true;
+                }
+            }
+        }
+        let lower = device.to_ascii_lowercase();
+        lower == "lx06" || lower.starts_with("lx06-") || lower.starts_with("lx06_")
+    }
+
+    /// Classify `device` into its hardware KWS sensitivity family.
+    pub fn kws_device_class(&self, device: &str) -> crate::voice::DeviceKwsClass {
+        if self.is_android_device(device) {
+            crate::voice::DeviceKwsClass::Android
+        } else if self.is_lx06_device(device) {
+            crate::voice::DeviceKwsClass::Lx06
+        } else {
+            crate::voice::DeviceKwsClass::Standard
+        }
+    }
+
     pub fn stop(&self, play_id: &str) -> Result<(), String> {
         self.lock_state().stop_sent.insert(play_id.to_string());
-        self.send_to_play(
+        let res = self.send_to_play(
             play_id,
             CoreFrame::Stop {
                 task_id: play_id.into(),
                 flush: true,
             },
-        )
+        );
+        if res.is_err() {
+            self.lock_state().stop_sent.remove(play_id);
+        }
+        res
     }
 
     /// Register before enqueueing, atomically bound to the play's connection
@@ -934,15 +1323,304 @@ impl DeviceHub {
     /// Every online device with audio_out, sorted — the tone is a device
     /// property, so a push goes to all of them.
     pub fn audio_out_devices(&self) -> Vec<String> {
-        let st = self.lock_state();
-        let mut devs: Vec<String> = st
+        self.devices_with_cap("audio_out")
+    }
+
+    /// Count of currently online devices across all live gateway connections.
+    pub fn online_device_count(&self) -> usize {
+        self.lock_state()
             .devices
             .values()
-            .filter(|d| d.online && d.descriptor.capabilities.iter().any(|c| c == "audio_out"))
-            .map(|d| d.descriptor.stable_id.clone())
+            .filter(|d| d.online)
+            .count()
+    }
+
+    /// True if `profile_version` identifies a portable/mobile gateway that sits
+    /// outside the fixed household speaker acoustic domain (e.g. `"android-v2"`).
+    pub fn is_mobile_profile_version(pv: Option<&str>) -> bool {
+        pv.map(str::trim).is_some_and(|v| {
+            v.eq_ignore_ascii_case("android-v2") || v.to_ascii_lowercase().starts_with("android-")
+        })
+    }
+
+    /// True when `device` is served over a local loopback connection (or a
+    /// synthetic test connection without `peer_addr`), false for remote LAN /
+    /// Tailscale gateways.
+    pub fn device_is_loopback(&self, device: &str) -> bool {
+        let st = self.lock_state();
+        if let Some(conn) = st
+            .device_to_conn
+            .get(device)
+            .and_then(|id| st.connections.get(id))
+            .or_else(|| {
+                st.devices
+                    .get(device)
+                    .and_then(|d| st.connections.get(&d.generation))
+            })
+        {
+            return conn
+                .peer_addr
+                .is_none_or(|p| crate::net::is_loopback_ip(p.ip()));
+        }
+        if let Some(slot) = st.devices.get(device) {
+            if slot.reserved_loopback {
+                return true;
+            }
+            if !st.connections.is_empty() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// True when `device` is connected over a constrained WAN / VPN / cellular
+    /// path where `<= 24 kHz` media decimation prevents TCP congestion underruns,
+    /// while returning `false` for both local loopback speakers AND low-RTT home
+    /// LAN Wi-Fi gateways so everyday LAN listening keeps native `44.1 / 48 kHz` Hi-Fi.
+    pub fn device_prefers_compact_media(&self, device: &str) -> bool {
+        let st = self.lock_state();
+        let Some(conn) = st
+            .device_to_conn
+            .get(device)
+            .and_then(|id| st.connections.get(id))
+            .or_else(|| {
+                st.devices
+                    .get(device)
+                    .and_then(|d| st.connections.get(&d.generation))
+            })
+        else {
+            return false;
+        };
+        let Some(peer) = conn.peer_addr else {
+            return false;
+        };
+        let ip = peer.ip();
+        if crate::net::is_loopback_ip(ip) {
+            return false;
+        }
+        if crate::net::is_cgnat_vpn_ip(ip) || !crate::net::is_private_lan_ip(ip) {
+            return true;
+        }
+        let health = conn.outbound.link_health();
+        health.rtt_us() >= CONSTRAINED_LINK_RTT_US || health.is_media_congested()
+    }
+
+    /// Current user-space `media_tx` queue depth (frames) for `device`'s owning
+    /// gateway connection (`0` if disconnected). Used by `MusicRuntime::pump`
+    /// to avoid piling hundreds of media chunks behind a stalled remote socket.
+    pub fn device_media_queue_depth(&self, device: &str) -> usize {
+        let st = self.lock_state();
+        st.device_to_conn
+            .get(device)
+            .and_then(|id| st.connections.get(id))
+            .or_else(|| {
+                st.devices
+                    .get(device)
+                    .and_then(|d| st.connections.get(&d.generation))
+            })
+            .map(|c| c.outbound.queued_media())
+            .unwrap_or(0)
+    }
+
+    /// Latch `media_congested` on `device`'s owning gateway connection when
+    /// sustained backpressure proves the link cannot sustain native bitrate.
+    pub fn mark_device_media_congested(&self, device: &str) {
+        let st = self.lock_state();
+        if let Some(conn) = st
+            .device_to_conn
+            .get(device)
+            .and_then(|id| st.connections.get(id))
+            .or_else(|| {
+                st.devices
+                    .get(device)
+                    .and_then(|d| st.connections.get(&d.generation))
+            })
+        {
+            conn.outbound.link_health().mark_media_congested();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_device_link_rtt_us_for_test(&self, device: &str, rtt_us: u32) {
+        let st = self.lock_state();
+        if let Some(conn) = st
+            .device_to_conn
+            .get(device)
+            .and_then(|id| st.connections.get(id))
+        {
+            conn.outbound.link_health().set_rtt_us(rtt_us);
+        }
+    }
+
+    /// True when `device` is a local loopback-bound speaker (either currently
+    /// connected on loopback or persistently reserved for loopback). Unauthenticated
+    /// `lan_gateway_exempt` LAN clients must NEVER access or mutate these devices.
+    pub fn device_is_loopback_protected(&self, device: &str) -> bool {
+        let st = self.lock_state();
+        if st.devices.get(device).is_some_and(|s| s.reserved_loopback) {
+            return true;
+        }
+        st.device_to_conn
+            .get(device)
+            .and_then(|id| st.connections.get(id))
+            .or_else(|| {
+                st.devices
+                    .get(device)
+                    .and_then(|d| st.connections.get(&d.generation))
+            })
+            .is_some_and(HubState::conn_is_loopback)
+    }
+
+    /// True when `device` is served by a non-loopback, unauthenticated gateway
+    /// connection (e.g., admitted via `lan_gateway_exempt = true` without a
+    /// household Bearer token). Authenticated or loopback gateways return `false`.
+    pub fn is_device_lan_exempt(&self, device: &str) -> bool {
+        let st = self.lock_state();
+        if let Some(conn) = st
+            .device_to_conn
+            .get(device)
+            .and_then(|id| st.connections.get(id))
+            .or_else(|| {
+                st.devices
+                    .get(device)
+                    .and_then(|d| st.connections.get(&d.generation))
+            })
+        {
+            return conn.peer_addr.is_some()
+                && !HubState::conn_is_loopback(conn)
+                && !conn.authenticated;
+        }
+        if let Some(slot) = st.devices.get(device) {
+            return !slot.reserved_loopback && !slot.reserved_authenticated && slot.last_unauth_lan;
+        }
+        false
+    }
+
+    /// True ONLY when `device` is registered on this hub as a known non-loopback
+    /// LAN device (`!reserved_loopback` and not served over loopback). Tools
+    /// running under unauthenticated `lan_gateway_exempt` chat use this to fail
+    /// closed on unknown/offline devices (e.g. an offline loopback speaker looked
+    /// up by room name in `device_meta` before its local gateway reconnects).
+    pub fn device_is_known_lan_device(&self, device: &str) -> bool {
+        let st = self.lock_state();
+        let Some(slot) = st.devices.get(device) else {
+            return false;
+        };
+        if slot.reserved_loopback {
+            return false;
+        }
+        !st.device_to_conn
+            .get(device)
+            .and_then(|id| st.connections.get(id))
+            .or_else(|| st.connections.get(&slot.generation))
+            .is_some_and(HubState::conn_is_loopback)
+    }
+
+    /// All known device ids that are loopback-protected (either persistently
+    /// reserved for loopback or currently served on a loopback connection).
+    pub fn loopback_protected_devices(&self) -> Vec<String> {
+        let st = self.lock_state();
+        st.devices
+            .iter()
+            .filter(|(id, slot)| {
+                slot.reserved_loopback
+                    || st
+                        .device_to_conn
+                        .get(*id)
+                        .and_then(|cid| st.connections.get(cid))
+                        .or_else(|| st.connections.get(&slot.generation))
+                        .is_some_and(HubState::conn_is_loopback)
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// True when `device` participates in the fixed household speaker acoustic
+    /// domain (loopback speakers, synthetic test devices without `peer_addr`,
+    /// and non-mobile fixed gateways). Non-loopback mobile gateways such as
+    /// `"android-v2"` are acoustically isolated from household arbitration,
+    /// passive presence, sovereignty playback notices, and foreign cues.
+    pub fn device_in_household_acoustic_domain(&self, device: &str) -> bool {
+        let st = self.lock_state();
+        Self::slot_in_household_acoustic_domain(&st, device)
+    }
+
+    fn slot_in_household_acoustic_domain(st: &HubState, device: &str) -> bool {
+        let conn = st
+            .device_to_conn
+            .get(device)
+            .and_then(|id| st.connections.get(id))
+            .or_else(|| {
+                st.devices
+                    .get(device)
+                    .and_then(|d| st.connections.get(&d.generation))
+            });
+        let is_loopback = match conn {
+            Some(c) => c.peer_addr.is_none_or(|p| p.ip().is_loopback()),
+            None => st
+                .devices
+                .get(device)
+                .map(|s| s.reserved_loopback || st.connections.is_empty())
+                .unwrap_or(true),
+        };
+        if is_loopback {
+            return true;
+        }
+        let pv = st
+            .devices
+            .get(device)
+            .and_then(|s| s.profile_version.as_deref());
+        !Self::is_mobile_profile_version(pv)
+    }
+
+    /// Count of online devices belonging to the household acoustic domain.
+    pub fn online_household_acoustic_device_count(&self) -> usize {
+        let st = self.lock_state();
+        st.devices
+            .iter()
+            .filter(|(id, d)| d.online && Self::slot_in_household_acoustic_domain(&st, id))
+            .count()
+    }
+
+    /// Resolve an implicit default `audio_out` device when the caller did not
+    /// specify a target device. Fails closed when multiple devices are online so
+    /// unbound headless callers never silently blast `dot2-d` (`MG-P0-01`).
+    pub fn resolve_default_audio_out(&self) -> Result<Option<HelloDevice>, String> {
+        let st = self.lock_state();
+        let online_count = st.devices.values().filter(|d| d.online).count();
+        if online_count > 1 {
+            return Err("multiple devices are online; specify target device explicitly".into());
+        }
+        drop(st);
+        Ok(self.primary_audio_out())
+    }
+
+    /// Whether `device` is currently online and advertises `cap`.
+    pub fn device_online_with_cap(&self, device: &str, cap: &str) -> bool {
+        let st = self.lock_state();
+        st.devices
+            .get(device)
+            .is_some_and(|d| d.online && d.descriptor.capabilities.iter().any(|c| c == cap))
+    }
+
+    /// Every online device advertising `cap`, preferring loopback speaker gateways
+    /// first and then `stable_id`.
+    pub fn devices_with_cap(&self, cap: &str) -> Vec<String> {
+        let st = self.lock_state();
+        let mut devs: Vec<(bool, String)> = st
+            .devices
+            .values()
+            .filter(|d| d.online && d.descriptor.capabilities.iter().any(|c| c == cap))
+            .map(|d| {
+                let is_loopback = st
+                    .connections
+                    .get(&d.generation)
+                    .is_some_and(HubState::conn_is_loopback);
+                (is_loopback, d.descriptor.stable_id.clone())
+            })
             .collect();
-        devs.sort();
-        devs
+        devs.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        devs.into_iter().map(|(_, id)| id).collect()
     }
 
     /// The hub's arrival sequence right now. A management command captures
@@ -1038,15 +1716,17 @@ impl DeviceHub {
                 })
             })
             .collect();
-        let (control_queued, play_queued) =
+        let (control_queued, voice_queued, media_queued) =
             st.connections
                 .values()
-                .fold((0usize, 0usize), |(c, p), conn| {
+                .fold((0usize, 0usize, 0usize), |(c, v, m), conn| {
                     (
                         c + conn.outbound.queued_control(),
-                        p + conn.outbound.queued_play(),
+                        v + conn.outbound.queued_voice(),
+                        m + conn.outbound.queued_media(),
                     )
                 });
+        let play_queued = voice_queued + media_queued;
         json!({
             "connected": !st.connections.is_empty(),
             "multi_gateway": true,
@@ -1072,14 +1752,20 @@ impl DeviceHub {
             "pending_stop_waiters": st.stop_waiters.values().map(Vec::len).sum::<usize>(),
             "pending_wifi": st.pending_wifi.len(),
             "pending_volume": st.volume_pending.len(),
+            "pending_volume_gen": st.volume_pending_gen.len(),
             "outbound_queue": {
                 "control_capacity": OUTBOUND_CONTROL_CAP,
+                "voice_capacity": OUTBOUND_VOICE_CAP,
                 "play_capacity": OUTBOUND_PLAY_CAP,
                 "control_queued": control_queued,
+                "voice_queued": voice_queued,
+                "media_queued": media_queued,
                 "play_queued": play_queued,
                 "control_high_water": self.transport_tasks.outbound.control_high_water.load(Ordering::SeqCst),
+                "voice_high_water": self.transport_tasks.outbound.voice_high_water.load(Ordering::SeqCst),
                 "play_high_water": self.transport_tasks.outbound.play_high_water.load(Ordering::SeqCst),
                 "control_dropped": self.transport_tasks.outbound.control_dropped.load(Ordering::SeqCst),
+                "voice_dropped": self.transport_tasks.outbound.voice_dropped.load(Ordering::SeqCst),
                 "play_dropped": self.transport_tasks.outbound.play_dropped.load(Ordering::SeqCst),
             },
             "transport_tasks": self.transport_tasks.snapshot(),

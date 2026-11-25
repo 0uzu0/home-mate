@@ -53,6 +53,7 @@ export default {
   setupVerifySend: '发送测试语句',
   setupVerifySending: '等待回复…',
   setupVerifyReplyLabel: '助手回复：',
+  setupVerifyFailed: '对话模型验证失败，未能收到有效回复。',
   wifiProvisioningBannerTitle: '设备请求配网（Mute 长按触发）',
   wifiProvisioningBannerHint: '设备 {device} 通过长按静音键发起了配网请求（不会重置配置）。请在下方或向导中完成 WiFi 设置。',
   wifiProvisioningGoSetup: '前往配网向导',

@@ -14,6 +14,7 @@ withDefaults(
     autocomplete?: string
     list?: string
     wide?: boolean
+    mono?: boolean
   }>(),
   {
     hint: '',
@@ -24,6 +25,7 @@ withDefaults(
     autocomplete: 'off',
     list: undefined,
     wide: false,
+    mono: false,
   },
 )
 
@@ -41,7 +43,7 @@ const id = useId()
     <input
       :id="id"
       class="text__input"
-      :class="{ 'text__input--wide': wide }"
+      :class="{ 'text__input--wide': wide, mono }"
       :type="type"
       :value="modelValue"
       :placeholder="placeholder"

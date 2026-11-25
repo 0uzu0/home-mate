@@ -423,11 +423,19 @@ fn contains_action_verb(s: &str, verb: &str) -> bool {
 /// providers only send the terminal content). Returns the text to speak and
 /// how many sentences were suppressed.
 pub fn sanitize_whole(text: &str, has_fact: bool) -> (String, usize) {
+    sanitize_whole_with_prose(text, has_fact, false)
+}
+
+pub fn sanitize_whole_with_prose(
+    text: &str,
+    has_fact: bool,
+    allow_followup_prose: bool,
+) -> (String, usize) {
     let mut out = String::new();
     let mut suppressed = 0;
     let mut refusal_sent = false;
     let sentences = split_sentences(text);
-    if has_fact {
+    if has_fact && !allow_followup_prose {
         // Same enforced boundary as the streaming gate: the core owns the
         // action sentences, so no model prose is kept.
         return (String::new(), sentences.len());

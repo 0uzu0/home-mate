@@ -6,10 +6,11 @@
  * details strictly behind advancedMode), spoken length/detail controls +
  * truncation notice, and waiting filler phrases.
  */
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import {
   getReflex,
   getReflexTokens,
+  putGlobalMode,
   putMode,
   putReflex,
   type FillerMode,
@@ -24,6 +25,7 @@ import { useResource } from '../../hooks/useResource'
 import { usePoll } from '../../hooks/usePoll'
 import { advancedMode } from '../../stores/advanced'
 import Panel from '../Panel.vue'
+import Pill from '../Pill.vue'
 import Toggle from '../Toggle.vue'
 import TextInput from '../TextInput.vue'
 import Select from '../Select.vue'
@@ -45,14 +47,17 @@ const props = defineProps<{
 const reflex = useResource((signal) => getReflex({ signal }), { timeoutMs: 6000, retries: 1 })
 usePoll(() => reflex.load(), 15000)
 
+interface ReflexWordRow extends ReflexWord {
+  autoTokens: boolean
+}
+
 const keywordInterrupt = ref(true)
-const reflexWords = ref<ReflexWord[] | null>(null)
+const reflexWords = ref<ReflexWordRow[] | null>(null)
 const stopEnabled = ref(true)
 const stopWords = ref<string[]>([])
 const continueWords = ref<string[]>([])
 const tokenError = ref('')
 const interruptTouched = ref(false)
-const autoTokens = ref<Set<number>>(new Set())
 let tokenTimer: number | null = null
 
 const {
@@ -110,18 +115,20 @@ const intentOptions = computed(() => [
 ])
 
 watch(
-  () => props.mode,
-  (mode) => {
-    if (!mode) return
+  [() => props.mode, () => props.device],
+  ([mode, device], [, prevDevice]) => {
+    const switchedDevice = prevDevice?.device !== undefined && prevDevice.device !== device?.device
+    if (switchedDevice) interruptTouched.value = false
+    if (!mode && !device) return
     if (!interruptTouched.value) {
-      keywordInterrupt.value = mode.keyword_interrupt !== false
-      if (mode.stop_intents) {
+      keywordInterrupt.value = (device?.keyword_interrupt ?? mode?.keyword_interrupt) !== false
+      if (mode?.stop_intents) {
         stopEnabled.value = mode.stop_intents.enabled !== false
         stopWords.value = [...mode.stop_intents.stop_words]
         continueWords.value = [...mode.stop_intents.continue_words]
       }
     }
-    if (!styleTouched.value) {
+    if (mode && !styleTouched.value) {
       if (mode.spoken) {
         sentences.value = mode.spoken.max_sentences
         chars.value = mode.spoken.max_chars
@@ -152,49 +159,48 @@ watch(
 watch(
   () => reflex.data.value,
   (state) => {
-    if (state && reflexWords.value === null) {
-      reflexWords.value = state.words.map((w) => ({ ...w }))
-      autoTokens.value = new Set(state.words.map((_, i) => i))
+    if (state && (reflexWords.value === null || !interruptTouched.value)) {
+      reflexWords.value = state.words.map((w) => ({ ...w, autoTokens: true }))
     }
   },
   { immediate: true },
 )
 
-function generate(i: number): void {
-  const word = reflexWords.value?.[i]
-  if (!word) return
-  const text = word.text.trim()
+function generate(row: ReflexWordRow): void {
+  const text = row.text.trim()
   if (!text) return
   void getReflexTokens(text)
     .then((res) => {
-      const row = reflexWords.value?.[i]
-      if (!row || row.text.trim() !== text) return
+      if (!reflexWords.value?.includes(row) || row.text.trim() !== text) return
       if (res.error) {
         tokenError.value = res.error
         return
       }
       tokenError.value = ''
       row.tokens = res.tokens
-      autoTokens.value.add(i)
+      row.autoTokens = true
     })
     .catch((err) => {
       tokenError.value = String(err)
     })
 }
 
-function onWordInput(i: number): void {
+function onWordInput(row: ReflexWordRow): void {
   interruptTouched.value = true
-  const word = reflexWords.value?.[i]
-  if (!word) return
-  if (!autoTokens.value.has(i) && word.tokens.trim() !== '') return
+  if (!row.autoTokens && row.tokens.trim() !== '') return
   if (tokenTimer !== null) window.clearTimeout(tokenTimer)
-  tokenTimer = window.setTimeout(() => generate(i), 300)
+  tokenTimer = window.setTimeout(() => generate(row), 300)
+}
+
+function onTokensInput(row: ReflexWordRow): void {
+  interruptTouched.value = true
+  row.autoTokens = false
 }
 
 function addWord(): void {
   if (!reflexWords.value) return
   interruptTouched.value = true
-  reflexWords.value.push({ text: '', tokens: '', intent: 'pause', enabled: true })
+  reflexWords.value.push({ text: '', tokens: '', intent: 'pause', enabled: true, autoTokens: true })
 }
 
 function removeWord(i: number): void {
@@ -202,12 +208,26 @@ function removeWord(i: number): void {
   reflexWords.value?.splice(i, 1)
 }
 
+onBeforeUnmount(() => {
+  if (tokenTimer !== null) {
+    window.clearTimeout(tokenTimer)
+    tokenTimer = null
+  }
+})
+
 async function saveInterrupts(): Promise<void> {
   if (!props.device || !reflexWords.value) return
-  const words = reflexWords.value.map((w) => ({ ...w }))
+  const words: ReflexWord[] = reflexWords.value.map(({ text, tokens, intent, enabled }) => ({
+    text,
+    tokens,
+    intent,
+    enabled,
+  }))
   await runInt(async () => {
     await putMode(props.device!.device, {
       keyword_interrupt: keywordInterrupt.value,
+    })
+    await putGlobalMode({
       stop_intents: {
         enabled: stopEnabled.value,
         stop_words: stopWords.value,
@@ -215,7 +235,7 @@ async function saveInterrupts(): Promise<void> {
       },
     })
     const saved = await putReflex({ words, deploy: true, device: props.device!.device })
-    reflexWords.value = saved.words.map((w) => ({ ...w }))
+    reflexWords.value = saved.words.map((w) => ({ ...w, autoTokens: true }))
     interruptTouched.value = false
     await reflex.load()
     await props.refresh()
@@ -224,16 +244,17 @@ async function saveInterrupts(): Promise<void> {
 }
 
 async function saveStyle(resynth = false): Promise<void> {
-  if (!props.device) return
   await runStyle(async () => {
-    await putMode(
-      props.device!.device,
+    const existingSpoken = props.mode?.spoken
+    await putGlobalMode(
       {
         spoken: {
           max_sentences: sentences.value,
           max_chars: chars.value,
           detail_max_sentences: detailSentences.value,
           detail_max_chars: detailChars.value,
+          ...(existingSpoken?.detail_words !== undefined ? { detail_words: existingSpoken.detail_words } : {}),
+          ...(existingSpoken?.long_form_words !== undefined ? { long_form_words: existingSpoken.long_form_words } : {}),
           backstop_max_sentences: backstopSentences.value,
           backstop_max_chars: backstopChars.value,
           continue_hint: continueHint.value.trim(),
@@ -270,7 +291,10 @@ const warnings = computed(() => reflex.data.value?.warnings ?? [])
     <template v-else>
       <!-- Sub-section A: Interrupt & Stop/Continue Words -->
       <section class="sp__block">
-        <SectionLabel :text="t('interruptTitle')" />
+        <div class="sp__head">
+          <SectionLabel :text="t('interruptDeviceTitle')" />
+          <Pill size="sm" tone="accent" mono>{{ t('scopeThisDevice', { device: device.device }) }}</Pill>
+        </div>
         <ErrorNotice v-if="reflex.error.value" :error="reflex.error.value" compact @retry="reflex.load" />
         <LoadingBlock v-else-if="!reflexWords" :label="t('loading')" />
         <template v-else>
@@ -282,9 +306,15 @@ const warnings = computed(() => reflex.data.value?.warnings ?? [])
             @update:model-value="interruptTouched = true"
           />
 
+          <div class="sp__head sp__head--divider">
+            <SectionLabel :text="t('interruptTitle')" />
+            <Pill size="sm" tone="info" mono>{{ t('scopeNodeGlobal') }}</Pill>
+          </div>
+          <p class="sp__hint">{{ t('reflexScopeHint', { device: device.device }) }}</p>
+
           <div class="sp__rows">
             <div v-for="(word, i) in reflexWords" :key="i" class="sp__word-row">
-              <div @input="onWordInput(i)">
+              <div @input="onWordInput(word)">
                 <TextInput v-model="word.text" :label="t('reflexWord')" :maxlength="12" />
               </div>
               <Select
@@ -315,6 +345,10 @@ const warnings = computed(() => reflex.data.value?.warnings ?? [])
             <button type="button" class="btn" :disabled="intBusy" @click="addWord">{{ t('reflexAdd') }}</button>
           </div>
 
+          <div class="sp__head sp__head--divider">
+            <SectionLabel :text="t('stopTitle')" />
+            <Pill size="sm" tone="info" mono>{{ t('scopeNodeGlobal') }}</Pill>
+          </div>
           <Toggle
             v-model="stopEnabled"
             :label="t('stopEnabled')"
@@ -350,12 +384,17 @@ const warnings = computed(() => reflex.data.value?.warnings ?? [])
             <div class="sp__tokens">
               <div v-for="(word, i) in reflexWords" :key="`tok-${i}`" class="sp__token-row">
                 <span class="sp__token-word">{{ word.text || '—' }}</span>
-                <TextInput v-model="word.tokens" :label="t('reflexTokens')" mono />
+                <TextInput
+                  v-model="word.tokens"
+                  :label="t('reflexTokens')"
+                  mono
+                  @update:model-value="onTokensInput(word)"
+                />
                 <button
                   type="button"
                   class="btn btn--ghost"
                   :disabled="intBusy || !word.text.trim()"
-                  @click="generate(i)"
+                  @click="generate(word)"
                 >
                   {{ t('reflexGenerate') }}
                 </button>
@@ -375,7 +414,10 @@ const warnings = computed(() => reflex.data.value?.warnings ?? [])
 
       <!-- Sub-section B: Reply Length, Truncation Notice, & Waiting Fillers -->
       <section class="sp__block">
-        <SectionLabel :text="t('spokenTitle')" />
+        <div class="sp__head">
+          <SectionLabel :text="t('spokenTitle')" />
+          <Pill size="sm" tone="info" mono>{{ t('scopeNodeGlobal') }}</Pill>
+        </div>
         <p class="sp__hint">{{ t('spokenHint') }}</p>
         <div class="sp__row">
           <NumberField
@@ -455,7 +497,10 @@ const warnings = computed(() => reflex.data.value?.warnings ?? [])
       </section>
 
       <section class="sp__block">
-        <SectionLabel :text="t('fillerTitle')" />
+        <div class="sp__head">
+          <SectionLabel :text="t('fillerTitle')" />
+          <Pill size="sm" tone="info" mono>{{ t('scopeNodeGlobal') }}</Pill>
+        </div>
         <p class="sp__hint">{{ t('fillerHint') }}</p>
         <div class="sp__filler-controls">
           <Slider
@@ -523,6 +568,19 @@ const warnings = computed(() => reflex.data.value?.warnings ?? [])
   border: 1px solid var(--line);
   border-radius: var(--r-sm);
   background: var(--surface-2);
+}
+
+.sp__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+.sp__head--divider {
+  padding-top: var(--sp-2);
+  border-top: 1px solid var(--line);
 }
 
 .sp__rows {

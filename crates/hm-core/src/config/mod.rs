@@ -91,7 +91,7 @@ pub const CONFIG_KEY: &str = "services";
 /// They are credentials for THIS node's wiring, not household configuration —
 /// exporting them would spread one node's access around the household, and
 /// importing them would silently point a device at a peer it cannot reach.
-pub const CONFIG_SECRETS: [&str; 11] = [
+pub const CONFIG_SECRETS: [&str; 15] = [
     "llm.api_key",
     "llm_fallback.api_key",
     "asr.api_key",
@@ -103,6 +103,10 @@ pub const CONFIG_SECRETS: [&str; 11] = [
     "openapi.token",
     "search.api_key",
     MASTER_BRAIN_TOKEN_SECRET,
+    STORY_TOKEN_SECRET,
+    JOKE_TOKEN_SECRET,
+    RADIO_TOKEN_SECRET,
+    LEARNING_TOKEN_SECRET,
 ];
 
 /// FNV-1a 64 (hex) — the same hash the gateway reports, so "did the device
@@ -353,6 +357,10 @@ impl ConfigService {
         push("openapi.token", "");
         push("search.api_key", "");
         push(MASTER_BRAIN_TOKEN_SECRET, "");
+        push(STORY_TOKEN_SECRET, "");
+        push(JOKE_TOKEN_SECRET, "");
+        push(RADIO_TOKEN_SECRET, "");
+        push(LEARNING_TOKEN_SECRET, "");
         debug_assert_eq!(out.len(), CONFIG_SECRETS.len());
         Ok(out)
     }
@@ -1262,6 +1270,8 @@ mod reflex_tests {
             "j ì x ù b ō f àng @继续播放\n",
             "x ià y ì sh ǒu @下一首\n",
             "t íng zh ǐ b ō f àng @停止播放\n",
+            "t uì x ià @退下\n",
+            "t uì x ià b a @退下吧\n",
         );
         assert_eq!(file, expected);
         // Disabled words are absent, not commented out.

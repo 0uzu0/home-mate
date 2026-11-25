@@ -36,9 +36,11 @@ pub const BAD_ARGS: &str = "BAD_ARGS";
 /// (a receipt that already arrived returns immediately).
 const RECEIPT_WAIT: Duration = Duration::from_millis(1_500);
 const POLL: Duration = Duration::from_millis(50);
-/// The firmware reports a quantized 0..1 value (n/127); allow one step plus
-/// rounding noise.
-const VOLUME_TOLERANCE: f64 = 0.02;
+/// Gateways report quantized 0..1 volume (Dot2 ALSA: n/127 ≈ 0.008 step;
+/// Android `STREAM_MUSIC`: n/15 ≈ 0.067 step, half-step error ≤ 0.0333).
+/// 0.04 accepts nearest-step rounding on both platforms while still rejecting
+/// an off-by-one Android step or wrong volume.
+const VOLUME_TOLERANCE: f64 = 0.04;
 
 pub enum ModeWait {
     Matched,
@@ -86,26 +88,82 @@ impl ManagementRuntime {
         }
     }
 
+    fn check_lan_exempt_device(&self, device: &str, ctx: &ToolCtx) -> Option<ToolResult> {
+        if ctx.is_lan_exempt() && !self.hub.device_is_known_lan_device(device) {
+            return Some(ToolResult::failed(
+                "PAIRING_REQUIRED",
+                format!("未认证的局域网访问不允许操作本机音箱「{device}」，请使用配对令牌认证"),
+                false,
+            ));
+        }
+        None
+    }
+
+    /// Resolve the target device for a tool call:
+    /// 1. Explicit `args["device"]` (stable_id, name, or room from `device_meta`)
+    /// 2. Originating turn's `ctx.device_id`
+    /// 3. Default primary online `audio_out` device
+    fn resolve_device_for_ctx(
+        &self,
+        requested: Option<&str>,
+        ctx: &ToolCtx,
+    ) -> Result<String, String> {
+        let explicit = requested.map(str::trim).filter(|s| !s.is_empty());
+        if explicit.is_some() {
+            return self.resolve_device(explicit);
+        }
+        if let Some(ctx_dev) = ctx
+            .device_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return self.resolve_device(Some(ctx_dev));
+        }
+        self.resolve_device(None)
+    }
+
     /// `None` = the only/first audio-out device. A name/room from
     /// `device_meta` is accepted because that is what a person says.
+    /// Candidate devices and metadata entries are sorted deterministically by
+    /// `stable_id` rather than depending on `HashMap` iteration order (`MG-P2-04`).
     fn resolve_device(&self, requested: Option<&str>) -> Result<String, String> {
         let req = requested.map(str::trim).filter(|s| !s.is_empty());
         let snap = self.hub.snapshot();
-        let devices = snap["devices"].as_array().cloned().unwrap_or_default();
+        let mut devices = snap["devices"].as_array().cloned().unwrap_or_default();
+        devices.sort_by(|a, b| {
+            a["stable_id"]
+                .as_str()
+                .unwrap_or("")
+                .cmp(b["stable_id"].as_str().unwrap_or(""))
+        });
         let online = |d: &Value| d["online"].as_bool().unwrap_or(false);
         if let Some(req) = req {
-            let meta = crate::config::ConfigService::new(self.store.clone())
-                .device_meta()
-                .unwrap_or_default();
-            let by_meta: Option<String> = meta.iter().find_map(|(id, m)| {
-                let hit = m.name.trim().eq_ignore_ascii_case(req)
-                    || m.room.trim().eq_ignore_ascii_case(req);
-                hit.then(|| id.clone())
-            });
-            let hit = devices.iter().find(|d| {
-                d["stable_id"].as_str() == Some(req)
-                    || by_meta.as_deref() == d["stable_id"].as_str()
-            });
+            let mut meta_entries: Vec<(String, crate::config::DeviceMeta)> =
+                crate::config::ConfigService::new(self.store.clone())
+                    .device_meta()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+            meta_entries.sort_by(|a, b| a.0.cmp(&b.0));
+            let meta_ids: Vec<&str> = meta_entries
+                .iter()
+                .filter(|(_, m)| {
+                    m.name.trim().eq_ignore_ascii_case(req)
+                        || m.room.trim().eq_ignore_ascii_case(req)
+                })
+                .map(|(id, _)| id.as_str())
+                .collect();
+            let matches_req = |d: &&Value| {
+                let sid = d["stable_id"].as_str().unwrap_or("");
+                sid == req || meta_ids.contains(&sid)
+            };
+            // Prioritize online devices when resolving by room/name before
+            // falling back to offline entries sharing the same label.
+            let hit = devices
+                .iter()
+                .find(|d| online(d) && matches_req(d))
+                .or_else(|| devices.iter().find(matches_req));
             return match hit {
                 Some(d) if online(d) => Ok(d["stable_id"]
                     .as_str()
@@ -121,6 +179,12 @@ impl ManagementRuntime {
                         .join("、")
                 )),
             };
+        }
+        if self.hub.online_device_count() > 1 {
+            return Err(
+                "AMBIGUOUS_DEVICE: multiple devices are online; specify target device explicitly"
+                    .into(),
+            );
         }
         devices
             .iter()
@@ -277,11 +341,14 @@ impl Tool for VolumeTool {
         }
         let device = match self
             .rt
-            .resolve_device(args.get("device").and_then(Value::as_str))
+            .resolve_device_for_ctx(args.get("device").and_then(Value::as_str), ctx)
         {
             Ok(d) => d,
             Err(e) => return ToolResult::failed(DEVICE_NOT_FOUND, e, false),
         };
+        if let Some(denied) = self.rt.check_lan_exempt_device(&device, ctx) {
+            return denied;
+        }
         let Some(voice) = self.rt.voice() else {
             return ToolResult::failed(
                 MANAGE_UNAVAILABLE,
@@ -294,23 +361,36 @@ impl Tool for VolumeTool {
         // Baseline arrival sequence: only a receipt that arrived AFTER this
         // request may confirm it (an old queued receipt has a lower seq).
         let baseline_seq = self.rt.device_volume(&device).map(|(_, s)| s).unwrap_or(0);
-        if let Err(e) = voice.set_volume(&device, value) {
-            return ToolResult::failed(MANAGE_REJECTED, e.clone(), false).with_fact(fact(
-                subject,
-                "set",
-                Some(format!("{percent:.0}%")),
-                false,
-                Some(e),
-            ));
-        }
-        match self.rt.wait_for_volume(&device, value, baseline_seq).await {
+        let submitted = match voice.set_volume(&device, value) {
+            Ok(v) => v,
+            Err(e) => {
+                return ToolResult::failed(MANAGE_REJECTED, e.clone(), false).with_fact(fact(
+                    subject,
+                    "set",
+                    Some(format!("{percent:.0}%")),
+                    false,
+                    Some(e),
+                ));
+            }
+        };
+        // `set_volume` clamps to `min(unit_acoustic_profile.volume_cap, VOLUME_CAP)`;
+        // wait for the effective clamped value so 95–100% requests confirm cleanly.
+        let effective_value = submitted["value"].as_f64().unwrap_or(value);
+        match self
+            .rt
+            .wait_for_volume(&device, effective_value, baseline_seq)
+            .await
+        {
             Some(reported) => {
                 let shown = format!("{:.0}%", (reported * 100.0).round());
                 ToolResult {
                     status: ToolStatus::Completed,
                     evidence: Evidence::DeviceConfirmed,
                     result: Some(json!({
-                        "device": device, "requested": value, "reported": reported,
+                        "device": device,
+                        "requested": value,
+                        "effective": effective_value,
+                        "reported": reported,
                     })),
                     error: None,
                     fact: Some(fact(subject, "set", Some(shown), true, None)),
@@ -319,7 +399,11 @@ impl Tool for VolumeTool {
             None => ToolResult {
                 status: ToolStatus::Unknown,
                 evidence: Evidence::Unknown,
-                result: Some(json!({ "device": device, "requested": value })),
+                result: Some(json!({
+                    "device": device,
+                    "requested": value,
+                    "effective": effective_value,
+                })),
                 error: Some(ToolError {
                     code: VOLUME_UNCONFIRMED.into(),
                     retryable: true,
@@ -328,7 +412,7 @@ impl Tool for VolumeTool {
                 fact: Some(fact(
                     subject,
                     "set",
-                    Some(format!("{percent:.0}%")),
+                    Some(format!("{:.0}%", (effective_value * 100.0).round())),
                     false,
                     Some("设备没有回执".into()),
                 )),
@@ -382,11 +466,14 @@ impl Tool for VolumeReadTool {
         }
         let device = match self
             .rt
-            .resolve_device(args.get("device").and_then(Value::as_str))
+            .resolve_device_for_ctx(args.get("device").and_then(Value::as_str), ctx)
         {
             Ok(d) => d,
             Err(e) => return ToolResult::failed(DEVICE_NOT_FOUND, e, false),
         };
+        if let Some(denied) = self.rt.check_lan_exempt_device(&device, ctx) {
+            return denied;
+        }
         let subject = format!("{}的音量", self.rt.label(&device));
         match self.rt.device_volume(&device) {
             Some((level, _seq)) => {
@@ -475,11 +562,14 @@ impl Tool for ModeTool {
         };
         let device = match self
             .rt
-            .resolve_device(args.get("device").and_then(Value::as_str))
+            .resolve_device_for_ctx(args.get("device").and_then(Value::as_str), ctx)
         {
             Ok(d) => d,
             Err(e) => return ToolResult::failed(DEVICE_NOT_FOUND, e, false),
         };
+        if let Some(denied) = self.rt.check_lan_exempt_device(&device, ctx) {
+            return denied;
+        }
         let Some(voice) = self.rt.voice() else {
             return ToolResult::failed(
                 MANAGE_UNAVAILABLE,
@@ -735,6 +825,9 @@ impl Tool for PlaybackReadTool {
                 Err(e) => return ToolResult::failed(DEVICE_NOT_FOUND, e, false),
             }
         };
+        if let Some(denied) = self.rt.check_lan_exempt_device(&device, ctx) {
+            return denied;
+        }
         let Some(voice) = self.rt.voice() else {
             return ToolResult::failed(
                 MANAGE_UNAVAILABLE,

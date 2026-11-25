@@ -340,7 +340,14 @@ fn concrete_wildcards_stay_protected_and_catalog_never_grants_new_apply_authorit
     for path in [
         "mode.vad.start_db",
         "mode.vad.end_db",
+        "mode.vad_by_device",
+        "mode.vad_by_device.dot2-d.start_db",
+        "mode.vad_by_device.dot2-d.end_db",
         "mode.media_trim_db",
+        "mode.media_trim_db_by_device",
+        "mode.media_trim_db_by_device.dot2-d",
+        "mode.device_overrides",
+        "mode.device_overrides.dot2-d.tail_blind_ms",
         "mode.tail_blind_ms",
         "unit_acoustic_profiles.dot2-d.mic_calibrated",
         "mode.wake_ack.resynth",
@@ -370,7 +377,7 @@ fn concrete_wildcards_stay_protected_and_catalog_never_grants_new_apply_authorit
 #[test]
 fn all_descriptors_have_typed_metadata_bounds_and_unit_isolation() {
     let catalog = fields();
-    assert_eq!(catalog.len(), 234);
+    assert_eq!(catalog.len(), 264);
     for field in &catalog {
         assert!(!field.unit.is_empty(), "{} missing unit", field.path);
         assert!(

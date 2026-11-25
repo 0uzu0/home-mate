@@ -756,14 +756,17 @@ pub const NODE_LOCAL_MODE_KEYS: &[&str] = &[
     "kws_threshold",
     "kws_score",
     "media_trim_db",
+    "media_trim_db_by_device",
     "tail_blind_ms",
     "vad",
+    "vad_by_device",
     "duplex_requested",
     "keyword_interrupt",
     "barge_in",
     "barge_protect_ms",
     "asr_wake_fallback",
     "proactive_asr_wake",
+    "device_overrides",
 ];
 
 pub fn strip_node_local(doc: &mut Value) {
@@ -975,7 +978,14 @@ mod tests {
     #[test]
     fn strip_removes_wake_words_and_wake_reflex_words_only() {
         let mut doc = json!({
-            "mode": { "wake_words": ["你好建国"], "media_trim_db": -6.0, "follow_window_ms": 9000 },
+            "mode": {
+                "wake_words": ["你好建国"],
+                "media_trim_db": -6.0,
+                "follow_window_ms": 9000,
+                "device_overrides": {
+                    "android-2": { "kws_threshold": 0.42, "tail_blind_ms": 950, "wake_words": ["你好小艺"] }
+                }
+            },
             "reflex": { "words": [
                 { "text": "你好建国", "tokens": "n ǐ h ǎo", "intent": "wake", "enabled": true },
                 { "text": "停止播放", "tokens": "t íng", "intent": "retreat", "enabled": true },
@@ -985,6 +995,10 @@ mod tests {
         strip_node_local(&mut doc);
         assert!(doc.pointer("/mode/wake_words").is_none());
         assert!(doc.pointer("/mode/media_trim_db").is_none());
+        assert!(
+            doc.pointer("/mode/device_overrides").is_none(),
+            "per-unit mode.device_overrides must never leak in fleet pushes"
+        );
         assert_eq!(doc["mode"]["follow_window_ms"], 9000);
         let words = doc["reflex"]["words"].as_array().unwrap();
         assert_eq!(words.len(), 1);

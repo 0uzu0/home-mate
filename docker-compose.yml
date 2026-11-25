@@ -6,9 +6,16 @@ services:
     image: home-mate/hm-core:latest
     container_name: home-mate-core
     restart: unless-stopped
-    ports:
-      - "8930:8930" # Web Console & HTTP Management API
-      - "8932:8932" # Northbound Protocol v2 TCP Listener for Android / Linux Gateways
+    # Host networking is required on Linux NAS deployments so LAN UDP broadcast
+    # discovery (:8933/udp) and real peer client IPs (for private-LAN checks)
+    # reach hm-core directly without bridge NAT rewriting.
+    # On macOS Docker Desktop (where host networking is isolated to the Linux VM),
+    # comment out `network_mode: host` and uncomment the `ports:` block below.
+    network_mode: host
+    # ports:
+    #   - "8930:8930" # Web Console & HTTP Management API
+    #   - "8932:8932" # Northbound Protocol v2 TCP Listener for Android / Linux Gateways
+    #   - "8933:8933/udp" # LAN UDP Beacon Discovery for Android Gateways
     environment:
       TZ: Asia/Shanghai
       HM_NODE_ID: nas-core-1
@@ -19,4 +26,5 @@ services:
       HM_GATEWAY_ALLOW_LAN: "1"
       RUST_LOG: hm_core=info
     volumes:
+      # Place optional silero_vad.onnx at ./data/models/silero_vad.onnx for neural VAD.
       - ./data:/data

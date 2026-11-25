@@ -10,7 +10,23 @@ use std::time::Duration;
 const DEFAULT_INVITATION_TTL_MS: u64 = 10 * 60 * 1000;
 const MAX_INVITATION_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const READBACK_TIMEOUT_MS: u64 = 5_000;
+/// Blocks that dispatch `ConfigBlock::Kws` (`reflex`, `mode`, `node`) wait up
+/// to `KWS_APPLY_TIMEOUT` (25s) on the target Core while `hm-kws` reloads on
+/// Dot2/LX06; keep fleet readback strictly above that budget.
+const KWS_READBACK_TIMEOUT_MS: u64 = 30_000;
 const READBACK_POLL_MS: u64 = 20;
+
+pub(super) fn readback_timeout_for(required_blocks: &[String]) -> Duration {
+    let may_touch_kws = required_blocks.is_empty()
+        || required_blocks
+            .iter()
+            .any(|b| matches!(b.as_str(), "reflex" | "mode" | "node"));
+    Duration::from_millis(if may_touch_kws {
+        KWS_READBACK_TIMEOUT_MS
+    } else {
+        READBACK_TIMEOUT_MS
+    })
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -437,7 +453,7 @@ async fn parse_peer_json(resp: reqwest::Response) -> Result<Value> {
             .unwrap_or("peer rejected request")
             .to_string();
         return Err(DeliveryError {
-            code: Box::leak(code.to_string().into_boxed_str()),
+            code: std::borrow::Cow::Owned(code.to_string()),
             detail,
             pointer: val["pointer"].as_str().map(str::to_string),
             status,
@@ -729,7 +745,7 @@ async fn poll_required_readback(
     app_id: &str,
     required_blocks: &[String],
 ) -> std::result::Result<Value, (DeliveryError, Option<Value>)> {
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(READBACK_TIMEOUT_MS);
+    let deadline = tokio::time::Instant::now() + readback_timeout_for(required_blocks);
     loop {
         let rb = transport.readback(app_id).await.map_err(|e| (e, None))?;
         let pub_state = rb["publication"]["state"].as_str().unwrap_or("unknown");

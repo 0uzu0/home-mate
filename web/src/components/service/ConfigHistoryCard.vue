@@ -27,7 +27,6 @@ const history = useResource((signal) => getConfigHistory({ signal }), {
   timeoutMs: 6000,
   retries: 1,
 })
-void history.load()
 usePoll(() => history.load(), 15000)
 
 const pending = ref<ConfigHistoryEntry | null>(null)
@@ -36,7 +35,7 @@ const cooldown = useCooldown()
 
 /** The restore route supports these scopes only; every other row used to
  * offer a button that always ended in a conflict (audit 2026-11-14). */
-const RESTORABLE = ['llm', 'asr', 'tts', 'device', 'voice']
+const RESTORABLE = ['llm', 'llm_fallback', 'asr', 'tts', 'device', 'voice']
 function restorable(scope: string): boolean {
   return RESTORABLE.includes(scope)
 }

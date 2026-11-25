@@ -8,7 +8,7 @@ import { getDiagnostics } from '../api'
 import { t } from '../i18n'
 import { useResource } from '../hooks/useResource'
 import { usePoll } from '../hooks/usePoll'
-import { devices } from '../stores/devices'
+import { devices, selected } from '../stores/devices'
 import SnapshotCard from '../components/diagnostics/SnapshotCard.vue'
 import SelfCheckCard from '../components/diagnostics/SelfCheckCard.vue'
 import ProbesCard from '../components/diagnostics/ProbesCard.vue'
@@ -43,10 +43,10 @@ const probeDevices = computed(() => (devices.value.length ? devices.value : snap
         :loading="snapshot.loading.value"
         :refresh="refresh"
       />
-      <SelfCheckCard />
-      <ProbesCard :devices="probeDevices" />
+      <SelfCheckCard :devices="probeDevices" :selected-device-id="selected?.device ?? null" />
+      <ProbesCard :devices="probeDevices" :selected-device-id="selected?.device ?? null" />
       <WakeLogCard />
-      <TracesCard :focus="focusTrace" />
+      <TracesCard :focus="focusTrace" @clear-focus="focusTrace = null" />
       <ChatCard @open-trace="focusTrace = $event" />
     </div>
   </section>

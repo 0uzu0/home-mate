@@ -92,7 +92,15 @@ async fn d1_timeout_and_exit_have_separate_history_and_bookmark_effects() {
             );
             (st.participation.identity(), st.stop_epoch)
         };
-        assert!(sessions.history(&session, 10).unwrap().is_empty());
+        let current_session = sessions.device_session_id("test").unwrap();
+        assert_ne!(current_session, session);
+        assert!(sessions.history(&current_session, 10).unwrap().is_empty());
+        assert_eq!(sessions.history(&session, 10).unwrap().len(), 1);
+        assert!(sessions
+            .device_contexts("test", None, 10)
+            .unwrap()
+            .iter()
+            .any(|c| c.session_id == session));
         pipe.retreat_session("test", "退下", "test");
         let states = pipe.states.lock().unwrap();
         assert_eq!(

@@ -37,7 +37,7 @@ const PRESETS: Record<Exclude<Preset, 'custom'>, number[]> = {
 
 const gains = ref<number[]>(BANDS.map(() => 0))
 const loaded = ref(false)
-const loadError = ref<string | null>(null)
+const loadError = ref<unknown>(null)
 /** The config as loaded: the curve and any band this editor does not show are
  * carried back on save, so opening the card cannot silently rewrite them. */
 const baseCurve = ref<string>('echomuse')
@@ -94,7 +94,7 @@ async function load(): Promise<void> {
     loadError.value = null
   } catch (e) {
     // Without this the card sat on "Loading" forever (audit 2026-11-14).
-    loadError.value = e instanceof Error ? e.message : String(e)
+    loadError.value = e
     throw e
   }
 }

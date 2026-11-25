@@ -173,16 +173,18 @@ async fn slice1_announce_auth_gating_delivery_and_followup_window() {
         .unwrap();
     assert_eq!(bad_prio.status(), reqwest::StatusCode::BAD_REQUEST);
 
+    let known_t1 = state.tasks.create("slice1-validation").unwrap().id.clone();
     let unknown = client
         .post(format!("{base}/api/v0/voice/announce"))
         .bearer_auth(&token)
-        .json(&json!({ "text": "测试", "device": "ghost-box", "task_id": "t1" }))
+        .json(&json!({ "text": "测试", "device": "ghost-box", "task_id": known_t1 }))
         .send()
         .await
         .unwrap();
     assert_eq!(unknown.status(), reqwest::StatusCode::NOT_FOUND);
 
-    // Unsolicited announcement (no task_id) is rejected when proactive_speech is off (default).
+    // Unsolicited announcement (no task_id) and forged/unknown task_id are BOTH
+    // rejected when proactive_speech is off (default).
     let unsolicited = client
         .post(format!("{base}/api/v0/voice/announce"))
         .bearer_auth(&token)
@@ -194,8 +196,22 @@ async fn slice1_announce_auth_gating_delivery_and_followup_window() {
     let err_body: Value = unsolicited.json().await.unwrap();
     assert_eq!(err_body["code"], "PROACTIVE_SPEECH_DISABLED");
 
-    // Task callback (task_id present) IS allowed even when proactive_speech=false,
+    let forged_task = client
+        .post(format!("{base}/api/v0/voice/announce"))
+        .bearer_auth(&token)
+        .json(
+            &json!({ "text": "伪造任务测试", "device": "dot2-d", "task_id": "forged-unknown-999" }),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forged_task.status(), reqwest::StatusCode::CONFLICT);
+    let forged_body: Value = forged_task.json().await.unwrap();
+    assert_eq!(forged_body["code"], "PROACTIVE_SPEECH_DISABLED");
+
+    // Task callback for a KNOWN task IS allowed even when proactive_speech=false,
     // speaks immediately on idle device, and opens bounded followup window when open_followup=true.
+    let cb_task_1 = state.tasks.create("slice1-cb-1").unwrap().id.clone();
     let cb = client
         .post(format!("{base}/api/v0/voice/announce"))
         .bearer_auth(&token)
@@ -205,7 +221,7 @@ async fn slice1_announce_auth_gating_delivery_and_followup_window() {
             "text": "主脑查完了，客厅音箱运行正常。需要继续排查吗？",
             "priority": "high",
             "open_followup": true,
-            "task_id": "run_cb_01",
+            "task_id": cb_task_1,
             "source": "master_brain"
         }))
         .send()
@@ -218,7 +234,7 @@ async fn slice1_announce_auth_gating_delivery_and_followup_window() {
     assert_eq!(cb_body["open_followup"], true);
 
     let spoken_ev = wait_for_voice_event(&state, "voice_announce_spoken", Some(&announce_id)).await;
-    assert_eq!(spoken_ev["task_id"], "run_cb_01");
+    assert_eq!(spoken_ev["task_id"], cb_task_1);
     assert!(spoken
         .lock()
         .unwrap()
@@ -232,13 +248,14 @@ async fn slice1_announce_auth_gating_delivery_and_followup_window() {
 
     // Verify the device is now in a listening session, so a second announcement DEFERS (queued)
     // instead of interrupting the open listening window!
+    let cb_task_2 = state.tasks.create("slice1-cb-2").unwrap().id.clone();
     let deferred = client
         .post(format!("{base}/api/v0/voice/announce"))
         .bearer_auth(&token)
         .json(&json!({
             "device": "dot2-d",
             "text": "这是排队的第二条通知。",
-            "task_id": "run_cb_02",
+            "task_id": cb_task_2,
             "source": "master_brain"
         }))
         .send()
@@ -271,6 +288,12 @@ async fn slice1_announce_auth_gating_delivery_and_followup_window() {
     // Queue cap (8) + high-priority eviction while the listening window is open
     // (1 deferred item is already queued above -> add 7 more normal to hit cap 8).
     for i in 1..8 {
+        let tid = state
+            .tasks
+            .create(&format!("slice1-norm-{i}"))
+            .unwrap()
+            .id
+            .clone();
         let r = client
             .post(format!("{base}/api/v0/voice/announce"))
             .bearer_auth(&token)
@@ -278,7 +301,7 @@ async fn slice1_announce_auth_gating_delivery_and_followup_window() {
                 "device": "dot2-d",
                 "text": format!("普通消息 {i}"),
                 "priority": "normal",
-                "task_id": format!("t-norm-{i}")
+                "task_id": tid
             }))
             .send()
             .await
@@ -286,6 +309,7 @@ async fn slice1_announce_auth_gating_delivery_and_followup_window() {
         assert_eq!(r.status(), reqwest::StatusCode::ACCEPTED);
     }
     // 9th normal is rejected with 429.
+    let overflow_tid = state.tasks.create("slice1-norm-9").unwrap().id.clone();
     let overflow = client
         .post(format!("{base}/api/v0/voice/announce"))
         .bearer_auth(&token)
@@ -293,7 +317,7 @@ async fn slice1_announce_auth_gating_delivery_and_followup_window() {
             "device": "dot2-d",
             "text": "第9条普通消息",
             "priority": "normal",
-            "task_id": "t-norm-9"
+            "task_id": overflow_tid
         }))
         .send()
         .await
@@ -301,6 +325,7 @@ async fn slice1_announce_auth_gating_delivery_and_followup_window() {
     assert_eq!(overflow.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
 
     // A high-priority announcement evicts the oldest normal item (`deferred_id`) cleanly.
+    let high_tid = state.tasks.create("slice1-high-1").unwrap().id.clone();
     let hi = client
         .post(format!("{base}/api/v0/voice/announce"))
         .bearer_auth(&token)
@@ -308,7 +333,7 @@ async fn slice1_announce_auth_gating_delivery_and_followup_window() {
             "device": "dot2-d",
             "text": "紧急高优播报",
             "priority": "high",
-            "task_id": "t-high-1"
+            "task_id": high_tid
         }))
         .send()
         .await
@@ -331,7 +356,7 @@ async fn slice1_announce_auth_gating_delivery_and_followup_window() {
     assert_eq!(close_res.status(), reqwest::StatusCode::OK);
 
     let drained = wait_for_voice_event(&state, "voice_announce_spoken", Some(&hi_id)).await;
-    assert_eq!(drained["task_id"], "t-high-1");
+    assert_eq!(drained["task_id"], high_tid);
     assert_eq!(drained["priority"], "high");
     assert!(spoken
         .lock()

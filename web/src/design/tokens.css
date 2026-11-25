@@ -230,6 +230,7 @@ svg {
 :root {
   --led-idle: #000000;
   --led-listening: #00a050;
+  --led-hearing: #00c864;
   --led-wake: #787878;
   --led-thinking: #0028a0;
   --led-speaking: #006e96;

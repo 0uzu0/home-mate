@@ -378,9 +378,6 @@ struct Program {
 enum SessionState {
     Idle,
     Listening,
-    /// A retreat/close is in progress: a local stop arriving now must not
-    /// turn into a bookmark (the amber the user saw after 退下).
-    Closing,
 }
 
 /// See [`VoicePipeline::in_window_command`].
@@ -422,7 +419,6 @@ impl Session {
         match self.state {
             SessionState::Idle => "idle",
             SessionState::Listening => "listening",
-            SessionState::Closing => "closing",
         }
     }
 }
@@ -639,6 +635,9 @@ struct DeviceVoiceState {
     /// Whether this device's explicitly saved `UnitAcousticProfile` has already
     /// been reconciled during the current online session (reset on join/offline).
     acoustics_reconciled: bool,
+    /// Whether this device's KWS/reflex config has already been reconciled via
+    /// `config_apply_v2` during the current online session (reset on join/offline).
+    kws_reconciled: bool,
 }
 
 impl DeviceVoiceState {
@@ -664,11 +663,9 @@ impl DeviceVoiceState {
 }
 
 /// M6b: the audible timeline of one turn. Times are absolute ms; the turn
-/// loop subtracts its own start. `gen` distinguishes "this turn's audio" from
-/// a previous turn's late receipt.
+/// loop subtracts its own start.
 #[derive(Clone, Default)]
 struct TurnAudio {
-    gen: u64,
     /// The task this timeline belongs to. Set by the turn loop when the
     /// Task event names it (or by the first submit). A late receipt from the
     /// PREVIOUS turn is refused by task, not merely by arrival order.
@@ -845,9 +842,12 @@ impl DeviceVoiceState {
     #[cfg(test)]
     fn timeout_session(&mut self, now: u64) -> bool {
         self.timeout_session_with_live(now, HubLive::default())
+            .is_some()
     }
 
-    fn timeout_session_with_live(&mut self, now: u64, hub_live: HubLive) -> bool {
+    /// Returns `Some(dropped_cut_bytes)` when this call transitioned the session
+    /// from `Listening` to `Idle` by timeout; `None` when no timeout occurred.
+    fn timeout_session_with_live(&mut self, now: u64, hub_live: HubLive) -> Option<Option<usize>> {
         // #88.2: active music/media playback NEVER triggers a Timeout session
         // close or farewell ("拜拜").
         if self
@@ -857,17 +857,16 @@ impl DeviceVoiceState {
             || self.media_live(hub_live)
             || self.session_open_with_live(now, hub_live)
         {
-            return false;
+            return None;
         }
         let expected = self.participation.identity();
         if !self
             .participation
             .close(expected, CloseReason::Timeout, now)
         {
-            return false;
+            return None;
         }
-        self.drop_system_cut();
-        true
+        Some(self.drop_system_cut())
     }
 
     /// `hub_live`: channels with active plays in the hub registry (tool
@@ -1131,7 +1130,9 @@ pub struct VoicePipeline {
     asr_factory: AsrFactory,
     states: Mutex<HashMap<String, DeviceVoiceState>>,
     /// Per-device VAD/wake processors (v0.2 core-side mic path).
-    mic: Mutex<HashMap<String, MicProcessor>>,
+    /// Each device has its own inner mutex so slow Silero ONNX inference on
+    /// Device B never blocks mic processing on sibling Device A (`MG-P1-03`).
+    mic: Mutex<HashMap<String, Arc<Mutex<MicProcessor>>>>,
     /// ASR results re-enter the event pump through this channel (ASR runs
     /// as a spawned task so a slow service never lags device events).
     mic_tx: mpsc::Sender<MicTranscript>,
@@ -1200,7 +1201,7 @@ pub struct VoicePipeline {
     /// was exactly that ("隔一段才能唤醒一次，固定的一段"), and it disappeared
     /// the moment arbitration was switched off. The transcript of the SAME
     /// utterance is the one thing to refuse; a later sentence must pass.
-    last_arbitration: Mutex<Option<(bool, u64, String, bool)>>,
+    last_arbitration: Mutex<HashMap<String, (bool, u64, String, bool)>>,
     /// Rolling per-device acoustic evidence (#71 / #74 item 2).
     mic_levels: Mutex<HashMap<String, MicLevelSnapshot>>,
     /// Contract v2 #2 (2026-11-16): the cue phrases THIS core played recently,
@@ -1229,7 +1230,9 @@ pub struct VoicePipeline {
     /// receives is byte-for-byte what the device-side spotter consumes (the
     /// gateway's own comment says so), so recording it here gives the honest
     /// input for a KWS hit-rate measurement — no firmware flag, no extra mic.
-    mic_capture: Mutex<Option<MicCapture>>,
+    /// Keyed per device so concurrent diagnostic captures never overwrite or
+    /// block each other (`MG-P2-01`).
+    mic_capture: Mutex<HashMap<String, MicCapture>>,
     /// M6b (S3): the bounded on-disk journal. The in-memory ring above stays
     /// the console's live view (100 events); acceptance needs the whole
     /// window, so every note ALSO goes here. `None` = the directory could
@@ -1243,12 +1246,11 @@ pub struct VoicePipeline {
     wifi_provisioning: Mutex<std::collections::BTreeMap<String, u64>>,
     /// Pre-subscribed timed control receiver for the pump (captures queue age from VoicePipeline::new).
     pump_control_rx: Mutex<Option<broadcast::Receiver<crate::gateway::QueuedDeviceEvent>>>,
-    /// Pre-subscribed timed audio receiver for the pump.
-    pump_audio_rx: Mutex<Option<broadcast::Receiver<crate::gateway::QueuedDeviceEvent>>>,
-    /// Phase 3 (#32): count of lagged `AudioChunk` frames dropped on the audio
-    /// subscription (control events are on a separate channel and never drop
-    /// due to audio backpressure).
-    audio_dropped_total: std::sync::atomic::AtomicU64,
+    /// Per-device bounded audio queue stream from `DeviceHub` (`MG-P1-03`).
+    pump_audio_queues:
+        Mutex<Option<mpsc::UnboundedReceiver<crate::gateway::DeviceAudioQueueHandle>>>,
+    /// Optional test seam invoked inside each device's audio VAD worker (`MG-P1-03`).
+    test_audio_chunk_hook: Mutex<Option<AudioChunkHook>>,
     /// Phase 3 (#32): count of lagged control events (should remain 0).
     control_lagged_total: std::sync::atomic::AtomicU64,
     /// Phase 5 (#44): high-water mark of control queue wait age in ms.
@@ -1325,6 +1327,17 @@ struct MicCapture {
 }
 
 impl MicCapture {
+    fn is_expired(&self, now_ms: u64) -> bool {
+        if self.done {
+            return false;
+        }
+        let seconds = (self.target as u64) / u64::from(self.rate.max(1));
+        let deadline_ms = self
+            .started_ms
+            .saturating_add(seconds.saturating_add(15).saturating_mul(1000));
+        now_ms >= deadline_ms
+    }
+
     /// 16-bit mono WAV, written once at the end (≤30 s ≈ 960 KB).
     fn to_wav(samples: &[i16], rate: u32) -> Vec<u8> {
         let data_len = (samples.len() * 2) as u32;
@@ -1370,7 +1383,37 @@ fn mic_capture_status_json(cap: Option<&MicCapture>, device: &str) -> serde_json
 pub type BeforePlaySubmitHook =
     Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
 
+/// Test hook invoked synchronously inside the per-device audio VAD worker with
+/// `(device_id, hub_event_seq)` (`MG-P1-03`).
+pub type AudioChunkHook = Arc<dyn Fn(&str, u64) + Send + Sync>;
+
 impl VoicePipeline {
+    pub fn hub(&self) -> &Arc<DeviceHub> {
+        &self.hub
+    }
+
+    /// True when `device` belongs to the fixed household speaker acoustic domain
+    /// (loopback speakers, synthetic test devices without `peer_addr`, and
+    /// non-mobile fixed gateways). Non-loopback mobile gateways (such as
+    /// `"android-v2"`) are isolated from household arbitration, passive
+    /// presence, sovereignty playback notices, and foreign cues (`MG-P0-04`).
+    pub fn device_in_household_acoustic_domain(&self, device: &str) -> bool {
+        if !self.hub.device_in_household_acoustic_domain(device) {
+            return false;
+        }
+        if !self.hub.device_is_loopback(device) {
+            let mobile_from_levels = crate::lock_or_recover(&self.mic_levels, "voice.mic_levels")
+                .get(device)
+                .is_some_and(|s| {
+                    DeviceHub::is_mobile_profile_version(s.profile_version.as_deref())
+                });
+            if mobile_from_levels {
+                return false;
+            }
+        }
+        true
+    }
+
     pub fn new(
         hub: Arc<DeviceHub>,
         store: Arc<Store>,
@@ -1394,9 +1437,12 @@ impl VoicePipeline {
         if settings.spoken.detail_words == legacy_default_detail_words() {
             settings.spoken.detail_words = default_detail_words();
         }
-        // Media trim lives on the hub (applied at play submit); seed it from
-        // the persisted settings so a reboot keeps the saved value.
-        hub.set_media_trim_db(settings.media_trim_db);
+        // Media trim lives on the hub (applied at play submit); seed both the
+        // node default and per-device overrides so a reboot keeps saved values.
+        hub.set_media_trim_map(
+            settings.media_trim_db,
+            settings.media_trim_db_by_device.clone(),
+        );
         let silero = SileroSetup::load(&data_dir);
         if silero.model.is_none() {
             tracing::info!(path = %silero.path, detail = %silero.detail,
@@ -1404,7 +1450,7 @@ impl VoicePipeline {
         }
         let (mic_tx, mic_rx) = mpsc::channel(16);
         let pump_control_rx = hub.subscribe_pump_control();
-        let pump_audio_rx = hub.subscribe_pump_audio();
+        let pump_audio_queues = hub.take_pump_audio_queues();
         let started_ms = id::now_ms();
         let arbiter = crate::arbitration::Arbiter::new(store.clone());
         let sovereignty = Arc::new(crate::sovereignty::RoomSessionDomain::new());
@@ -1423,7 +1469,8 @@ impl VoicePipeline {
             mic_tx,
             mic_rx: Mutex::new(Some(mic_rx)),
             pump_control_rx: Mutex::new(Some(pump_control_rx)),
-            pump_audio_rx: Mutex::new(Some(pump_audio_rx)),
+            pump_audio_queues: Mutex::new(pump_audio_queues),
+            test_audio_chunk_hook: Mutex::new(None),
             settings: Mutex::new(settings),
             settings_edit_gate: Mutex::new(()),
             last_cue_synth: Mutex::new(None),
@@ -1441,18 +1488,17 @@ impl VoicePipeline {
             #[cfg(test)]
             input_handoff_finished: tokio::sync::Notify::new(),
             sovereignty,
-            last_arbitration: Mutex::new(None),
+            last_arbitration: Mutex::new(HashMap::new()),
             mic_levels: Mutex::new(HashMap::new()),
             foreign_cues: Mutex::new(std::collections::VecDeque::new()),
             fleet: Mutex::new(None),
             silero,
             reminder_inflight: Mutex::new(HashMap::new()),
             announces: Mutex::new(announce::AnnounceStore::default()),
-            mic_capture: Mutex::new(None),
+            mic_capture: Mutex::new(HashMap::new()),
             wifi_provisioning: Mutex::new(std::collections::BTreeMap::new()),
             events_file,
             memory_extract_enabled: std::sync::atomic::AtomicBool::new(true),
-            audio_dropped_total: std::sync::atomic::AtomicU64::new(0),
             control_lagged_total: std::sync::atomic::AtomicU64::new(0),
             max_control_queue_age_ms: std::sync::atomic::AtomicU64::new(0),
             max_audio_queue_age_ms: std::sync::atomic::AtomicU64::new(0),
@@ -1463,12 +1509,40 @@ impl VoicePipeline {
     /// M1b: one mic processor per device, with the Silero detector when the
     /// model is available. Every construction site goes through here so a
     /// device never accidentally runs a different detector than its peers.
-    fn new_mic_processor(&self) -> MicProcessor {
-        let p = MicProcessor::new(self.live_vad_config());
+    fn new_mic_processor_for(&self, device: &str) -> MicProcessor {
+        let p = MicProcessor::new(self.live_vad_config_for(device));
         match &self.silero.model {
             Some(m) => p.with_silero(crate::silero::SileroDetector::new(m.clone())),
             None => p,
         }
+    }
+
+    pub(super) fn mic_arc(&self, device: &str) -> Option<Arc<Mutex<MicProcessor>>> {
+        crate::lock_or_recover(&self.mic, "voice.mic")
+            .get(device)
+            .cloned()
+    }
+
+    pub(super) fn mic_arc_or_init(&self, device: &str) -> Arc<Mutex<MicProcessor>> {
+        if let Some(arc) = self.mic_arc(device) {
+            return arc;
+        }
+        let created = Arc::new(Mutex::new(self.new_mic_processor_for(device)));
+        let mut map = crate::lock_or_recover(&self.mic, "voice.mic");
+        map.entry(device.to_string()).or_insert(created).clone()
+    }
+
+    pub(super) fn all_mic_arcs(&self) -> Vec<(String, Arc<Mutex<MicProcessor>>)> {
+        crate::lock_or_recover(&self.mic, "voice.mic")
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// Test seam (`MG-P1-03`): install or clear a synchronous hook invoked
+    /// inside each device's audio VAD worker for every `AudioChunk`.
+    pub fn set_test_audio_chunk_hook(&self, hook: Option<AudioChunkHook>) {
+        *crate::lock_or_recover(&self.test_audio_chunk_hook, "voice.test_audio_chunk_hook") = hook;
     }
 
     /// M7-1: turn the session-end memory extractor on/off. Production keeps
@@ -1598,6 +1672,11 @@ impl VoicePipeline {
             .collect()
     }
 
+    /// Map of devices currently in long-press mute Wi-Fi provisioning mode (`device -> since_ms`).
+    pub fn wifi_provisioning_map(&self) -> std::collections::BTreeMap<String, u64> {
+        crate::lock_or_recover(&self.wifi_provisioning, "voice.wifi_provisioning").clone()
+    }
+
     /// Clear Wi-Fi provisioning status for `device`.
     pub fn clear_wifi_provisioning(&self, device: &str) {
         crate::lock_or_recover(&self.wifi_provisioning, "voice.wifi_provisioning").remove(device);
@@ -1618,10 +1697,14 @@ impl VoicePipeline {
             .collect()
     }
 
-    /// Total number of lagged `AudioChunk` frames dropped on the audio channel.
+    /// Total number of lagged `AudioChunk` frames dropped across per-device audio queues.
     pub fn audio_dropped_total(&self) -> u64 {
-        self.audio_dropped_total
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.hub.audio_dropped_total()
+    }
+
+    /// Per-device count of dropped `AudioChunk` frames (`MG-P1-03`).
+    pub fn audio_dropped_by_device(&self) -> std::collections::BTreeMap<String, u64> {
+        self.hub.audio_dropped_by_device()
     }
 
     /// Total number of lagged control events on the control channel.
@@ -1666,6 +1749,7 @@ impl VoicePipeline {
     pub fn pump_metrics_json(&self) -> serde_json::Value {
         json!({
             "audio_dropped_total": self.audio_dropped_total(),
+            "audio_dropped_by_device": self.audio_dropped_by_device(),
             "control_lagged_total": self.control_lagged_total(),
             "lock_poison_total": crate::lock_poison_total(),
             "max_control_queue_age_ms": self.max_control_queue_age_ms(),

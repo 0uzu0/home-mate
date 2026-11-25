@@ -3,10 +3,11 @@
  * The light and the device facts it reflects, plus per-unit Night LED &
  * Orientation configuration wired to GET/PUT /api/v0/devices/:id/profile.
  */
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import {
   LED_STATES,
   getDeviceProfile,
+  isAbort,
   ledStateOf,
   putDeviceProfile,
   type DeviceLedConfig,
@@ -22,6 +23,7 @@ import StatTile from '../StatTile.vue'
 import LedDot from '../LedDot.vue'
 import ProvenanceTag from '../ProvenanceTag.vue'
 import EmptyState from '../EmptyState.vue'
+import ErrorNotice from '../ErrorNotice.vue'
 import Toggle from '../Toggle.vue'
 import NumberField from '../NumberField.vue'
 
@@ -37,6 +39,7 @@ function ledStateLabel(s: string): string {
   switch (s) {
     case 'idle': return t('ledStateIdle')
     case 'listening': return t('ledStateListening')
+    case 'hearing': return t('ledStateHearing')
     case 'wake': return t('ledStateWake')
     case 'thinking': return t('ledStateThinking')
     case 'speaking': return t('ledStateSpeaking')
@@ -69,6 +72,7 @@ function timeToMinutes(value: string, fallback: number): number {
 const nightStartTime = computed({
   get: () => minutesToTime(ledCfg.value.night_start_minute),
   set: (v: string) => {
+    touched.value = true
     ledCfg.value.night_start_minute = timeToMinutes(v, ledCfg.value.night_start_minute)
   },
 })
@@ -76,6 +80,7 @@ const nightStartTime = computed({
 const nightEndTime = computed({
   get: () => minutesToTime(ledCfg.value.night_end_minute),
   set: (v: string) => {
+    touched.value = true
     ledCfg.value.night_end_minute = timeToMinutes(v, ledCfg.value.night_end_minute)
   },
 })
@@ -88,34 +93,60 @@ const ledCfg = ref<DeviceLedConfig>({
   orientation_rotation: 0,
   orientation_reverse: false,
 })
+const loaded = ref(false)
+const loadError = ref<unknown>(null)
+const touched = ref(false)
+let loadSeq = 0
+let loadController: AbortController | null = null
 
 const { busy, message, tone, run } = useSave()
 
 async function loadProfile(id: string): Promise<void> {
+  const seq = ++loadSeq
+  loadController?.abort()
+  const controller = new AbortController()
+  loadController = controller
+  loadError.value = null
   try {
-    const res = await getDeviceProfile(id)
-    if (res.led) {
+    const res = await getDeviceProfile(id, { signal: controller.signal })
+    if (seq !== loadSeq) return
+    if (res.led && !touched.value) {
       ledCfg.value = { ...res.led }
     }
-  } catch {
-    /* keep defaults until reachable */
+    loaded.value = true
+  } catch (err) {
+    if (seq !== loadSeq || isAbort(err)) return
+    loadError.value = err
   }
 }
 
 watch(
   () => props.device?.device,
   (id) => {
+    loaded.value = false
+    loadError.value = null
+    touched.value = false
+    loadSeq += 1
+    loadController?.abort()
+    loadController = null
     if (id) void loadProfile(id)
   },
   { immediate: true },
 )
 
+onBeforeUnmount(() => {
+  loadSeq += 1
+  loadController?.abort()
+  loadController = null
+})
+
 async function saveLedProfile(): Promise<void> {
   const id = props.device?.device
-  if (!id) return
+  if (!id || !loaded.value) return
   await run(async () => {
     const res = await putDeviceProfile(id, { led: ledCfg.value })
     if (res.led) ledCfg.value = { ...res.led }
+    touched.value = false
     return t('ledProfileSaved')
   })
 }
@@ -157,34 +188,59 @@ async function saveLedProfile(): Promise<void> {
 
       <div class="ledcard__profile">
         <p class="ledcard__profile-title">{{ t('ledNightTitle') }}</p>
+        <ErrorNotice
+          v-if="loadError"
+          :error="loadError"
+          compact
+          @retry="device && loadProfile(device.device)"
+        />
         <div class="ledcard__toggles">
-          <Toggle v-model="ledCfg.night_enabled" :label="t('ledNightEnabled')" />
-          <Toggle v-model="ledCfg.orientation_reverse" :label="t('ledOrientationReverse')" />
+          <Toggle
+            v-model="ledCfg.night_enabled"
+            :label="t('ledNightEnabled')"
+            :disabled="busy || !loaded"
+            @update:model-value="touched = true"
+          />
+          <Toggle
+            v-model="ledCfg.orientation_reverse"
+            :label="t('ledOrientationReverse')"
+            :disabled="busy || !loaded"
+            @update:model-value="touched = true"
+          />
         </div>
         <div class="ledcard__fields">
           <label class="ledcard__time-field">
             <span class="ledcard__time-label">{{ t('ledNightStart') }}</span>
-            <input v-model="nightStartTime" type="time" class="ledcard__time-input mono" />
+            <input v-model="nightStartTime" type="time" class="ledcard__time-input mono" :disabled="busy || !loaded" />
           </label>
           <label class="ledcard__time-field">
             <span class="ledcard__time-label">{{ t('ledNightEnd') }}</span>
-            <input v-model="nightEndTime" type="time" class="ledcard__time-input mono" />
+            <input v-model="nightEndTime" type="time" class="ledcard__time-input mono" :disabled="busy || !loaded" />
           </label>
           <NumberField
             v-model="ledCfg.night_brightness_pct"
             :label="t('ledNightBrightness')"
             :min="0"
             :max="100"
+            :disabled="busy || !loaded"
+            @update:model-value="touched = true"
           />
           <NumberField
             v-model="ledCfg.orientation_rotation"
             :label="t('ledOrientationRotation')"
             :min="0"
             :max="11"
+            :disabled="busy || !loaded"
+            @update:model-value="touched = true"
           />
         </div>
         <div class="ledcard__actions">
-          <button type="button" class="btn btn--primary" :disabled="busy" @click="saveLedProfile">
+          <button
+            type="button"
+            class="btn btn--primary"
+            :disabled="busy || !loaded || Boolean(loadError)"
+            @click="saveLedProfile"
+          >
             {{ busy ? t('saving') : t('ledProfileSave') }}
           </button>
           <span v-if="message" :class="`ledcard__msg--${tone}`">{{ message }}</span>

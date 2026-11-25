@@ -57,7 +57,7 @@ async fn reviewed_voice_policy_reaches_live_turns_and_rolls_back() {
         .unwrap()
     };
 
-    read(put("/api/v0/mode/dot2-d").json(&json!({
+    read(put("/api/v0/mode").json(&json!({
         "assistant_name":"Existing Speaker", "persona_prompt":"Existing persona note",
         "follow_window_enabled":true, "followup_credits":3, "tail_blind_ms":333,
     })))

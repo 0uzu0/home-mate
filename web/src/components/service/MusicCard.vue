@@ -37,6 +37,7 @@ interface Draft {
 }
 
 const draft = ref<Draft | null>(null)
+const touched = ref(false)
 const probe = ref<MusicProbe | null>(null)
 const probing = ref(false)
 const probeError = ref('')
@@ -59,7 +60,7 @@ function fromStatus(status: MusicStatus): Draft {
 watch(
   () => music.data.value,
   (status) => {
-    if (status && draft.value === null) draft.value = fromStatus(status)
+    if (status && (draft.value === null || !touched.value)) draft.value = fromStatus(status)
   },
   { immediate: true },
 )
@@ -93,6 +94,7 @@ async function save(): Promise<void> {
     // The server returns the NEW revision; keeping the old one would make the
     // next save a 409.
     draft.value = { ...fromStatus(status), librarySecret: '', onlineSecret: '' }
+    touched.value = false
     await music.load()
   })
 }
@@ -112,7 +114,10 @@ async function runProbe(): Promise<void> {
 
 function reload(): void {
   void music.load().then(() => {
-    if (music.data.value) draft.value = fromStatus(music.data.value)
+    if (music.data.value) {
+      draft.value = fromStatus(music.data.value)
+      touched.value = false
+    }
   })
 }
 </script>
@@ -136,31 +141,45 @@ function reload(): void {
 
     <template v-if="draft">
       <div class="music__switches">
-        <Toggle v-model="draft.enabled" :label="t('musicEnabled')" />
-        <Toggle v-model="draft.prefer_local" :label="t('musicPreferLocal')" />
+        <Toggle v-model="draft.enabled" :label="t('musicEnabled')" @update:model-value="touched = true" />
+        <Toggle v-model="draft.prefer_local" :label="t('musicPreferLocal')" @update:model-value="touched = true" />
       </div>
 
       <div class="music__sources">
         <div class="music__source">
           <p class="music__source-title">{{ t('musicLibrary') }}</p>
-          <TextInput v-model="draft.libraryEndpoint" :label="t('musicEndpoint')" wide placeholder="http://192.168.1.x:4533" />
-          <TextInput v-model="draft.libraryUser" :label="t('musicUser')" />
+          <TextInput
+            v-model="draft.libraryEndpoint"
+            :label="t('musicEndpoint')"
+            wide
+            placeholder="http://192.168.1.x:4533"
+            @update:model-value="touched = true"
+          />
+          <TextInput v-model="draft.libraryUser" :label="t('musicUser')" @update:model-value="touched = true" />
           <PasswordField
             v-model="draft.librarySecret"
             :label="t('musicLibrarySecret')"
             :is-set="music.data.value?.library?.secret_set ?? false"
             :placeholder="music.data.value?.library?.secret_set ? t('musicSecretSet') : t('musicSecretUnset')"
+            @update:model-value="touched = true"
           />
         </div>
         <div class="music__source">
           <p class="music__source-title">{{ t('musicOnline') }}</p>
-          <TextInput v-model="draft.onlineEndpoint" :label="t('musicEndpoint')" wide placeholder="http://192.168.1.x:PORT" />
-          <TextInput v-model="draft.onlineUser" :label="t('musicOnlineUser')" wide />
+          <TextInput
+            v-model="draft.onlineEndpoint"
+            :label="t('musicEndpoint')"
+            wide
+            placeholder="http://192.168.1.x:PORT"
+            @update:model-value="touched = true"
+          />
+          <TextInput v-model="draft.onlineUser" :label="t('musicOnlineUser')" wide @update:model-value="touched = true" />
           <PasswordField
             v-model="draft.onlineSecret"
             :label="t('musicOnlineSecret')"
             :is-set="music.data.value?.online?.secret_set ?? false"
             :placeholder="music.data.value?.online?.secret_set ? t('musicSecretSet') : t('musicSecretUnset')"
+            @update:model-value="touched = true"
           />
         </div>
       </div>

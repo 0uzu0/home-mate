@@ -16,6 +16,19 @@ use std::time::Duration;
 
 const DEFAULT_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_APPLY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Real `hm-kws` sidecar cold reload takes ~6.8s on Dot2 and ~11.8s on LX06
+/// (+ up to 1.5s kill grace), and the Linux Gateway enforces a 20s reload
+/// deadline (`KWS_RELOAD_TIMEOUT_MS`). Keep Core's `ConfigBlock::Kws` wait
+/// strictly above Gateway's timeout so Gateway reports deterministic
+/// `Failed(kws_reload_timeout)` rather than Core spuriously timing out first.
+const KWS_APPLY_TIMEOUT: Duration = Duration::from_secs(25);
+
+pub(super) fn apply_timeout_for(block: ConfigBlock) -> Duration {
+    match block {
+        ConfigBlock::Kws => KWS_APPLY_TIMEOUT,
+        _ => DEFAULT_APPLY_TIMEOUT,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct GatewayDispatchOutcome {
@@ -73,6 +86,55 @@ fn merge_wake_phrases_into_reflex(
     Ok(rfx)
 }
 
+fn merge_retreat_words_into_reflex(
+    base: Option<&ReflexConfig>,
+    words: &[String],
+    err_path: &str,
+) -> Result<ReflexConfig> {
+    let mut rfx = base.cloned().unwrap_or_default();
+    let cleaned: Vec<String> = words
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if cleaned.is_empty() {
+        return Ok(rfx);
+    }
+    let mut next_words = Vec::with_capacity(cleaned.len() + rfx.words.len());
+    for word in rfx.words.iter() {
+        if word.intent != ReflexIntent::Retreat && !cleaned.iter().any(|p| p == word.text.trim()) {
+            next_words.push(word.clone());
+        }
+    }
+    for phrase in &cleaned {
+        if let Some(existing) = rfx.words.iter().find(|w| w.text.trim() == phrase) {
+            let tokens = if existing.tokens.trim().is_empty() {
+                reflex_tokens(phrase)
+                    .map_err(|e| DeliveryError::new("INVALID_REFLEX", e).at(err_path))?
+            } else {
+                existing.tokens.clone()
+            };
+            next_words.push(ReflexWord {
+                text: phrase.clone(),
+                tokens,
+                intent: ReflexIntent::Retreat,
+                enabled: true,
+            });
+        } else {
+            let tokens = reflex_tokens(phrase)
+                .map_err(|e| DeliveryError::new("INVALID_REFLEX", e).at(err_path))?;
+            next_words.push(ReflexWord {
+                text: phrase.clone(),
+                tokens,
+                intent: ReflexIntent::Retreat,
+                enabled: true,
+            });
+        }
+    }
+    rfx.words = next_words;
+    Ok(rfx)
+}
+
 fn compile_kws_block(
     rfx: &ReflexConfig,
     threshold: Option<f64>,
@@ -119,6 +181,7 @@ fn build_led_payload(led: &DeviceLedConfig, timezone: &str) -> Value {
 pub(super) fn build_gateway_payload(
     block_name: &str,
     device: &str,
+    kws_class: crate::voice::DeviceKwsClass,
     desired: &Value,
     expected: Option<&Value>,
     current_voice: Option<&crate::voice::VoiceSettings>,
@@ -172,7 +235,12 @@ pub(super) fn build_gateway_payload(
                 .onset_threshold_dbfs
                 .unwrap_or_else(|| {
                     current_voice
-                        .and_then(|v| v.vad.as_ref().map(|vad| vad.start_db))
+                        .and_then(|v| {
+                            v.vad_by_device
+                                .get(device)
+                                .or(v.vad.as_ref())
+                                .map(|vad| vad.start_db)
+                        })
                         .unwrap_or(-40.0)
                 })
                 .clamp(-120.0, 0.0);
@@ -187,13 +255,32 @@ pub(super) fn build_gateway_payload(
             ));
         }
         "reflex" => {
-            let rfx: ReflexConfig = serde_json::from_value(desired.clone())?;
-            let kws = compile_kws_block(
-                &rfx,
-                current_voice.map(|v| f64::from(v.kws_threshold)),
-                current_voice.map(|v| f64::from(v.kws_score)),
-                "reflex",
-            )?;
+            let mut rfx: ReflexConfig = serde_json::from_value(desired.clone())?;
+            let dev_ov = current_voice.and_then(|v| v.device_overrides.get(device));
+            if let Some(ov_wakes) = dev_ov.and_then(|o| o.wake_words.as_ref()) {
+                rfx = merge_wake_phrases_into_reflex(Some(&rfx), ov_wakes, "reflex")?;
+            }
+            if let Some(ov_retreat) = dev_ov.and_then(|o| o.retreat_words.as_ref()) {
+                rfx = merge_retreat_words_into_reflex(Some(&rfx), ov_retreat, "reflex")?;
+            }
+            let (kws_t, kws_s) = match current_voice {
+                Some(v) => {
+                    let (t, s) = v.effective_kws_for(device, kws_class);
+                    (Some(t), Some(s))
+                }
+                None => match kws_class {
+                    crate::voice::DeviceKwsClass::Android => (
+                        Some(crate::voice::default_android_kws_threshold()),
+                        Some(crate::voice::default_android_kws_score()),
+                    ),
+                    crate::voice::DeviceKwsClass::Lx06 => (
+                        Some(crate::voice::default_lx06_kws_threshold()),
+                        Some(crate::voice::default_lx06_kws_score()),
+                    ),
+                    crate::voice::DeviceKwsClass::Standard => (None, None),
+                },
+            };
+            let kws = compile_kws_block(&rfx, kws_t, kws_s, "reflex")?;
             out.push((ConfigBlock::Kws, kws));
         }
         "node" => {
@@ -218,58 +305,99 @@ pub(super) fn build_gateway_payload(
                     .and_then(|w| w.get("phrases"))
                     .and_then(Value::as_array)
                 {
-                    let phrases: Vec<String> = phrases_arr
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect();
-                    let rfx = merge_wake_phrases_into_reflex(
+                    let dev_ov = current_voice.and_then(|v| v.device_overrides.get(device));
+                    let phrases: Vec<String> =
+                        if let Some(ov_wakes) = dev_ov.and_then(|o| o.wake_words.as_ref()) {
+                            ov_wakes.clone()
+                        } else {
+                            phrases_arr
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        };
+                    let mut rfx = merge_wake_phrases_into_reflex(
                         current_reflex,
                         &phrases,
                         "node.wake.phrases",
                     )?;
-                    let kws = compile_kws_block(
-                        &rfx,
-                        current_voice.map(|v| f64::from(v.kws_threshold)),
-                        current_voice.map(|v| f64::from(v.kws_score)),
-                        "node.wake.phrases",
-                    )?;
+                    if let Some(ov_retreat) = dev_ov.and_then(|o| o.retreat_words.as_ref()) {
+                        rfx = merge_retreat_words_into_reflex(
+                            Some(&rfx),
+                            ov_retreat,
+                            "node.wake.phrases",
+                        )?;
+                    }
+                    let (kws_t, kws_s) = match current_voice {
+                        Some(v) => {
+                            let (t, s) = v.effective_kws_for(device, kws_class);
+                            (Some(t), Some(s))
+                        }
+                        None => match kws_class {
+                            crate::voice::DeviceKwsClass::Android => (
+                                Some(crate::voice::default_android_kws_threshold()),
+                                Some(crate::voice::default_android_kws_score()),
+                            ),
+                            crate::voice::DeviceKwsClass::Lx06 => (
+                                Some(crate::voice::default_lx06_kws_threshold()),
+                                Some(crate::voice::default_lx06_kws_score()),
+                            ),
+                            crate::voice::DeviceKwsClass::Standard => (None, None),
+                        },
+                    };
+                    let kws = compile_kws_block(&rfx, kws_t, kws_s, "node.wake.phrases")?;
                     out.push((ConfigBlock::Kws, kws));
                 }
             }
         }
         "mode" => {
-            let prev_duplex = expected.and_then(|e| e.get("duplex_requested"));
-            let next_duplex = desired.get("duplex_requested");
-            if next_duplex != prev_duplex {
-                if let Some(req) = next_duplex
-                    .and_then(|m| m.get(device))
-                    .and_then(Value::as_str)
-                {
+            // Per-device `duplex_requested` diff (`MG-P1-02`): only dispatch
+            // `ConfigBlock::Duplex` to a device whose own requested mode changed.
+            let prev_dev_duplex = expected
+                .and_then(|e| e.get("duplex_requested"))
+                .and_then(|m| m.get(device))
+                .and_then(Value::as_str);
+            let next_dev_duplex = desired
+                .get("duplex_requested")
+                .and_then(|m| m.get(device))
+                .and_then(Value::as_str);
+            if next_dev_duplex != prev_dev_duplex {
+                if let Some(req) = next_dev_duplex {
                     out.push((ConfigBlock::Duplex, json!({ "duplex_requested": req })));
+                } else if expected.is_some() {
+                    out.push((ConfigBlock::Duplex, json!({ "duplex_requested": "half" })));
                 }
             }
             let prev_kws_t = expected.and_then(|e| e.get("kws_threshold"));
             let prev_kws_s = expected.and_then(|e| e.get("kws_score"));
             let prev_wake = expected.and_then(|e| e.get("wake_words"));
+            let prev_retreat = expected.and_then(|e| e.get("retreat_words"));
             if desired.get("kws_threshold") != prev_kws_t
                 || desired.get("kws_score") != prev_kws_s
                 || desired.get("wake_words") != prev_wake
+                || desired.get("retreat_words") != prev_retreat
             {
-                let mut wake_words: Vec<String> = if desired.get("wake_words") != prev_wake {
-                    desired
-                        .get("wake_words")
-                        .and_then(Value::as_array)
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(Value::as_str)
-                                .map(str::to_string)
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
+                let dev_ov = current_voice.and_then(|v| v.device_overrides.get(device));
+                let eff_voice = current_voice.map(|v| v.effective_for(device));
+                // Prefer per-device `device_overrides[device]` over global desired
+                // values so global config_delivery pushes never clobber per-device overrides.
+                let mut wake_words: Vec<String> =
+                    if let Some(ov_wakes) = dev_ov.and_then(|o| o.wake_words.as_ref()) {
+                        ov_wakes.clone()
+                    } else if desired.get("wake_words") != prev_wake {
+                        desired
+                            .get("wake_words")
+                            .and_then(Value::as_array)
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(Value::as_str)
+                                    .map(str::to_string)
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
                 if wake_words.is_empty() {
                     if let Some(node_phrases) = current_node
                         .and_then(|n| n.get("wake"))
@@ -283,16 +411,55 @@ pub(super) fn build_gateway_payload(
                             .collect();
                     }
                 }
-                let rfx =
+                let mut rfx =
                     merge_wake_phrases_into_reflex(current_reflex, &wake_words, "mode.wake_words")?;
-                let threshold = desired
-                    .get("kws_threshold")
-                    .and_then(Value::as_f64)
-                    .or_else(|| current_voice.map(|v| f64::from(v.kws_threshold)));
-                let score = desired
-                    .get("kws_score")
-                    .and_then(Value::as_f64)
-                    .or_else(|| current_voice.map(|v| f64::from(v.kws_score)));
+                let retreat_words: Option<Vec<String>> =
+                    if let Some(ov_retreat) = dev_ov.and_then(|o| o.retreat_words.as_ref()) {
+                        Some(ov_retreat.clone())
+                    } else if desired.get("retreat_words") != prev_retreat {
+                        desired
+                            .get("retreat_words")
+                            .and_then(Value::as_array)
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(Value::as_str)
+                                    .map(str::to_string)
+                                    .collect()
+                            })
+                    } else {
+                        None
+                    };
+                if let Some(rw) = retreat_words.as_deref() {
+                    rfx = merge_retreat_words_into_reflex(Some(&rfx), rw, "mode.retreat_words")?;
+                }
+                let threshold = dev_ov
+                    .and_then(|o| o.kws_threshold)
+                    .or_else(|| match kws_class {
+                        crate::voice::DeviceKwsClass::Android => {
+                            Some(crate::voice::default_android_kws_threshold())
+                        }
+                        crate::voice::DeviceKwsClass::Lx06 => {
+                            Some(crate::voice::default_lx06_kws_threshold())
+                        }
+                        crate::voice::DeviceKwsClass::Standard => desired
+                            .get("kws_threshold")
+                            .and_then(Value::as_f64)
+                            .or_else(|| eff_voice.as_ref().map(|v| v.kws_threshold)),
+                    });
+                let score = dev_ov
+                    .and_then(|o| o.kws_score)
+                    .or_else(|| match kws_class {
+                        crate::voice::DeviceKwsClass::Android => {
+                            Some(crate::voice::default_android_kws_score())
+                        }
+                        crate::voice::DeviceKwsClass::Lx06 => {
+                            Some(crate::voice::default_lx06_kws_score())
+                        }
+                        crate::voice::DeviceKwsClass::Standard => desired
+                            .get("kws_score")
+                            .and_then(Value::as_f64)
+                            .or_else(|| eff_voice.as_ref().map(|v| v.kws_score)),
+                    });
                 let kws = compile_kws_block(&rfx, threshold, score, "mode")?;
                 out.push((ConfigBlock::Kws, kws));
             }
@@ -309,6 +476,7 @@ pub(super) fn build_gateway_payload(
 pub(super) async fn dispatch_block_v2(
     hub: &DeviceHub,
     device: &str,
+    core_node_id: &str,
     data_epoch: u64,
     application_id: &str,
     desired_revision: u64,
@@ -319,12 +487,14 @@ pub(super) async fn dispatch_block_v2(
     dispatch_block_v2_inner(
         hub,
         device,
+        core_node_id,
         data_epoch,
         application_id,
         desired_revision,
         block_generation,
         block,
         values,
+        false,
         false,
     )
     .await
@@ -334,6 +504,7 @@ pub(super) async fn dispatch_block_v2(
 async fn dispatch_block_v2_clamped(
     hub: &DeviceHub,
     device: &str,
+    core_node_id: &str,
     data_epoch: u64,
     application_id: &str,
     desired_revision: u64,
@@ -344,12 +515,42 @@ async fn dispatch_block_v2_clamped(
     dispatch_block_v2_inner(
         hub,
         device,
+        core_node_id,
         data_epoch,
         application_id,
         desired_revision,
         block_generation,
         block,
         values,
+        true,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_block_v2_reconcile(
+    hub: &DeviceHub,
+    device: &str,
+    core_node_id: &str,
+    data_epoch: u64,
+    application_id: &str,
+    desired_revision: u64,
+    block_generation: u64,
+    block: ConfigBlock,
+    values: Value,
+) -> GatewayDispatchOutcome {
+    dispatch_block_v2_inner(
+        hub,
+        device,
+        core_node_id,
+        data_epoch,
+        application_id,
+        desired_revision,
+        block_generation,
+        block,
+        values,
+        true,
         true,
     )
     .await
@@ -359,6 +560,7 @@ async fn dispatch_block_v2_clamped(
 async fn dispatch_block_v2_inner(
     hub: &DeviceHub,
     device: &str,
+    core_node_id: &str,
     data_epoch: u64,
     application_id: &str,
     desired_revision: u64,
@@ -366,6 +568,7 @@ async fn dispatch_block_v2_inner(
     block: ConfigBlock,
     values: Value,
     clamp_generation: bool,
+    skip_if_active_hash_matches: bool,
 ) -> GatewayDispatchOutcome {
     let block_hash = match digest(&values) {
         Ok(h) => h,
@@ -391,6 +594,29 @@ async fn dispatch_block_v2_inner(
                 blocks,
                 ..
             }) => {
+                if skip_if_active_hash_matches {
+                    if let Some(matched) = blocks.iter().find(|b| {
+                        b.block == block
+                            && b.state == ConfigReceiptStatus::Active
+                            && b.active_hash.as_deref() == Some(block_hash.as_str())
+                    }) {
+                        return GatewayDispatchOutcome {
+                            state: "applied",
+                            error: None,
+                            receipt: json!({
+                                "block": block,
+                                "state": ConfigReceiptStatus::Active,
+                                "skipped_unchanged": true,
+                                "block_generation": matched.block_generation,
+                                "gateway_boot_id": gateway_boot_id,
+                                "state_revision": state_revision,
+                                "persisted_hash": matched.persisted_hash,
+                                "active_hash": matched.active_hash,
+                                "active_values": matched.active_values,
+                            }),
+                        };
+                    }
+                }
                 let effective_gen = if clamp_generation {
                     let existing = blocks
                         .iter()
@@ -520,7 +746,7 @@ async fn dispatch_block_v2_inner(
         let operation_id = id::next("CFGOP");
         let mut rx = match hub.config_apply(ConfigApplyRequest {
             device: device.to_string(),
-            core_node_id: device.to_string(),
+            core_node_id: core_node_id.to_string(),
             data_epoch,
             application_id: application_id.to_string(),
             operation_id: operation_id.clone(),
@@ -545,7 +771,7 @@ async fn dispatch_block_v2_inner(
         };
 
         let mut last_persisted_hash: Option<String> = None;
-        let deadline = tokio::time::Instant::now() + DEFAULT_APPLY_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + apply_timeout_for(block);
         let should_retry;
 
         loop {
@@ -707,6 +933,7 @@ pub(crate) async fn dispatch_unit_acoustics_parts(
     let targets = match build_gateway_payload(
         "unit_acoustic_profiles",
         device,
+        hub.kws_device_class(device),
         &json!({ device: profile }),
         None,
         Some(voice_settings),
@@ -735,16 +962,7 @@ pub(crate) async fn dispatch_unit_acoustics_parts(
         };
     };
 
-    let (revision, data_epoch) = store
-        .with(|c| {
-            Ok(c.query_row(
-                "SELECT revision, data_epoch FROM config_head WHERE id=1",
-                [],
-                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
-            )
-            .unwrap_or((0, 0)))
-        })
-        .unwrap_or((0, 0));
+    let (revision, data_epoch, core_node_id) = read_config_head(store);
 
     let desired_revision = if is_new_write {
         revision.saturating_add(1)
@@ -756,6 +974,7 @@ pub(crate) async fn dispatch_unit_acoustics_parts(
     dispatch_block_v2_clamped(
         hub,
         device,
+        &core_node_id,
         data_epoch,
         &format!("device_profile_{}", id::next("AC")),
         desired_revision,
@@ -783,17 +1002,80 @@ pub(crate) async fn dispatch_unit_acoustics(
     .await
 }
 
-fn read_config_head(store: &crate::store::Store) -> (u64, u64) {
-    store
+pub(super) fn read_config_head(store: &crate::store::Store) -> (u64, u64, String) {
+    let (rev, epoch, node_id) = store
         .with(|c| {
             Ok(c.query_row(
-                "SELECT revision, data_epoch FROM config_head WHERE id=1",
+                "SELECT revision, data_epoch, node_id FROM config_head WHERE id=1",
                 [],
-                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)? as u64,
+                        r.get::<_, i64>(1)? as u64,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
             )
-            .unwrap_or((0, 0)))
+            .unwrap_or((0, 0, String::new())))
         })
-        .unwrap_or((0, 0))
+        .unwrap_or((0, 0, String::new()));
+    let resolved_node = if !node_id.trim().is_empty() {
+        node_id
+    } else {
+        std::env::var("HM_NODE_ID")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                store
+                    .config_get("core_id")
+                    .ok()
+                    .flatten()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or_else(|| "core".to_string())
+    };
+    (rev, epoch, resolved_node)
+}
+
+/// Resolve the effective `ReflexConfig` for `device` (`MG-P1-01` / `MG-P1-02`).
+///
+/// Merges `settings.effective_for(device).wake_words` into the saved reflex table
+/// whenever:
+/// 1. `device` has an explicit per-device `device_overrides[device].wake_words`, OR
+/// 2. `REFLEX_KEY` has never been saved in SQLite and the effective wake words differ
+///    from `default_wake_words()` (e.g. changed via global `PUT /api/v0/mode`).
+pub(crate) fn resolve_reflex_config_for_device(
+    store: &std::sync::Arc<crate::store::Store>,
+    settings: &crate::voice::VoiceSettings,
+    device: &str,
+) -> std::result::Result<ReflexConfig, String> {
+    let has_saved_reflex = store
+        .config_get(crate::config::REFLEX_KEY)
+        .ok()
+        .flatten()
+        .is_some();
+    let mut cfg = crate::config::ConfigService::new(store.clone())
+        .reflex()
+        .map_err(|e| e.to_string())?;
+    let eff = settings.effective_for(device);
+    let dev_ov = settings.device_overrides.get(device);
+    let has_dev_wake_override = dev_ov.and_then(|o| o.wake_words.as_ref()).is_some();
+    let should_merge_wake = has_dev_wake_override
+        || (!has_saved_reflex && eff.wake_words != crate::voice::default_wake_words());
+    if should_merge_wake {
+        cfg = merge_wake_phrases_into_reflex(Some(&cfg), &eff.wake_words, "reflex")
+            .map_err(|e| e.detail)?;
+    }
+    let has_dev_retreat_override = dev_ov.and_then(|o| o.retreat_words.as_ref()).is_some();
+    let should_merge_retreat = has_dev_retreat_override
+        || (!has_saved_reflex && eff.retreat_words != crate::voice::default_retreat_words());
+    if should_merge_retreat {
+        cfg = merge_retreat_words_into_reflex(Some(&cfg), &eff.retreat_words, "reflex")
+            .map_err(|e| e.detail)?;
+    }
+    Ok(cfg)
 }
 
 /// Dispatch the saved `ReflexConfig` (keywords + KWS sensitivity) over Gateway
@@ -805,33 +1087,72 @@ pub(crate) async fn dispatch_reflex_v2(
     settings: &crate::voice::VoiceSettings,
     device: &str,
 ) -> std::result::Result<(crate::voice::ReflexDeploy, Value, Value), String> {
-    let cfg = crate::config::ConfigService::new(store.clone())
-        .reflex()
-        .map_err(|e| e.to_string())?;
+    dispatch_reflex_v2_inner(store, hub, settings, device, false).await
+}
+
+/// Reconnect reconciliation variant of [`dispatch_reflex_v2`]: inspects the
+/// gateway's `ConfigState` preflight first and skips `ConfigValidate` /
+/// `ConfigApply` when `ConfigBlock::Kws` is already `Active` with the exact
+/// desired `block_hash`, preventing redundant `hm-kws` restarts on reconnect
+/// (e.g. LX06 fresh-DB `0.20 / 2.50` reconciliation).
+pub(crate) async fn dispatch_reflex_v2_reconcile(
+    store: &std::sync::Arc<crate::store::Store>,
+    hub: &crate::gateway::DeviceHub,
+    settings: &crate::voice::VoiceSettings,
+    device: &str,
+) -> std::result::Result<(crate::voice::ReflexDeploy, Value, Value), String> {
+    dispatch_reflex_v2_inner(store, hub, settings, device, true).await
+}
+
+async fn dispatch_reflex_v2_inner(
+    store: &std::sync::Arc<crate::store::Store>,
+    hub: &crate::gateway::DeviceHub,
+    settings: &crate::voice::VoiceSettings,
+    device: &str,
+    skip_if_active_hash_matches: bool,
+) -> std::result::Result<(crate::voice::ReflexDeploy, Value, Value), String> {
+    let cfg = resolve_reflex_config_for_device(store, settings, device)?;
     let compiled = compile_keywords(&cfg)?;
     let hash = crate::config::fnv1a_hex(compiled.as_bytes());
     let words = compiled.lines().count() as u64;
     let (retreat_words, intents_hash) = reflex_intent_map(&cfg);
-    let kws_threshold = settings.kws_threshold;
-    let kws_score = settings.kws_score;
+    let (kws_threshold, kws_score) =
+        settings.effective_kws_for(device, hub.kws_device_class(device));
     let values = compile_kws_block(&cfg, Some(kws_threshold), Some(kws_score), "reflex")
         .map_err(|e| e.detail)?;
 
-    let (revision, data_epoch) = read_config_head(store);
+    let (revision, data_epoch, core_node_id) = read_config_head(store);
     let desired_revision = revision;
     let block_generation = desired_revision.saturating_mul(10).saturating_add(1);
     let sent_ms = id::now_ms();
-    let outcome = dispatch_block_v2_clamped(
-        hub,
-        device,
-        data_epoch,
-        &format!("reflex_deploy_{}", id::next("KW")),
-        desired_revision,
-        block_generation,
-        ConfigBlock::Kws,
-        values,
-    )
-    .await;
+    let app_id = format!("reflex_deploy_{}", id::next("KW"));
+    let outcome = if skip_if_active_hash_matches {
+        dispatch_block_v2_reconcile(
+            hub,
+            device,
+            &core_node_id,
+            data_epoch,
+            &app_id,
+            desired_revision,
+            block_generation,
+            ConfigBlock::Kws,
+            values,
+        )
+        .await
+    } else {
+        dispatch_block_v2_clamped(
+            hub,
+            device,
+            &core_node_id,
+            data_epoch,
+            &app_id,
+            desired_revision,
+            block_generation,
+            ConfigBlock::Kws,
+            values,
+        )
+        .await
+    };
     if outcome.state != "applied" {
         return Err(outcome
             .error
@@ -894,11 +1215,12 @@ pub(crate) async fn dispatch_duplex_v2(
     device: &str,
     requested: &str,
 ) -> GatewayDispatchOutcome {
-    let (revision, data_epoch) = read_config_head(store);
+    let (revision, data_epoch, core_node_id) = read_config_head(store);
     let block_generation = revision.saturating_mul(10).saturating_add(1);
     dispatch_block_v2_clamped(
         hub,
         device,
+        &core_node_id,
         data_epoch,
         &format!("reconnect_duplex_{}", id::next("DX")),
         revision,
@@ -920,21 +1242,30 @@ pub(crate) async fn dispatch_audio_eq_v2(
         .audio_eq()
         .unwrap_or_default();
     let desired = serde_json::to_value(&cfg).unwrap_or_else(|_| json!({}));
-    let targets =
-        match build_gateway_payload("audio_eq", device, &desired, None, None, None, None, None) {
-            Ok(t) => t,
-            Err(e) => {
-                return GatewayDispatchOutcome {
-                    state: "failed",
-                    error: Some(format!("{}: {}", e.code, e.detail)),
-                    receipt: json!({
-                        "block": ConfigBlock::AudioEq,
-                        "state": "failed",
-                        "reason": e.detail,
-                    }),
-                };
-            }
-        };
+    let targets = match build_gateway_payload(
+        "audio_eq",
+        device,
+        hub.kws_device_class(device),
+        &desired,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            return GatewayDispatchOutcome {
+                state: "failed",
+                error: Some(format!("{}: {}", e.code, e.detail)),
+                receipt: json!({
+                    "block": ConfigBlock::AudioEq,
+                    "state": "failed",
+                    "reason": e.detail,
+                }),
+            };
+        }
+    };
     let Some((block, values)) = targets.into_iter().next() else {
         return GatewayDispatchOutcome {
             state: "failed",
@@ -942,11 +1273,12 @@ pub(crate) async fn dispatch_audio_eq_v2(
             receipt: json!({ "block": ConfigBlock::AudioEq, "state": "failed" }),
         };
     };
-    let (revision, data_epoch) = read_config_head(store);
+    let (revision, data_epoch, core_node_id) = read_config_head(store);
     let block_generation = revision.saturating_mul(10).saturating_add(1);
     dispatch_block_v2_clamped(
         hub,
         device,
+        &core_node_id,
         data_epoch,
         &format!("reconnect_audio_eq_{}", id::next("EQ")),
         revision,
@@ -955,4 +1287,217 @@ pub(crate) async fn dispatch_audio_eq_v2(
         values,
     )
     .await
+}
+
+/// Dispatch reconnect `DeviceLedConfig` over Gateway `config_apply_v2`
+/// (`ConfigBlock::Led`), reusing [`build_led_payload`].
+pub(crate) async fn dispatch_led_v2(
+    store: &crate::store::Store,
+    hub: &crate::gateway::DeviceHub,
+    device: &str,
+    led: &DeviceLedConfig,
+) -> GatewayDispatchOutcome {
+    let tz = store
+        .config_get("node")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|n| {
+            n.get("led")
+                .and_then(|l| l.get("timezone"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "Asia/Shanghai".to_string());
+    let values = build_led_payload(led, &tz);
+    let (revision, data_epoch, core_node_id) = read_config_head(store);
+    let block_generation = revision.saturating_mul(10).saturating_add(1);
+    dispatch_block_v2_clamped(
+        hub,
+        device,
+        &core_node_id,
+        data_epoch,
+        &format!("reconnect_led_{}", id::next("LD")),
+        revision,
+        block_generation,
+        ConfigBlock::Led,
+        values,
+    )
+    .await
+}
+
+#[cfg(test)]
+mod kws_device_family_tests {
+    use super::*;
+    use crate::voice::{DeviceVoiceOverrides, VoiceSettings};
+
+    #[test]
+    fn kws_config_delivery_uses_android_mobile_defaults_unless_overridden_and_keeps_dot2_global() {
+        let mut voice = VoiceSettings {
+            kws_threshold: 0.32,
+            kws_score: 2.50,
+            ..Default::default()
+        };
+        voice.device_overrides.insert(
+            "android-custom".into(),
+            DeviceVoiceOverrides {
+                kws_threshold: Some(0.19),
+                kws_score: Some(3.35),
+                ..Default::default()
+            },
+        );
+        voice.device_overrides.insert(
+            "lx06-custom".into(),
+            DeviceVoiceOverrides {
+                kws_threshold: Some(0.17),
+                kws_score: Some(2.8),
+                ..Default::default()
+            },
+        );
+        let reflex = ReflexConfig::default();
+        let reflex_json = serde_json::to_value(&reflex).unwrap();
+        let mode_desired = json!({
+            "kws_threshold": 0.32,
+            "kws_score": 2.50,
+            "wake_words": ["你好小智"],
+        });
+        let mode_expected = json!({
+            "kws_threshold": 0.25,
+            "kws_score": 3.0,
+            "wake_words": ["你好小智"],
+        });
+
+        // 1) Android device without per-device override -> 0.22 / 3.00 in both `reflex` and `mode` KWS blocks.
+        let android_reflex = build_gateway_payload(
+            "reflex",
+            "android-sm-f9760-ae77",
+            crate::voice::DeviceKwsClass::Android,
+            &reflex_json,
+            None,
+            Some(&voice),
+            Some(&reflex),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(android_reflex[0].0, ConfigBlock::Kws);
+        assert_eq!(android_reflex[0].1["threshold"], json!(0.22));
+        assert_eq!(android_reflex[0].1["score"], json!(3.0));
+
+        let android_mode = build_gateway_payload(
+            "mode",
+            "android-sm-f9760-ae77",
+            crate::voice::DeviceKwsClass::Android,
+            &mode_desired,
+            Some(&mode_expected),
+            Some(&voice),
+            Some(&reflex),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(android_mode[0].0, ConfigBlock::Kws);
+        assert_eq!(android_mode[0].1["threshold"], json!(0.22));
+        assert_eq!(android_mode[0].1["score"], json!(3.0));
+
+        // 2) Android device WITH explicit per-device override -> honors override (0.19 / 3.35).
+        let android_ov = build_gateway_payload(
+            "mode",
+            "android-custom",
+            crate::voice::DeviceKwsClass::Android,
+            &mode_desired,
+            Some(&mode_expected),
+            Some(&voice),
+            Some(&reflex),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(android_ov[0].0, ConfigBlock::Kws);
+        assert_eq!(android_ov[0].1["threshold"], json!(0.19));
+        assert_eq!(android_ov[0].1["score"], json!(3.35));
+
+        // 3) LX06 device without per-device override -> calibrated 0.20 / 2.50 (never inherits Dot2's 0.32).
+        let lx06_reflex = build_gateway_payload(
+            "reflex",
+            "lx06",
+            crate::voice::DeviceKwsClass::Lx06,
+            &reflex_json,
+            None,
+            Some(&voice),
+            Some(&reflex),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(lx06_reflex[0].0, ConfigBlock::Kws);
+        assert_eq!(lx06_reflex[0].1["threshold"], json!(0.20));
+        assert_eq!(lx06_reflex[0].1["score"], json!(2.5));
+
+        let lx06_mode = build_gateway_payload(
+            "mode",
+            "lx06",
+            crate::voice::DeviceKwsClass::Lx06,
+            &mode_desired,
+            Some(&mode_expected),
+            Some(&voice),
+            Some(&reflex),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(lx06_mode[0].0, ConfigBlock::Kws);
+        assert_eq!(lx06_mode[0].1["threshold"], json!(0.20));
+        assert_eq!(lx06_mode[0].1["score"], json!(2.5));
+
+        // 4) LX06 device WITH explicit per-device override -> honors override (0.17 / 2.80).
+        let lx06_ov = build_gateway_payload(
+            "mode",
+            "lx06-custom",
+            crate::voice::DeviceKwsClass::Lx06,
+            &mode_desired,
+            Some(&mode_expected),
+            Some(&voice),
+            Some(&reflex),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(lx06_ov[0].0, ConfigBlock::Kws);
+        assert_eq!(lx06_ov[0].1["threshold"], json!(0.17));
+        assert_eq!(lx06_ov[0].1["score"], json!(2.8));
+
+        // 5) Dot2 device without override -> keeps global 0.32 / 2.50 in both `reflex` and `mode`.
+        let dot2_reflex = build_gateway_payload(
+            "reflex",
+            "dot2-d",
+            crate::voice::DeviceKwsClass::Standard,
+            &reflex_json,
+            None,
+            Some(&voice),
+            Some(&reflex),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(dot2_reflex[0].0, ConfigBlock::Kws);
+        assert_eq!(dot2_reflex[0].1["threshold"], json!(0.32));
+        assert_eq!(dot2_reflex[0].1["score"], json!(2.5));
+
+        let dot2_mode = build_gateway_payload(
+            "mode",
+            "dot2-d",
+            crate::voice::DeviceKwsClass::Standard,
+            &mode_desired,
+            Some(&mode_expected),
+            Some(&voice),
+            Some(&reflex),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(dot2_mode[0].0, ConfigBlock::Kws);
+        assert_eq!(dot2_mode[0].1["threshold"], json!(0.32));
+        assert_eq!(dot2_mode[0].1["score"], json!(2.5));
+    }
 }

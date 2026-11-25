@@ -19,7 +19,8 @@ impl VoicePipeline {
     fn effective_window_ms(&self, device: &str, now: u64) -> (u64, u64) {
         let (base_follow, context_ms) = {
             let s = crate::lock_or_recover(&self.settings, "voice.settings");
-            (s.follow_window_ms, s.context_window_ms)
+            let eff = s.effective_for(device);
+            (eff.follow_window_ms, eff.context_window_ms)
         };
         let eff_follow = crate::lock_or_recover(&self.states, "voice.states")
             .get(device)
@@ -31,7 +32,7 @@ impl VoicePipeline {
     pub(super) fn sync_learning_wait(&self, device: &str, now: u64) {
         let lease = crate::lock_or_recover(&self.learning, "voice.learning")
             .as_ref()
-            .and_then(|l| l.active_wait(now));
+            .and_then(|l| l.active_wait_for(Some(device), now));
         let mut renew_for_learning = false;
         if let Some(st) = crate::lock_or_recover(&self.states, "voice.states").get_mut(device) {
             match lease {
@@ -43,7 +44,7 @@ impl VoicePipeline {
                 None => st.participation.set_learning_wait(None, 0),
             }
         }
-        if renew_for_learning {
+        if renew_for_learning && self.device_in_household_acoustic_domain(device) {
             let (follow_ms, context_ms) = self.effective_window_ms(device, now);
             let room = self.room_of(device);
             if let Some(owner) = self
@@ -56,14 +57,17 @@ impl VoicePipeline {
         }
     }
 
-    pub(super) fn clear_learning_wait(&self) {
+    pub(super) fn clear_learning_wait(&self, device: &str) {
         if let Some(l) = crate::lock_or_recover(&self.learning, "voice.learning").as_ref() {
-            l.clear_wait();
+            l.clear_wait_for(Some(device));
         }
     }
 
     pub(super) fn claim_sovereignty(&self, device: &str, now: u64) {
         self.sync_learning_wait(device, now);
+        if !self.device_in_household_acoustic_domain(device) {
+            return;
+        }
         let (follow_ms, context_ms) = self.effective_window_ms(device, now);
         let room = self.room_of(device);
         let owner = self
@@ -75,6 +79,9 @@ impl VoicePipeline {
 
     pub(super) fn renew_sovereignty(&self, device: &str, now: u64) {
         self.sync_learning_wait(device, now);
+        if !self.device_in_household_acoustic_domain(device) {
+            return;
+        }
         let (follow_ms, context_ms) = self.effective_window_ms(device, now);
         let room = self.room_of(device);
         if let Some(owner) = self
@@ -87,7 +94,10 @@ impl VoicePipeline {
     }
 
     pub(super) fn release_sovereignty(&self, device: &str, now: u64, clear_context: bool) {
-        self.clear_learning_wait();
+        self.clear_learning_wait(device);
+        if !self.device_in_household_acoustic_domain(device) {
+            return;
+        }
         let room = self.room_of(device);
         if let Some(notice) =
             self.sovereignty
@@ -127,8 +137,8 @@ impl VoicePipeline {
             )
         };
 
-        if let Some(p) = crate::lock_or_recover(&self.mic, "voice.mic").get_mut(device) {
-            p.reset();
+        if let Some(arc) = self.mic_arc(device) {
+            crate::lock_or_recover(&arc, "voice.mic.dev").reset();
         }
         self.apply_capture_revocations();
 
@@ -154,6 +164,9 @@ impl VoicePipeline {
         self_heard: bool,
         fed_ms: Option<u64>,
     ) -> bool {
+        if !self.device_in_household_acoustic_domain(device) {
+            return false;
+        }
         // ARB-08: require real measured NearEndPresence SNR (never `None`,
         // because `DeviceEvent::Keyword` populates `rms_dbfs` with `snr_db=None`)
         // AND calibrated speech level above typical cross-room bleed (-32 dBFS).
@@ -237,7 +250,7 @@ impl VoicePipeline {
             }
         }
         if closed {
-            self.clear_learning_wait();
+            self.clear_learning_wait(device);
             self.release_sovereignty(device, now, false);
         }
         self.push_assistant_state(device, false);

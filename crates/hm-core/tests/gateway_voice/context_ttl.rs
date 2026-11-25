@@ -1053,3 +1053,492 @@ async fn input_lease_production_capture_cap_releases_silent_open_segment() {
     assert!(f.probe.audio.lock().unwrap().is_empty());
     assert!(f.probe.prompts.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn retreat_archives_conversation_isolates_next_turn_and_explicit_clear_still_deletes() {
+    let llm = FakeLlm::new(vec![
+        Scripted::Text {
+            chunks: vec!["第一轮回复内容。".into()],
+        },
+        Scripted::Text {
+            chunks: vec!["第二轮全新回复。".into()],
+        },
+    ]);
+    let (base, state, gw) = spawn_app_with_gateway(llm.clone()).await;
+    set_context_window(&base, 600_000).await;
+
+    // 1) Run a real conversation turn.
+    wake(&state, &gw, 1).await;
+    request(&state, &gw, 2, "RETREAT_ARCHIVED_SECRET_TURN").await;
+    finish_answer(&state, &gw).await;
+    let before_retreat = state.sessions.device_session_id("dot2-d").unwrap();
+    let before_msgs = state.sessions.messages(&before_retreat).unwrap();
+    assert!(
+        before_msgs
+            .iter()
+            .any(|m| m["role"] == "user" && m["content"] == "RETREAT_ARCHIVED_SECRET_TURN"),
+        "expected user turn in active session: {before_msgs:?}"
+    );
+    assert!(
+        before_msgs
+            .iter()
+            .any(|m| m["role"] == "assistant" && m["content"] == "第一轮回复内容。"),
+        "expected assistant reply in active session: {before_msgs:?}"
+    );
+
+    // 2) Retreat closes the session and archives the finished conversation without deleting it.
+    let close_res = state.voice.close_session("dot2-d", None).unwrap();
+    assert_eq!(close_res["closed"], true);
+
+    let after_retreat = state.sessions.device_session_id("dot2-d").unwrap();
+    assert_ne!(
+        after_retreat, before_retreat,
+        "retreat must rotate to a brand-new active context"
+    );
+    assert!(
+        state
+            .sessions
+            .history(&after_retreat, 50)
+            .unwrap()
+            .is_empty(),
+        "new active context after retreat must have 0 carried-over turns for LLM"
+    );
+
+    let archived = state.sessions.device_contexts("dot2-d", None, 10).unwrap();
+    assert!(
+        archived.iter().any(|c| c.session_id == before_retreat),
+        "finished conversation must be listed in archived device_contexts: {archived:?}"
+    );
+    let archived_msgs = state.sessions.messages(&before_retreat).unwrap();
+    assert!(
+        archived_msgs
+            .iter()
+            .any(|m| m["role"] == "user" && m["content"] == "RETREAT_ARCHIVED_SECRET_TURN")
+            && archived_msgs
+                .iter()
+                .any(|m| m["role"] == "assistant" && m["content"] == "第一轮回复内容。"),
+        "archived context must preserve full user+assistant conversation: {archived_msgs:?}"
+    );
+
+    // Readback via HTTP `/api/v0/devices/dot2-d/conversation` exposes the archived session.
+    let conv_api: Value = reqwest::Client::new()
+        .get(format!("{base}/api/v0/devices/dot2-d/conversation"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(conv_api["session_id"], after_retreat);
+    assert!(conv_api["messages"].as_array().unwrap().is_empty());
+    assert!(
+        conv_api["archived_contexts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["session_id"] == before_retreat),
+        "conversation API must expose retreated session in archived_contexts: {conv_api:?}"
+    );
+    let archive_api: Value = reqwest::Client::new()
+        .get(format!("{base}/api/v0/devices/dot2-d/conversation"))
+        .query(&[("context_session_id", &before_retreat)])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(archive_api["view"], "archive");
+    assert!(archive_api["messages"]
+        .to_string()
+        .contains("RETREAT_ARCHIVED_SECRET_TURN"));
+
+    // 3) Next wake + turn starts with 0 carried-over turns in the actual LLM prompt.
+    wake(&state, &gw, 3).await;
+    request(&state, &gw, 4, "新的对话开场").await;
+    finish_answer(&state, &gw).await;
+    let second_prompt = prompt(&llm, 1);
+    assert!(
+        !second_prompt.contains("RETREAT_ARCHIVED_SECRET_TURN"),
+        "retreated context must never leak into the next wake's LLM prompt: {second_prompt}"
+    );
+    assert!(
+        !second_prompt.contains("第一轮回复内容"),
+        "retreated reply must never leak into the next wake's LLM prompt: {second_prompt}"
+    );
+    assert!(!state.sessions.messages(&after_retreat).unwrap().is_empty());
+
+    // 4) Explicit conversation clear (DELETE /api/v0/devices/{id}/conversation) STILL deletes messages.
+    let clear_resp: Value = reqwest::Client::new()
+        .delete(format!("{base}/api/v0/devices/dot2-d/conversation"))
+        .json(&json!({ "expected_session_id": after_retreat }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(clear_resp["cleared"].as_u64().unwrap_or(0) >= 2);
+    assert!(
+        state.sessions.messages(&after_retreat).unwrap().is_empty(),
+        "explicit conversation clear must still delete current session messages"
+    );
+    // Archived conversation from earlier retreat remains intact after clearing current context.
+    assert!(
+        !state.sessions.messages(&before_retreat).unwrap().is_empty(),
+        "clearing current context must not wipe archived contexts"
+    );
+
+    // 5) Explicit clear with `include_archived: true` clears both current AND archived contexts
+    //    so unified conversation history + home preview stay empty on subsequent polls.
+    let stale_all = reqwest::Client::new()
+        .delete(format!("{base}/api/v0/devices/dot2-d/conversation"))
+        .json(&json!({ "expected_session_id": "stale-sid", "include_archived": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        stale_all.status(),
+        reqwest::StatusCode::CONFLICT,
+        "include_archived=true must still enforce SESSION_CHANGED optimistic lock"
+    );
+
+    let clear_all_resp: Value = reqwest::Client::new()
+        .delete(format!("{base}/api/v0/devices/dot2-d/conversation"))
+        .json(&json!({ "expected_session_id": after_retreat, "include_archived": true }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(clear_all_resp["include_archived"], json!(true));
+    assert!(
+        clear_all_resp["cleared"].as_u64().unwrap_or(0) >= 2,
+        "include_archived=true must delete archived session messages: {clear_all_resp:?}"
+    );
+    assert!(
+        state.sessions.messages(&before_retreat).unwrap().is_empty(),
+        "archived session messages must be cleared when include_archived=true"
+    );
+    let after_clear_api: Value = reqwest::Client::new()
+        .get(format!("{base}/api/v0/devices/dot2-d/conversation"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        after_clear_api["messages"].as_array().unwrap().is_empty(),
+        "current messages must be empty after include_archived=true clear"
+    );
+    assert!(
+        after_clear_api["archived_contexts"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "archived_contexts must be empty after include_archived=true clear: {after_clear_api:?}"
+    );
+}
+
+#[tokio::test]
+async fn clear_device_conversation_include_archived_multi_device_scope_and_confirmation_invariants()
+{
+    let llm = FakeLlm::new(vec![
+        Scripted::Text {
+            chunks: vec!["第一轮回答。".into()],
+        },
+        Scripted::Text {
+            chunks: vec!["第二轮回答。".into()],
+        },
+        Scripted::Text {
+            chunks: vec!["清空后的新回答。".into()],
+        },
+    ]);
+    let (base, state, gw) = spawn_app_with_gateway(llm).await;
+    let http = reqwest::Client::new();
+
+    // Register two sibling devices (`dot2-e` with its own history, and `dot2-fresh` with no session).
+    let gw_e = {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hub_c = state.hub.clone();
+        tokio::spawn(async move {
+            if let Ok((stream, peer)) = listener.accept().await {
+                let _ = hub_c.serve_connection_from(stream, Some(peer)).await;
+            }
+        });
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let hello = GatewayFrame::Hello {
+            protocol: 0,
+            min_protocol: 0,
+            supported_versions: vec![],
+            gateway: "fake-gw-extra".into(),
+            gateway_version: "0.0.53".into(),
+            devices: vec![
+                hm_core::gateway::HelloDevice {
+                    stable_id: "dot2-e".into(),
+                    model: "AEOBC".into(),
+                    firmware: Some("0.0.53".into()),
+                    capabilities: vec!["audio_in".into(), "audio_out".into()],
+                    audio_profile: "fireos_builtin_speaker".into(),
+                    wifi_ssid: None,
+                },
+                hm_core::gateway::HelloDevice {
+                    stable_id: "dot2-fresh".into(),
+                    model: "AEOBC".into(),
+                    firmware: Some("0.0.53".into()),
+                    capabilities: vec!["audio_in".into(), "audio_out".into()],
+                    audio_profile: "fireos_builtin_speaker".into(),
+                    wifi_ssid: None,
+                },
+            ],
+            aec_tail_ms: None,
+            profile_version: None,
+            auth_token: None,
+        };
+        let line = format!("{}\n", serde_json::to_string(&hello).unwrap());
+        s.write_all(line.as_bytes()).await.unwrap();
+        s.flush().await.unwrap();
+        s
+    };
+    for _ in 0..200 {
+        if state.hub.device_exists("dot2-e") && state.hub.device_exists("dot2-fresh") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(state.hub.device_exists("dot2-e") && state.hub.device_exists("dot2-fresh"));
+
+    // 1) `expected_session_id: ""` with `include_archived: true` succeeds (200, cleared=0)
+    //    ONLY when the device has `current.is_none()`.
+    let fresh_clear: Value = http
+        .delete(format!("{base}/api/v0/devices/dot2-fresh/conversation"))
+        .json(&json!({ "expected_session_id": "", "include_archived": true }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(fresh_clear["cleared"], json!(0));
+    assert_eq!(fresh_clear["include_archived"], json!(true));
+
+    // 2) Populate `dot2-d` with BOTH an archived session (`d_archived`) AND a non-empty current
+    //    session (`d_current`), plus a pending confirmation row on `d_archived`.
+    wake(&state, &gw, 1).await;
+    request(&state, &gw, 2, "第一轮归档内容").await;
+    finish_answer(&state, &gw).await;
+    let d_archived = state
+        .sessions
+        .current_device_session_id("dot2-d")
+        .unwrap()
+        .unwrap();
+    let close_res = state.voice.close_session("dot2-d", None).unwrap();
+    assert_eq!(close_res["closed"], true);
+    wake(&state, &gw, 3).await;
+    request(&state, &gw, 4, "第二轮当前内容").await;
+    finish_answer(&state, &gw).await;
+    let d_current = state
+        .sessions
+        .current_device_session_id("dot2-d")
+        .unwrap()
+        .unwrap();
+    assert_ne!(d_archived, d_current);
+    assert!(!state.sessions.messages(&d_archived).unwrap().is_empty());
+    assert!(!state.sessions.messages(&d_current).unwrap().is_empty());
+
+    // Seed a pending confirmation on `dot2-d`'s archived session.
+    state
+        .store
+        .with(|c| {
+            c.execute(
+                "INSERT INTO confirmations(id,task_id,session_id,requester,actor_key,approver,boot_id,catalog_revision,operation_revision,request_digest,state,revision,data_epoch,session_generation,created_ms,expires_ms,action_json,private_payload) \
+                 VALUES ('conf-arch-1','t-1',?1,'voice','dev:dot2-d',NULL,'boot1','cat1','op1','dig1','pending',1,1,0,1000,9999999999999,'{}','secret')",
+                [&d_archived],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    // Seed `dot2-e` with its own archived + current conversations to verify multi-device isolation.
+    let e_arch_ctx = state
+        .sessions
+        .admit_device_context("dot2-e", 10_000, 180_000, false)
+        .unwrap();
+    state
+        .sessions
+        .append(&e_arch_ctx.session_id, "user", "dot2-e 归档问题")
+        .unwrap();
+    let _ = state
+        .sessions
+        .archive_and_rotate_device_context("dot2-e", 20_000)
+        .unwrap();
+    let e_cur_sid = state
+        .sessions
+        .current_device_session_id("dot2-e")
+        .unwrap()
+        .unwrap();
+    state
+        .sessions
+        .append(&e_cur_sid, "user", "dot2-e 当前问题")
+        .unwrap();
+
+    // 3) `expected_session_id: ""` MUST return 409 SESSION_CHANGED when `current.is_some()`.
+    let empty_lock_bypass = http
+        .delete(format!("{base}/api/v0/devices/dot2-d/conversation"))
+        .json(&json!({ "expected_session_id": "", "include_archived": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        empty_lock_bypass.status(),
+        reqwest::StatusCode::CONFLICT,
+        "empty expected_session_id must NOT bypass optimistic lock when current session exists"
+    );
+
+    // 4) Clearing `dot2-d` with `include_archived: true` deletes BOTH current AND archived
+    //    messages simultaneously, cancels pending confirmations on archived sessions, empties
+    //    `archived_contexts`, and leaves `dot2-e` completely untouched.
+    let clear_both: Value = http
+        .delete(format!("{base}/api/v0/devices/dot2-d/conversation"))
+        .json(&json!({ "expected_session_id": d_current, "include_archived": true }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        clear_both["cleared"].as_u64().unwrap_or(0) >= 4,
+        "must delete both current (>=2) and archived (>=2) messages simultaneously: {clear_both:?}"
+    );
+    assert!(state.sessions.messages(&d_current).unwrap().is_empty());
+    assert!(state.sessions.messages(&d_archived).unwrap().is_empty());
+
+    let conf_state: String = state
+        .store
+        .with(|c| {
+            c.query_row(
+                "SELECT state FROM confirmations WHERE id='conf-arch-1'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(Into::into)
+        })
+        .unwrap();
+    assert_eq!(
+        conf_state, "cancelled",
+        "pending confirmation on archived session must be invalidated"
+    );
+
+    let d_after: Value = http
+        .get(format!("{base}/api/v0/devices/dot2-d/conversation"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(d_after["messages"].as_array().unwrap().is_empty());
+    assert!(d_after["archived_contexts"].as_array().unwrap().is_empty());
+
+    // Sibling `dot2-e` is 100% untouched.
+    let e_after: Value = http
+        .get(format!("{base}/api/v0/devices/dot2-e/conversation"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(e_after["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(e_after["archived_contexts"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        state
+            .sessions
+            .messages(&e_arch_ctx.session_id)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Subsequent turn on `dot2-d` still works cleanly on the preserved head.
+    wake(&state, &gw, 5).await;
+    request(&state, &gw, 6, "清空后的新对话").await;
+    finish_answer(&state, &gw).await;
+    let d_reused: Value = http
+        .get(format!("{base}/api/v0/devices/dot2-d/conversation"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(d_reused["messages"].as_array().unwrap().len() >= 2);
+
+    // 5) B01 scope guard: an unbound/foreign-scope session row in `device_contexts` aborts
+    //    `clear_device_conversation_with_archives(..., true)` with ZERO partial deletion.
+    state
+        .store
+        .with(|c| {
+            let epoch: i64 =
+                c.query_row("SELECT data_epoch FROM config_head WHERE id=1", [], |r| {
+                    r.get(0)
+                })?;
+            c.execute(
+                "INSERT INTO sessions(id,created_ms,title) VALUES ('foreign-unbound-sid',1,'x')",
+                [],
+            )?;
+            c.execute(
+                "INSERT INTO device_contexts(session_id,device,data_epoch,created_ms,last_activity_ms) VALUES ('foreign-unbound-sid','dot2-e',?1,1,1)",
+                [epoch],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let e_head_now = state
+        .store
+        .with(|c| {
+            c.query_row(
+                "SELECT session_id FROM device_contexts WHERE device='dot2-e' ORDER BY generation DESC LIMIT 1",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .map_err(Into::into)
+        })
+        .unwrap();
+    let scope_err = state
+        .sessions
+        .clear_device_conversation_with_archives("dot2-e", &e_head_now, true)
+        .unwrap_err();
+    assert!(
+        scope_err.contains("context scope changed"),
+        "foreign/unbound context must abort clear: {scope_err}"
+    );
+    assert_eq!(
+        state.sessions.messages(&e_cur_sid).unwrap().len(),
+        1,
+        "aborted scope-guard clear must NOT partially delete current messages"
+    );
+    assert_eq!(
+        state
+            .sessions
+            .messages(&e_arch_ctx.session_id)
+            .unwrap()
+            .len(),
+        1,
+        "aborted scope-guard clear must NOT partially delete archived messages"
+    );
+    drop(gw_e);
+}

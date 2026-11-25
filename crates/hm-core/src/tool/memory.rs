@@ -224,7 +224,15 @@ impl Tool for WorkingMemorySetTool {
                         expected_epoch: Some(authority.epoch() as i64),
                     });
                 }
-                ToolResult::observed_ok(json!({"saved":item}))
+                let subject = format!("工作记忆「{}」", item.key_or_topic);
+                ToolResult::observed_ok(json!({"saved":item})).with_fact(crate::tool::ToolFact {
+                    subject,
+                    action: "set".into(),
+                    basis: crate::tool::FactBasis::ReadBack,
+                    confirmed: true,
+                    value: None,
+                    detail: None,
+                })
             }
             Err(e) => ToolResult::failed("WORKING_MEMORY_REJECTED", e, false),
         }

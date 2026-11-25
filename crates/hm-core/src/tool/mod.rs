@@ -362,6 +362,9 @@ impl ToolCtx {
     pub fn authority(&self) -> Option<&crate::execution::Authority> {
         self.authority.as_ref()
     }
+    pub fn is_lan_exempt(&self) -> bool {
+        self.authority.as_ref().is_some_and(|a| a.is_lan_exempt())
+    }
     pub fn with_provenance(mut self, device_id: Option<String>, trace_id: Option<String>) -> Self {
         self.device_id = device_id;
         self.trace_id = trace_id;

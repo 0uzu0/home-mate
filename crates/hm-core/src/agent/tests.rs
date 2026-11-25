@@ -110,6 +110,7 @@ async fn consume_stream_aborts_on_mid_stream_idle_timeout() {
         &mut tx,
         false,
         false,
+        false,
     )
     .await;
     let (err, emitted) = match res {
@@ -145,6 +146,7 @@ async fn consume_stream_wakes_immediately_on_cancel() {
         &mut tx,
         false,
         false,
+        false,
     )
     .await;
     assert!(res.is_err());
@@ -168,6 +170,7 @@ async fn consume_stream_cancels_when_receiver_drops() {
         Duration::from_secs(5),
         &cancel,
         &mut tx,
+        false,
         false,
         false,
     )

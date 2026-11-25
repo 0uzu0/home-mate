@@ -675,9 +675,15 @@ async fn kws_sensitivity_is_validated_saved_and_deployed() {
     let rows = state.config.history(100).unwrap();
     let row = rows
         .iter()
-        .find(|r| r["scope"] == "voice" && r["payload"]["kws_threshold"] == 0.18)
+        .find(|r| {
+            r["scope"] == "voice"
+                && r["payload"]["device_overrides"]["dot2-d"]["kws_threshold"] == 0.18
+        })
         .expect("the change must be in the history");
-    assert_eq!(row["payload"]["kws_score"], 3.5);
+    assert_eq!(
+        row["payload"]["device_overrides"]["dot2-d"]["kws_score"],
+        3.5
+    );
     let backup: Value = client
         .get(format!("{base}/api/v0/config/export"))
         .send()
@@ -686,7 +692,10 @@ async fn kws_sensitivity_is_validated_saved_and_deployed() {
         .json()
         .await
         .unwrap();
-    assert_eq!(backup["mode"]["kws_threshold"], 0.18);
+    assert_eq!(
+        backup["mode"]["device_overrides"]["dot2-d"]["kws_threshold"],
+        0.18
+    );
 
     // The deploy is what puts it on the device.
     assert_eq!(
@@ -730,7 +739,16 @@ async fn kws_sensitivity_is_validated_saved_and_deployed() {
             .status(),
         200
     );
-    assert!((state.voice.settings_snapshot().kws_threshold - 0.18).abs() < 1e-6);
+    assert!(
+        (state
+            .voice
+            .settings_snapshot()
+            .effective_for("dot2-d")
+            .kws_threshold
+            - 0.18)
+            .abs()
+            < 1e-6
+    );
 }
 
 /// Contract v2 #4 (2026-11-16), end to end with the window EXPLICITLY ON

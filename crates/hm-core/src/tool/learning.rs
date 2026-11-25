@@ -16,6 +16,7 @@ use crate::tool::{Availability, SideEffect, Tool, ToolCtx, ToolDescriptor, ToolR
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -64,14 +65,33 @@ fn valid_id(raw: &str) -> bool {
             .any(|c| matches!(c, '/' | '\\' | '?' | '#') || c.is_whitespace() || c.is_control())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActiveLearningOwner {
+    device_key: String,
+    until_ms: u64,
+}
+
 #[derive(Clone)]
 pub struct LearningRuntime {
     store: Arc<Store>,
+    hub: Option<Arc<crate::gateway::DeviceHub>>,
     client: reqwest::Client,
-    wait: Arc<Mutex<Option<LearningWaitLease>>>,
+    wait: Arc<Mutex<HashMap<String, LearningWaitLease>>>,
+    /// Core-side device ownership guard for the active `learning-svc` speaker
+    /// session (`MG-P1-05`): while Device A owns an active session, sibling
+    /// Device B cannot hijack, answer, or terminate it.
+    active_owner: Arc<Mutex<Option<ActiveLearningOwner>>>,
 }
 
 impl LearningRuntime {
+    fn wait_key(device: Option<&str>) -> String {
+        device
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("__default__")
+            .to_string()
+    }
+
     pub fn new(store: Arc<Store>) -> Self {
         let allow_loopback = store.allows_loopback_public();
         let client = crate::tool::http::apply_policy_resolver(
@@ -84,9 +104,115 @@ impl LearningRuntime {
         .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             store,
+            hub: None,
             client,
-            wait: Arc::new(Mutex::new(None)),
+            wait: Arc::new(Mutex::new(HashMap::new())),
+            active_owner: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn with_hub(mut self, hub: Arc<crate::gateway::DeviceHub>) -> Self {
+        self.hub = Some(hub);
+        self
+    }
+
+    fn resolve_authorized_device_id(
+        &self,
+        ctx: &ToolCtx,
+    ) -> Result<Option<String>, Box<ToolResult>> {
+        let device_id = self
+            .resolve_device_id(ctx)
+            .map_err(|e| Box::new(ToolResult::failed("AMBIGUOUS_DEVICE", e, false)))?;
+        if ctx.is_lan_exempt() {
+            let unauthorized = match (&self.hub, device_id.as_deref()) {
+                (Some(hub), Some(dev)) => !hub.device_is_known_lan_device(dev),
+                // Fail closed when no DeviceHub or target device can be proven
+                // to be a non-loopback LAN device (e.g. offline loopback speaker).
+                _ => true,
+            };
+            if unauthorized {
+                let target = device_id.as_deref().unwrap_or("未绑定设备");
+                return Err(Box::new(ToolResult::failed(
+                    "PAIRING_REQUIRED",
+                    format!(
+                        "未认证的局域网访问不允许操作本机音箱「{target}」的学习会话，请使用配对令牌认证"
+                    ),
+                    false,
+                )));
+            }
+        }
+        Ok(device_id)
+    }
+
+    /// Resolve the originating device ID from `ctx.device_id` or single-device
+    /// hub default; fails closed when multiple devices are online and `ctx.device_id`
+    /// is omitted (`MG-P1-05`).
+    pub fn resolve_device_id(&self, ctx: &ToolCtx) -> Result<Option<String>, String> {
+        if let Some(dev) = ctx
+            .device_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Ok(Some(dev.to_string()));
+        }
+        if let Some(hub) = &self.hub {
+            return Ok(hub.resolve_default_audio_out()?.map(|d| d.stable_id));
+        }
+        Ok(None)
+    }
+
+    /// Append `?device_id=...` (percent-encoded) onto a GET path when known.
+    fn with_device_query(path: &str, device_id: Option<&str>) -> String {
+        let Some(dev) = device_id.map(str::trim).filter(|s| !s.is_empty()) else {
+            return path.to_string();
+        };
+        let sep = if path.contains('?') { '&' } else { '?' };
+        let mut encoded = String::with_capacity(dev.len());
+        for b in dev.bytes() {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+                encoded.push(b as char);
+            } else {
+                encoded.push_str(&format!("%{b:02X}"));
+            }
+        }
+        format!("{path}{sep}device_id={encoded}")
+    }
+
+    /// Check whether `caller_device` may operate on the active learning session.
+    /// Rejects sibling devices while another device owns an unexpired active session.
+    pub fn check_session_ownership(
+        &self,
+        caller_device: Option<&str>,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        let caller_key = Self::wait_key(caller_device);
+        let mut guard = crate::lock_or_recover(&self.active_owner, "learning.active_owner");
+        if let Some(owner) = guard.as_ref() {
+            if now_ms >= owner.until_ms {
+                *guard = None;
+                return Ok(());
+            }
+            if owner.device_key != caller_key {
+                return Err(format!(
+                    "learning session is currently active on device '{}' and cannot be modified by '{}'",
+                    owner.device_key, caller_key
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Return the currently active learning session owner device key (if unexpired).
+    pub fn active_owner_device(&self, now_ms: u64) -> Option<String> {
+        let mut guard = crate::lock_or_recover(&self.active_owner, "learning.active_owner");
+        if let Some(owner) = guard.as_ref() {
+            if now_ms < owner.until_ms {
+                return Some(owner.device_key.clone());
+            }
+            *guard = None;
+        }
+        None
     }
 
     pub fn config(&self) -> (PersonalEndpointConfig, Option<String>) {
@@ -96,24 +222,44 @@ impl LearningRuntime {
         (cfg, tok)
     }
 
-    /// Returns the active bounded `LEARN-10` wait lease if still valid at `now_ms`.
-    pub fn active_wait(&self, now_ms: u64) -> Option<LearningWaitLease> {
+    /// Returns the active bounded `LEARN-10` wait lease for `device` (or default scope)
+    /// if still valid at `now_ms`.
+    pub fn active_wait_for(&self, device: Option<&str>, now_ms: u64) -> Option<LearningWaitLease> {
+        let key = Self::wait_key(device);
         let mut guard = crate::lock_or_recover(&self.wait, "learning.wait");
-        if let Some(lease) = guard.as_ref() {
+        if let Some(lease) = guard.get(&key) {
             if now_ms < lease.until_ms {
                 return Some(lease.clone());
             }
-            *guard = None;
+            guard.remove(&key);
         }
         None
     }
 
-    /// Explicitly clears the `LEARN-10` wait lease (pause, end, retreat, close).
-    pub fn clear_wait(&self) {
-        *crate::lock_or_recover(&self.wait, "learning.wait") = None;
+    /// Returns the active bounded `LEARN-10` wait lease for the default scope.
+    #[cfg(test)]
+    pub fn active_wait(&self, now_ms: u64) -> Option<LearningWaitLease> {
+        self.active_wait_for(None, now_ms)
     }
 
-    fn sync_wait_from_response(&self, body: &Value, now_ms: u64) {
+    /// Explicitly clears the `LEARN-10` wait lease and active session ownership
+    /// for `device` (pause, end, retreat, close).
+    pub fn clear_wait_for(&self, device: Option<&str>) {
+        let key = Self::wait_key(device);
+        crate::lock_or_recover(&self.wait, "learning.wait").remove(&key);
+        let mut owner = crate::lock_or_recover(&self.active_owner, "learning.active_owner");
+        if owner.as_ref().is_some_and(|o| o.device_key == key) {
+            *owner = None;
+        }
+    }
+
+    /// Explicitly clears the default-scope `LEARN-10` wait lease.
+    #[cfg(test)]
+    pub fn clear_wait(&self) {
+        self.clear_wait_for(None);
+    }
+
+    pub fn sync_wait_from_response_for(&self, device: Option<&str>, body: &Value, now_ms: u64) {
         let status = body["status"].as_str();
         let active_flag = body["active"].as_bool();
         let has_attempt = body["attempt"].is_object();
@@ -122,22 +268,45 @@ impl LearningRuntime {
         let is_inactive =
             matches!(status, Some("paused" | "ended" | "completed")) || active_flag == Some(false);
         if is_active {
+            let until_ms = now_ms.saturating_add(LEARNING_WAIT_TTL_MS);
+            let session_id = body["session_id"]
+                .as_str()
+                .or_else(|| body["session"]["id"].as_str())
+                .map(String::from);
             let lease = LearningWaitLease {
                 window_ms: LEARNING_WAIT_WINDOW_MS.min(MAX_LEARNING_WAIT_MS),
-                until_ms: now_ms.saturating_add(LEARNING_WAIT_TTL_MS),
-                session_id: body["session_id"]
-                    .as_str()
-                    .or_else(|| body["session"]["id"].as_str())
-                    .map(String::from),
+                until_ms,
+                session_id: session_id.clone(),
                 attempt_id: body["attempt"]["attempt_id"]
                     .as_str()
                     .or_else(|| body["attempt"]["id"].as_str())
                     .or_else(|| body["attempt_id"].as_str())
                     .map(String::from),
             };
-            *crate::lock_or_recover(&self.wait, "learning.wait") = Some(lease);
+            let key = Self::wait_key(device);
+            {
+                let mut guard = crate::lock_or_recover(&self.wait, "learning.wait");
+                if guard.len() >= 32 && !guard.contains_key(&key) {
+                    guard.retain(|_, v| now_ms < v.until_ms);
+                    if guard.len() >= 32 {
+                        if let Some(oldest) = guard
+                            .iter()
+                            .min_by_key(|(_, v)| v.until_ms)
+                            .map(|(k, _)| k.clone())
+                        {
+                            guard.remove(&oldest);
+                        }
+                    }
+                }
+                guard.insert(key.clone(), lease);
+            }
+            let mut owner = crate::lock_or_recover(&self.active_owner, "learning.active_owner");
+            *owner = Some(ActiveLearningOwner {
+                device_key: key,
+                until_ms,
+            });
         } else if is_inactive {
-            self.clear_wait();
+            self.clear_wait_for(device);
         }
     }
 
@@ -209,9 +378,9 @@ impl LearningRuntime {
         serde_json::from_slice(&bytes).map_err(|e| format!("invalid json: {e}"))
     }
 
-    fn clear_if_session_gone(&self, err: &str) {
+    fn clear_if_session_gone_for(&self, device: Option<&str>, err: &str) {
         if err.starts_with("HTTP 404:") || err.starts_with("HTTP 410:") {
-            self.clear_wait();
+            self.clear_wait_for(device);
         }
     }
 
@@ -269,7 +438,7 @@ impl Tool for LearningDecksTool {
         ready_availability(&self.rt)
     }
 
-    async fn execute(&self, _args: Value, _ctx: &ToolCtx) -> ToolResult {
+    async fn execute(&self, _args: Value, ctx: &ToolCtx) -> ToolResult {
         let (cfg, tok) = self.rt.config();
         if !cfg.is_ready() {
             return ToolResult::failed(
@@ -278,11 +447,15 @@ impl Tool for LearningDecksTool {
                 false,
             );
         }
-        match self
-            .rt
-            .get_json(&cfg, tok.as_deref(), &format!("{API_PREFIX}/device/decks"))
-            .await
-        {
+        let device_id = match self.rt.resolve_authorized_device_id(ctx) {
+            Ok(d) => d,
+            Err(denied) => return *denied,
+        };
+        let path = LearningRuntime::with_device_query(
+            &format!("{API_PREFIX}/device/decks"),
+            device_id.as_deref(),
+        );
+        match self.rt.get_json(&cfg, tok.as_deref(), &path).await {
             Ok(v) => ToolResult::observed_ok(v),
             Err(e) => ToolResult::failed("LEARNING_ERROR", e, true),
         }
@@ -325,7 +498,7 @@ impl Tool for LearningStartTool {
         ready_availability(&self.rt)
     }
 
-    async fn execute(&self, args: Value, _ctx: &ToolCtx) -> ToolResult {
+    async fn execute(&self, args: Value, ctx: &ToolCtx) -> ToolResult {
         let (cfg, tok) = self.rt.config();
         if !cfg.is_ready() {
             return ToolResult::failed(
@@ -334,7 +507,20 @@ impl Tool for LearningStartTool {
                 false,
             );
         }
+        let device_id = match self.rt.resolve_authorized_device_id(ctx) {
+            Ok(d) => d,
+            Err(denied) => return *denied,
+        };
+        if let Err(e) = self
+            .rt
+            .check_session_ownership(device_id.as_deref(), id::now_ms())
+        {
+            return ToolResult::failed("LEARNING_DEVICE_BUSY", e, false);
+        }
         let mut obj = serde_json::Map::new();
+        if let Some(dev) = device_id.as_deref() {
+            obj.insert("device_id".into(), Value::String(dev.into()));
+        }
         for key in ["learner_id", "deck_id"] {
             if let Some(s) = args
                 .get(key)
@@ -402,12 +588,23 @@ impl Tool for LearningStartTool {
             )
             .await
         {
-            Ok(v) => {
-                self.rt.sync_wait_from_response(&v, id::now_ms());
-                ToolResult::observed_ok(v)
+            Ok(mut v) => {
+                self.rt
+                    .sync_wait_from_response_for(device_id.as_deref(), &v, id::now_ms());
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("allow_followup_prose".into(), json!(true));
+                }
+                ToolResult::observed_ok(v).with_fact(crate::tool::ToolFact {
+                    subject: "英语学习".into(),
+                    action: "open".into(),
+                    basis: crate::tool::FactBasis::ReadBack,
+                    confirmed: true,
+                    value: None,
+                    detail: None,
+                })
             }
             Err(e) => {
-                self.rt.clear_if_session_gone(&e);
+                self.rt.clear_if_session_gone_for(device_id.as_deref(), &e);
                 ToolResult::failed("LEARNING_ERROR", e, true)
             }
         }
@@ -445,7 +642,7 @@ impl Tool for LearningCurrentTool {
         ready_availability(&self.rt)
     }
 
-    async fn execute(&self, args: Value, _ctx: &ToolCtx) -> ToolResult {
+    async fn execute(&self, args: Value, ctx: &ToolCtx) -> ToolResult {
         let (cfg, tok) = self.rt.config();
         if !cfg.is_ready() {
             return ToolResult::failed(
@@ -454,12 +651,23 @@ impl Tool for LearningCurrentTool {
                 false,
             );
         }
-        let (path, is_speaker_route) = match args
+        let device_id = match self.rt.resolve_authorized_device_id(ctx) {
+            Ok(d) => d,
+            Err(denied) => return *denied,
+        };
+        let (base_path, is_speaker_route) = match args
             .get("binding_id")
             .and_then(Value::as_str)
             .map(str::trim)
         {
             Some(bid) if !bid.is_empty() => {
+                if ctx.is_lan_exempt() {
+                    return ToolResult::failed(
+                        "PAIRING_REQUIRED",
+                        "未认证的局域网访问不允许按 binding_id 读取学习会话，请使用配对令牌认证",
+                        false,
+                    );
+                }
                 if !valid_id(bid) {
                     return ToolResult::failed(
                         "INVALID_ARGS",
@@ -471,14 +679,26 @@ impl Tool for LearningCurrentTool {
             }
             _ => (format!("{API_PREFIX}/device/current"), true),
         };
+        if is_speaker_route {
+            if let Err(e) = self
+                .rt
+                .check_session_ownership(device_id.as_deref(), id::now_ms())
+            {
+                return ToolResult::failed("LEARNING_DEVICE_BUSY", e, false);
+            }
+        }
+        let path = LearningRuntime::with_device_query(&base_path, device_id.as_deref());
         match self.rt.get_json(&cfg, tok.as_deref(), &path).await {
             Ok(v) => {
-                self.rt.sync_wait_from_response(&v, id::now_ms());
+                if is_speaker_route {
+                    self.rt
+                        .sync_wait_from_response_for(device_id.as_deref(), &v, id::now_ms());
+                }
                 ToolResult::observed_ok(v)
             }
             Err(e) => {
                 if is_speaker_route {
-                    self.rt.clear_if_session_gone(&e);
+                    self.rt.clear_if_session_gone_for(device_id.as_deref(), &e);
                 }
                 ToolResult::failed("LEARNING_ERROR", e, true)
             }
@@ -520,7 +740,7 @@ impl Tool for LearningAnswerTool {
         ready_availability(&self.rt)
     }
 
-    async fn execute(&self, args: Value, _ctx: &ToolCtx) -> ToolResult {
+    async fn execute(&self, args: Value, ctx: &ToolCtx) -> ToolResult {
         let (cfg, tok) = self.rt.config();
         if !cfg.is_ready() {
             return ToolResult::failed(
@@ -528,6 +748,16 @@ impl Tool for LearningAnswerTool {
                 "learning-svc is not configured",
                 false,
             );
+        }
+        let device_id = match self.rt.resolve_authorized_device_id(ctx) {
+            Ok(d) => d,
+            Err(denied) => return *denied,
+        };
+        if let Err(e) = self
+            .rt
+            .check_session_ownership(device_id.as_deref(), id::now_ms())
+        {
+            return ToolResult::failed("LEARNING_DEVICE_BUSY", e, false);
         }
         let Some(ans) = args["answer"]
             .as_str()
@@ -544,6 +774,9 @@ impl Tool for LearningAnswerTool {
             );
         }
         let mut obj = serde_json::Map::new();
+        if let Some(dev) = device_id.as_deref() {
+            obj.insert("device_id".into(), Value::String(dev.into()));
+        }
         obj.insert("answer".into(), Value::String(ans.into()));
         obj.insert(
             "auto_grade".into(),
@@ -568,11 +801,12 @@ impl Tool for LearningAnswerTool {
             .await
         {
             Ok(v) => {
-                self.rt.sync_wait_from_response(&v, id::now_ms());
+                self.rt
+                    .sync_wait_from_response_for(device_id.as_deref(), &v, id::now_ms());
                 ToolResult::observed_ok(v)
             }
             Err(e) => {
-                self.rt.clear_if_session_gone(&e);
+                self.rt.clear_if_session_gone_for(device_id.as_deref(), &e);
                 ToolResult::failed("LEARNING_ERROR", e, true)
             }
         }
@@ -610,7 +844,7 @@ impl Tool for LearningRevealTool {
         ready_availability(&self.rt)
     }
 
-    async fn execute(&self, args: Value, _ctx: &ToolCtx) -> ToolResult {
+    async fn execute(&self, args: Value, ctx: &ToolCtx) -> ToolResult {
         let (cfg, tok) = self.rt.config();
         if !cfg.is_ready() {
             return ToolResult::failed(
@@ -619,7 +853,24 @@ impl Tool for LearningRevealTool {
                 false,
             );
         }
-        let body = json!({ "assisted": args["assisted"].as_bool().unwrap_or(false) });
+        let device_id = match self.rt.resolve_authorized_device_id(ctx) {
+            Ok(d) => d,
+            Err(denied) => return *denied,
+        };
+        if let Err(e) = self
+            .rt
+            .check_session_ownership(device_id.as_deref(), id::now_ms())
+        {
+            return ToolResult::failed("LEARNING_DEVICE_BUSY", e, false);
+        }
+        let mut obj = serde_json::Map::new();
+        obj.insert(
+            "assisted".into(),
+            json!(args["assisted"].as_bool().unwrap_or(false)),
+        );
+        if let Some(dev) = device_id.as_deref() {
+            obj.insert("device_id".into(), Value::String(dev.into()));
+        }
         let idem = next_idempotency_uuid("learn-rev");
         match self
             .rt
@@ -627,13 +878,14 @@ impl Tool for LearningRevealTool {
                 &cfg,
                 tok.as_deref(),
                 &format!("{API_PREFIX}/device/current/reveal"),
-                body,
+                Value::Object(obj),
                 Some(&idem),
             )
             .await
         {
             Ok(mut v) => {
-                self.rt.sync_wait_from_response(&v, id::now_ms());
+                self.rt
+                    .sync_wait_from_response_for(device_id.as_deref(), &v, id::now_ms());
                 if let Some(obj) = v.as_object_mut() {
                     obj.insert(
                         "_instruction".into(),
@@ -646,7 +898,7 @@ impl Tool for LearningRevealTool {
                 ToolResult::observed_ok(v)
             }
             Err(e) => {
-                self.rt.clear_if_session_gone(&e);
+                self.rt.clear_if_session_gone_for(device_id.as_deref(), &e);
                 ToolResult::failed("LEARNING_ERROR", e, true)
             }
         }
@@ -686,7 +938,7 @@ impl Tool for LearningControlTool {
         ready_availability(&self.rt)
     }
 
-    async fn execute(&self, args: Value, _ctx: &ToolCtx) -> ToolResult {
+    async fn execute(&self, args: Value, ctx: &ToolCtx) -> ToolResult {
         let (cfg, tok) = self.rt.config();
         if !cfg.is_ready() {
             return ToolResult::failed(
@@ -694,6 +946,16 @@ impl Tool for LearningControlTool {
                 "learning-svc is not configured",
                 false,
             );
+        }
+        let device_id = match self.rt.resolve_authorized_device_id(ctx) {
+            Ok(d) => d,
+            Err(denied) => return *denied,
+        };
+        if let Err(e) = self
+            .rt
+            .check_session_ownership(device_id.as_deref(), id::now_ms())
+        {
+            return ToolResult::failed("LEARNING_DEVICE_BUSY", e, false);
         }
         let Some(action) = args["action"]
             .as_str()
@@ -706,6 +968,11 @@ impl Tool for LearningControlTool {
                 false,
             );
         };
+        let mut obj = serde_json::Map::new();
+        obj.insert("action".into(), Value::String(action.into()));
+        if let Some(dev) = device_id.as_deref() {
+            obj.insert("device_id".into(), Value::String(dev.into()));
+        }
         let idem = next_idempotency_uuid("learn-ctrl");
         match self
             .rt
@@ -713,17 +980,35 @@ impl Tool for LearningControlTool {
                 &cfg,
                 tok.as_deref(),
                 &format!("{API_PREFIX}/device/current/control"),
-                json!({ "action": action }),
+                Value::Object(obj),
                 Some(&idem),
             )
             .await
         {
-            Ok(v) => {
-                self.rt.sync_wait_from_response(&v, id::now_ms());
-                ToolResult::observed_ok(v)
+            Ok(mut v) => {
+                self.rt
+                    .sync_wait_from_response_for(device_id.as_deref(), &v, id::now_ms());
+                let fact_action = match action {
+                    "pause" => "pause",
+                    "resume" => {
+                        if let Some(obj) = v.as_object_mut() {
+                            obj.insert("allow_followup_prose".into(), json!(true));
+                        }
+                        "resume"
+                    }
+                    _ => "stop",
+                };
+                ToolResult::observed_ok(v).with_fact(crate::tool::ToolFact {
+                    subject: "英语学习".into(),
+                    action: fact_action.into(),
+                    basis: crate::tool::FactBasis::ReadBack,
+                    confirmed: true,
+                    value: None,
+                    detail: None,
+                })
             }
             Err(e) => {
-                self.rt.clear_if_session_gone(&e);
+                self.rt.clear_if_session_gone_for(device_id.as_deref(), &e);
                 ToolResult::failed("LEARNING_ERROR", e, true)
             }
         }

@@ -795,3 +795,252 @@ async fn voice_mode_requested_duplex_probe_guard_and_restore_projections_241() {
     assert_eq!(pipe.requested_duplex("dot2-d"), "full");
     assert_eq!(pipe.requested_duplex("unknown-dev"), "half");
 }
+
+/// Hardware-family KWS isolation: Android mobile/panel gateways without an explicit
+/// override use mobile-calibrated defaults (`0.22 / 3.00`), Xiaomi LX06 speakers use
+/// LX06-calibrated defaults (`0.20 / 2.50`), Dot2 (`Standard`) inherits node-global
+/// defaults (`0.32 / 2.50`), and explicit per-device overrides always win.
+#[tokio::test]
+async fn android_kws_defaults_are_isolated_from_dot2_global_defaults() {
+    use tokio::io::AsyncWriteExt;
+
+    let pipe = pipeline();
+    {
+        let mut s = pipe.settings.lock().unwrap();
+        s.kws_threshold = 0.32;
+        s.kws_score = 2.50;
+        s.device_overrides.insert(
+            "android-override".into(),
+            DeviceVoiceOverrides {
+                kws_threshold: Some(0.18),
+                kws_score: Some(3.40),
+                ..Default::default()
+            },
+        );
+    }
+
+    // Connect three gateways: Dot2 + Android mobile + LX06 speaker.
+    let mut ctrl = pipe.hub.subscribe_control();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_hub = pipe.hub.clone();
+    tokio::spawn(async move {
+        for _ in 0..3 {
+            if let Ok((stream, _)) = listener.accept().await {
+                let h = srv_hub.clone();
+                tokio::spawn(async move {
+                    let _ = h.serve_connection(stream).await;
+                });
+            }
+        }
+    });
+
+    let send_hello = |addr: std::net::SocketAddr, hello: crate::gateway::GatewayFrame| async move {
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut line = serde_json::to_string(&hello).unwrap();
+        line.push('\n');
+        client.write_all(line.as_bytes()).await.unwrap();
+        client.flush().await.unwrap();
+        client
+    };
+
+    let _dot2_conn = send_hello(
+        addr,
+        crate::gateway::GatewayFrame::Hello {
+            protocol: 2,
+            min_protocol: 0,
+            supported_versions: vec![0, 1, 2],
+            gateway: "gw-dot2".into(),
+            gateway_version: "0.2.0".into(),
+            devices: vec![crate::gateway::HelloDevice {
+                stable_id: "dot2-d".into(),
+                model: "AEOBC".into(),
+                firmware: Some("hm-firmware 0.0.53".into()),
+                capabilities: vec!["audio_out".into(), "audio_in".into()],
+                audio_profile: "fireos_builtin_speaker".into(),
+                wifi_ssid: None,
+            }],
+            aec_tail_ms: None,
+            profile_version: None,
+            auth_token: None,
+        },
+    )
+    .await;
+
+    let _android_conn = send_hello(
+        addr,
+        crate::gateway::GatewayFrame::Hello {
+            protocol: 2,
+            min_protocol: 0,
+            supported_versions: vec![0, 1, 2],
+            gateway: "home-mate-android".into(),
+            gateway_version: "2.3.8".into(),
+            devices: vec![
+                crate::gateway::HelloDevice {
+                    stable_id: "android-sm-f9760-ae77".into(),
+                    model: "SM-F9760".into(),
+                    firmware: Some("android 15".into()),
+                    capabilities: vec!["audio_out".into(), "audio_in".into()],
+                    audio_profile: "android_phone".into(),
+                    wifi_ssid: None,
+                },
+                crate::gateway::HelloDevice {
+                    stable_id: "phone-desk".into(),
+                    model: "SM-F9760".into(),
+                    firmware: Some("android 15".into()),
+                    capabilities: vec!["audio_out".into(), "audio_in".into()],
+                    audio_profile: "android_phone".into(),
+                    wifi_ssid: None,
+                },
+                crate::gateway::HelloDevice {
+                    stable_id: "android-override".into(),
+                    model: "SM-F9760".into(),
+                    firmware: Some("android 15".into()),
+                    capabilities: vec!["audio_out".into(), "audio_in".into()],
+                    audio_profile: "android_phone".into(),
+                    wifi_ssid: None,
+                },
+            ],
+            aec_tail_ms: None,
+            profile_version: Some("android-v2".into()),
+            auth_token: None,
+        },
+    )
+    .await;
+
+    let _lx06_conn = send_hello(
+        addr,
+        crate::gateway::GatewayFrame::Hello {
+            protocol: 2,
+            min_protocol: 0,
+            supported_versions: vec![0, 1, 2],
+            gateway: "home-mate-device-gateway 0.0.53 (lx06-direct)".into(),
+            gateway_version: "hm-firmware 0.0.53".into(),
+            devices: vec![
+                crate::gateway::HelloDevice {
+                    stable_id: "lx06".into(),
+                    model: "LX06".into(),
+                    firmware: Some("hm-firmware 0.0.53".into()),
+                    capabilities: vec!["audio_out".into(), "audio_in".into()],
+                    audio_profile: "lx06_shared_dmix".into(),
+                    wifi_ssid: None,
+                },
+                crate::gateway::HelloDevice {
+                    stable_id: "living-room-pro".into(),
+                    model: "LX06".into(),
+                    firmware: Some("hm-firmware 0.0.53".into()),
+                    capabilities: vec!["audio_out".into(), "audio_in".into()],
+                    audio_profile: "lx06_shared_dmix".into(),
+                    wifi_ssid: None,
+                },
+            ],
+            aec_tail_ms: None,
+            profile_version: None,
+            auth_token: None,
+        },
+    )
+    .await;
+
+    let mut joined = std::collections::HashSet::new();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while joined.len() < 6 {
+            if let Ok(crate::gateway::DeviceEvent::DeviceJoined { device, .. }) = ctrl.recv().await
+            {
+                joined.insert(device.stable_id);
+            }
+        }
+    })
+    .await
+    .expect("all six test devices must join");
+
+    // Seed states entries so `mode_snapshot` includes all six devices.
+    {
+        let mut states = pipe.states.lock().unwrap();
+        for id in [
+            "dot2-d",
+            "android-sm-f9760-ae77",
+            "phone-desk",
+            "android-override",
+            "lx06",
+            "living-room-pro",
+        ] {
+            states.entry(id.into()).or_default();
+        }
+    }
+
+    assert!(!pipe.hub.is_android_device("dot2-d"));
+    assert!(!pipe.hub.is_lx06_device("dot2-d"));
+    assert!(pipe.hub.is_android_device("android-sm-f9760-ae77"));
+    assert!(pipe.hub.is_android_device("phone-desk"));
+    assert!(pipe.hub.is_android_device("android-override"));
+    assert!(pipe.hub.is_android_device("android-offline-fallback"));
+    assert!(pipe.hub.is_lx06_device("lx06"));
+    assert!(pipe.hub.is_lx06_device("living-room-pro"));
+    assert!(pipe.hub.is_lx06_device("lx06-offline-fallback"));
+    assert_eq!(
+        pipe.hub.kws_device_class("dot2-d"),
+        DeviceKwsClass::Standard
+    );
+    assert_eq!(
+        pipe.hub.kws_device_class("android-sm-f9760-ae77"),
+        DeviceKwsClass::Android
+    );
+    assert_eq!(pipe.hub.kws_device_class("lx06"), DeviceKwsClass::Lx06);
+    assert_eq!(
+        pipe.hub.kws_device_class("living-room-pro"),
+        DeviceKwsClass::Lx06
+    );
+
+    // 1) Android devices without explicit override get 0.22 / 3.00.
+    assert_eq!(pipe.effective_kws_for("android-sm-f9760-ae77"), (0.22, 3.0));
+    assert_eq!(pipe.effective_kws_for("phone-desk"), (0.22, 3.0));
+    assert_eq!(
+        pipe.effective_kws_for("android-offline-fallback"),
+        (0.22, 3.0)
+    );
+
+    // 2) Android device WITH explicit per-device override gets the override values.
+    assert_eq!(pipe.effective_kws_for("android-override"), (0.18, 3.4));
+
+    // 3) LX06 devices without override get LX06-calibrated 0.20 / 2.50 (never inheriting Dot2's 0.32).
+    assert_eq!(pipe.effective_kws_for("lx06"), (0.20, 2.5));
+    assert_eq!(pipe.effective_kws_for("living-room-pro"), (0.20, 2.5));
+    assert_eq!(pipe.effective_kws_for("lx06-offline-fallback"), (0.20, 2.5));
+
+    // 4) Dot2 device without override keeps global 0.32 / 2.50.
+    assert_eq!(pipe.effective_kws_for("dot2-d"), (0.32, 2.5));
+
+    // Verify `/api/v0/mode` device readout matches for every device.
+    let snap = pipe.mode_snapshot();
+    let devs = snap["devices"].as_array().unwrap();
+    let find_dev = |id: &str| devs.iter().find(|d| d["device"] == id).unwrap();
+    assert_eq!(
+        find_dev("android-sm-f9760-ae77")["kws_threshold"],
+        json!(0.22)
+    );
+    assert_eq!(find_dev("android-sm-f9760-ae77")["kws_score"], json!(3.0));
+    assert_eq!(find_dev("phone-desk")["kws_threshold"], json!(0.22));
+    assert_eq!(find_dev("phone-desk")["kws_score"], json!(3.0));
+    assert_eq!(find_dev("android-override")["kws_threshold"], json!(0.18));
+    assert_eq!(find_dev("android-override")["kws_score"], json!(3.4));
+    assert_eq!(find_dev("lx06")["kws_threshold"], json!(0.20));
+    assert_eq!(find_dev("lx06")["kws_score"], json!(2.5));
+    assert_eq!(find_dev("living-room-pro")["kws_threshold"], json!(0.20));
+    assert_eq!(find_dev("living-room-pro")["kws_score"], json!(2.5));
+    assert_eq!(find_dev("dot2-d")["kws_threshold"], json!(0.32));
+    assert_eq!(find_dev("dot2-d")["kws_score"], json!(2.5));
+
+    // Device-scoped mode_snapshot_for also reports Android/LX06 defaults vs Dot2 global vs override.
+    let android_scoped = pipe.mode_snapshot_for(Some("android-sm-f9760-ae77"));
+    assert_eq!(android_scoped["kws_threshold"], json!(0.22));
+    assert_eq!(android_scoped["kws_score"], json!(3.0));
+    let lx06_scoped = pipe.mode_snapshot_for(Some("lx06"));
+    assert_eq!(lx06_scoped["kws_threshold"], json!(0.20));
+    assert_eq!(lx06_scoped["kws_score"], json!(2.5));
+    let override_scoped = pipe.mode_snapshot_for(Some("android-override"));
+    assert_eq!(override_scoped["kws_threshold"], json!(0.18));
+    assert_eq!(override_scoped["kws_score"], json!(3.4));
+    let dot2_scoped = pipe.mode_snapshot_for(Some("dot2-d"));
+    assert_eq!(dot2_scoped["kws_threshold"], json!(0.32));
+    assert_eq!(dot2_scoped["kws_score"], json!(2.5));
+}

@@ -30,8 +30,15 @@ impl ConfigDelivery {
             if let Some(changes) = changed_values(&before, &after) {
                 super::service::merge_known(&mut persisted, &changes);
             }
-            if before["duplex_requested"] != after["duplex_requested"] {
-                persisted["duplex_requested"] = after["duplex_requested"].clone();
+            for map_key in [
+                "duplex_requested",
+                "vad_by_device",
+                "media_trim_db_by_device",
+                "device_overrides",
+            ] {
+                if before.get(map_key) != after.get(map_key) {
+                    sync_optional_map_field(&mut persisted, &after, map_key);
+                }
             }
             persist_payload(&tx, &persisted.to_string(), actor, summary)?;
             tx.commit()?;
@@ -57,11 +64,32 @@ impl ConfigDelivery {
                     .unwrap_or_else(|| canonical.clone())
             };
             super::service::merge_known(&mut opaque, &canonical);
-            opaque["duplex_requested"] = canonical["duplex_requested"].clone();
+            for map_key in [
+                "duplex_requested",
+                "vad_by_device",
+                "media_trim_db_by_device",
+                "device_overrides",
+            ] {
+                sync_optional_map_field(&mut opaque, &canonical, map_key);
+            }
             persist_payload(&tx, &opaque.to_string(), actor, summary)?;
             tx.commit()?;
             Ok(())
         })
+    }
+}
+
+fn sync_optional_map_field(target: &mut Value, source: &Value, key: &str) {
+    let Some(obj) = target.as_object_mut() else {
+        return;
+    };
+    match source.get(key) {
+        Some(v) => {
+            obj.insert(key.to_string(), v.clone());
+        }
+        None => {
+            obj.remove(key);
+        }
     }
 }
 
@@ -214,6 +242,14 @@ pub(super) fn write_projection_on(
     if let Some(changes) = changed_values(&projection(current), desired) {
         super::service::merge_known(&mut persisted, &changes);
     }
+    let next_duplex = desired
+        .get("duplex_requested")
+        .filter(|v| v.is_object())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if let Some(obj) = persisted.as_object_mut() {
+        obj.insert("duplex_requested".into(), next_duplex);
+    }
     persist_payload(c, &persisted.to_string(), actor, summary).map_err(DeliveryError::internal)
 }
 
@@ -287,6 +323,14 @@ fn resolve_projection_with(
     let mut full = serde_json::to_value(current)?;
     check_scope(desired, &projection(current), "mode")?;
     super::service::merge_known(&mut full, desired);
+    let next_duplex = desired
+        .get("duplex_requested")
+        .filter(|v| v.is_object())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if let Some(obj) = full.as_object_mut() {
+        obj.insert("duplex_requested".into(), next_duplex);
+    }
     let next: VoiceSettings = serde_json::from_value(full)?;
     if combined {
         next.validate_reviewed_delivery().map_err(delivery_error)?;

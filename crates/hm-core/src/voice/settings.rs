@@ -1,6 +1,6 @@
 use crate::interaction::Content;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 pub(crate) const VOICE_CFG_KEY: &str = "voice_mode";
 /// Core-side send pacing for streamed TTS (v0.3): keep at most this much
@@ -64,6 +64,36 @@ pub fn default_kws_threshold() -> f64 {
 pub fn default_kws_score() -> f64 {
     3.0
 }
+/// Hardware-family KWS sensitivity class so devices with distinct microphone
+/// arrays never inherit another family's node-global tuning (`MG-P1-01`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceKwsClass {
+    /// Dot2 / standard 7-mic array (inherits node-global `kws_threshold` / `kws_score`).
+    Standard,
+    /// Android phone / tablet / 86-panel gateway (`0.22 / 3.00`).
+    Android,
+    /// Xiaomi AI Speaker Pro (`LX06`, lower PDM floor -> `0.20 / 2.50`).
+    Lx06,
+}
+
+/// Mobile-calibrated KWS sensitivity defaults for Android mobile/panel gateways
+/// (never inheriting Dot2 7-mic array global defaults).
+pub fn default_android_kws_threshold() -> f64 {
+    0.22
+}
+pub fn default_android_kws_score() -> f64 {
+    3.0
+}
+/// Hardware-calibrated KWS sensitivity defaults for Xiaomi LX06 speakers
+/// (measured on live LX06 PDM mic array: 5/5 detection at -38 dBFS, 0 FP on
+/// 22.5 s Chinese negative speech at -30 dBFS; prevents Dot2's 0.32/2.50 from
+/// blacking out far-field `"你好高达"` wake-up on LX06).
+pub fn default_lx06_kws_threshold() -> f64 {
+    0.20
+}
+pub fn default_lx06_kws_score() -> f64 {
+    2.5
+}
 /// Bound on the house-cue pane.
 pub(super) const HOUSE_CUE_PANE: usize = 16;
 
@@ -87,7 +117,8 @@ pub(super) const FILLER_STOP_WAIT_MS: u64 = 200;
 /// finish on its own.
 pub(super) const FILLER_COMPLETE_WAIT_MS: u64 = 1_500;
 /// Bound on waiting for the wake ack's terminal receipt before the command runs.
-pub(super) const ACK_SETTLE_MS: u64 = 1_200;
+/// Sized for LAN/Tailscale gateways so a ~780 ms ack does not time out over RTT.
+pub(super) const ACK_SETTLE_MS: u64 = 2_500;
 /// R1j/P1: how long after a spotted intent the same intent arriving as an
 /// ASR transcript is treated as the same speech.
 pub(super) const REFLEX_DEDUPE_MS: u64 = 3_000;
@@ -102,7 +133,7 @@ pub(super) const TURN_BUDGET_TICK_MS: u64 = 250;
 /// How long a terminal-but-stale output record may stay in `/api/v0/mode`.
 pub(super) const OUTPUT_STALE_MS: u64 = 5_000;
 
-pub(super) fn default_wake_words() -> Vec<String> {
+pub fn default_wake_words() -> Vec<String> {
     vec!["你好高达".into()]
 }
 
@@ -112,6 +143,58 @@ pub(super) fn default_wake_words() -> Vec<String> {
 pub struct VadSettings {
     pub start_db: f32,
     pub end_db: f32,
+}
+
+/// Per-device overrides for unit acoustic and room interaction policies (`MG-P1-01`).
+/// Absent (`None`) fields inherit from the node-level `VoiceSettings` defaults.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DeviceVoiceOverrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kws_threshold: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kws_score: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail_blind_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub barge_in: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub barge_protect_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyword_interrupt: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proactive_speech: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_window_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_window_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_ms: Option<u64>,
+    /// Outer `Option`: whether this device overrides `followup_credits`;
+    /// inner `Option<u8>`: `None` (unlimited) or `Some(n)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub followup_credits: Option<Option<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_window_tone: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_words: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_ack: Option<WakeAckSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retreat_intent: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retreat_words: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asr_wake_fallback: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proactive_asr_wake: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_arbitration: Option<WakeArbitration>,
+}
+
+impl DeviceVoiceOverrides {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -148,6 +231,9 @@ pub struct VoiceSettings {
     /// Measured VAD thresholds (G4); absent = env/first-guess defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vad: Option<VadSettings>,
+    /// Per-device measured VAD thresholds (multi-gateway isolation). Absent = fall back to `vad`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub vad_by_device: HashMap<String, VadSettings>,
     #[serde(default)]
     pub follow_window_tone: bool,
     #[serde(default)]
@@ -166,6 +252,9 @@ pub struct VoiceSettings {
     pub stop_intents: StopIntentSettings,
     #[serde(default = "default_media_trim_db")]
     pub media_trim_db: f64,
+    /// Per-device media-channel trim overrides in dB (multi-gateway isolation).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub media_trim_db_by_device: HashMap<String, f64>,
     #[serde(default = "default_true")]
     pub keyword_interrupt: bool,
     #[serde(default = "default_true")]
@@ -184,6 +273,9 @@ pub struct VoiceSettings {
     pub proactive_asr_wake: bool,
     #[serde(default)]
     pub wake_arbitration: WakeArbitration,
+    /// Per-device acoustic & room policy overrides (`MG-P1-01`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub device_overrides: BTreeMap<String, DeviceVoiceOverrides>,
 }
 
 /// See [`VoiceSettings::wake_arbitration`].
@@ -243,6 +335,70 @@ pub struct SpokenDeliverySettings {
     pub backstop_max_sentences: usize,
     #[serde(default = "default_backstop_max_chars")]
     pub backstop_max_chars: usize,
+}
+
+/// Partial update for `SpokenDeliverySettings` used by `PUT /api/v0/mode`:
+/// omitting `detail_words`, `long_form_words`, or any other field preserves
+/// the currently stored value instead of overwriting it with serde defaults.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct SpokenDeliveryPatch {
+    #[serde(default)]
+    pub max_sentences: Option<usize>,
+    #[serde(default)]
+    pub max_chars: Option<usize>,
+    #[serde(default)]
+    pub detail_max_sentences: Option<usize>,
+    #[serde(default)]
+    pub detail_max_chars: Option<usize>,
+    #[serde(default)]
+    pub detail_words: Option<Vec<String>>,
+    #[serde(default)]
+    pub long_form_words: Option<Vec<String>>,
+    #[serde(default)]
+    pub continue_hint: Option<String>,
+    #[serde(default)]
+    pub resume_lead: Option<String>,
+    #[serde(default)]
+    pub backstop_max_sentences: Option<usize>,
+    #[serde(default)]
+    pub backstop_max_chars: Option<usize>,
+}
+
+impl SpokenDeliveryPatch {
+    pub fn apply_to(&self, base: &SpokenDeliverySettings) -> SpokenDeliverySettings {
+        let mut next = base.clone();
+        if let Some(v) = self.max_sentences {
+            next.max_sentences = v;
+        }
+        if let Some(v) = self.max_chars {
+            next.max_chars = v;
+        }
+        if let Some(v) = self.detail_max_sentences {
+            next.detail_max_sentences = v;
+        }
+        if let Some(v) = self.detail_max_chars {
+            next.detail_max_chars = v;
+        }
+        if let Some(v) = &self.detail_words {
+            next.detail_words = v.clone();
+        }
+        if let Some(v) = &self.long_form_words {
+            next.long_form_words = v.clone();
+        }
+        if let Some(v) = &self.continue_hint {
+            next.continue_hint = v.clone();
+        }
+        if let Some(v) = &self.resume_lead {
+            next.resume_lead = v.clone();
+        }
+        if let Some(v) = self.backstop_max_sentences {
+            next.backstop_max_sentences = v;
+        }
+        if let Some(v) = self.backstop_max_chars {
+            next.backstop_max_chars = v;
+        }
+        next
+    }
 }
 
 pub fn default_spoken_max_sentences() -> usize {
@@ -347,6 +503,101 @@ pub(crate) fn preferred_continue_word(words: &[String]) -> Option<&str> {
 }
 
 impl VoiceSettings {
+    /// Resolve the effective settings for `device` by overlaying any per-device
+    /// overrides (`device_overrides`, `vad_by_device`, `media_trim_db_by_device`)
+    /// onto node-level defaults (`MG-P1-01`).
+    pub fn effective_for(&self, device: &str) -> Self {
+        let mut eff = self.clone();
+        if let Some(vad) = self.vad_by_device.get(device).copied() {
+            eff.vad = Some(vad);
+        }
+        if let Some(db) = self.media_trim_db_by_device.get(device).copied() {
+            eff.media_trim_db = db;
+        }
+        if let Some(ov) = self.device_overrides.get(device) {
+            if let Some(v) = ov.kws_threshold {
+                eff.kws_threshold = v;
+            }
+            if let Some(v) = ov.kws_score {
+                eff.kws_score = v;
+            }
+            if let Some(v) = ov.tail_blind_ms {
+                eff.tail_blind_ms = v;
+            }
+            if let Some(v) = ov.barge_in {
+                eff.barge_in = v;
+            }
+            if let Some(v) = ov.barge_protect_ms {
+                eff.barge_protect_ms = v;
+            }
+            if let Some(v) = ov.keyword_interrupt {
+                eff.keyword_interrupt = v;
+            }
+            if let Some(v) = ov.proactive_speech {
+                eff.proactive_speech = v;
+            }
+            if let Some(v) = ov.follow_window_enabled {
+                eff.follow_window_enabled = v;
+            }
+            if let Some(v) = ov.follow_window_ms {
+                eff.follow_window_ms = v;
+            }
+            if let Some(v) = ov.context_window_ms {
+                eff.context_window_ms = v;
+            }
+            if let Some(v) = ov.followup_credits {
+                eff.followup_credits = v;
+            }
+            if let Some(v) = ov.follow_window_tone {
+                eff.follow_window_tone = v;
+            }
+            if let Some(words) = &ov.wake_words {
+                eff.wake_words = words.clone();
+            }
+            if let Some(ack) = &ov.wake_ack {
+                eff.wake_ack = ack.clone();
+            }
+            if let Some(v) = ov.retreat_intent {
+                eff.retreat_intent = v;
+            }
+            if let Some(words) = &ov.retreat_words {
+                eff.retreat_words = words.clone();
+            }
+            if let Some(v) = ov.asr_wake_fallback {
+                eff.asr_wake_fallback = v;
+            }
+            if let Some(v) = ov.proactive_asr_wake {
+                eff.proactive_asr_wake = v;
+            }
+            if let Some(v) = ov.wake_arbitration {
+                eff.wake_arbitration = v;
+            }
+        }
+        eff
+    }
+
+    /// Resolve effective `(kws_threshold, kws_score)` for `device`.
+    ///
+    /// Explicit per-device overrides always win. When no per-device override is
+    /// set, Android gateways use mobile-calibrated defaults (`0.22 / 3.00`) and
+    /// LX06 speakers use LX06-calibrated defaults (`0.20 / 2.50`) instead of
+    /// copying Dot2's node-global values.
+    pub fn effective_kws_for(&self, device: &str, class: DeviceKwsClass) -> (f64, f64) {
+        let ov = self.device_overrides.get(device);
+        let (fallback_threshold, fallback_score) = match class {
+            DeviceKwsClass::Android => {
+                (default_android_kws_threshold(), default_android_kws_score())
+            }
+            DeviceKwsClass::Lx06 => (default_lx06_kws_threshold(), default_lx06_kws_score()),
+            DeviceKwsClass::Standard => (self.kws_threshold, self.kws_score),
+        };
+        let threshold = ov
+            .and_then(|o| o.kws_threshold)
+            .unwrap_or(fallback_threshold);
+        let score = ov.and_then(|o| o.kws_score).unwrap_or(fallback_score);
+        (threshold, score)
+    }
+
     pub(crate) fn continue_command(&self) -> Option<&str> {
         self.stop_intents
             .enabled
@@ -687,7 +938,7 @@ pub fn default_retreat_words() -> Vec<String> {
 }
 
 /// Short local ack phrases; WAVs are pre-synthesized into `<data_dir>/assets/wake-acks/`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WakeAckSettings {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -695,6 +946,29 @@ pub struct WakeAckSettings {
     pub phrases: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resynth: Option<bool>,
+}
+
+/// Partial update for `wake_ack` on `PUT /api/v0/mode/{dev}`. Omitting
+/// `phrases` preserves existing custom phrases atomically under
+/// `settings_edit_gate`.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct WakeAckPatch {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub phrases: Option<Vec<String>>,
+    #[serde(default)]
+    pub resynth: Option<bool>,
+}
+
+impl From<WakeAckSettings> for WakeAckPatch {
+    fn from(s: WakeAckSettings) -> Self {
+        Self {
+            enabled: Some(s.enabled),
+            phrases: Some(s.phrases),
+            resynth: s.resynth,
+        }
+    }
 }
 
 impl Default for WakeAckSettings {
@@ -753,6 +1027,7 @@ impl Default for VoiceSettings {
             duplex_requested: HashMap::new(),
             wake_words: default_wake_words(),
             vad: None,
+            vad_by_device: HashMap::new(),
             follow_window_tone: false,
             wake_ack: WakeAckSettings::default(),
             retreat_intent: true,
@@ -763,6 +1038,7 @@ impl Default for VoiceSettings {
             stop_intents: StopIntentSettings::default(),
             tail_blind_ms: default_tail_blind_ms(),
             media_trim_db: default_media_trim_db(),
+            media_trim_db_by_device: HashMap::new(),
             keyword_interrupt: true,
             barge_in: true,
             barge_protect_ms: default_barge_protect_ms(),
@@ -773,6 +1049,7 @@ impl Default for VoiceSettings {
             asr_wake_fallback: true,
             proactive_asr_wake: true,
             wake_arbitration: WakeArbitration::Off,
+            device_overrides: BTreeMap::new(),
         }
     }
 }
@@ -802,6 +1079,8 @@ pub struct FollowWindowPatch {
     pub kws_score: Option<f64>,
     #[serde(skip)]
     pub spoken: Option<SpokenDeliverySettings>,
+    #[serde(skip)]
+    pub spoken_patch: Option<SpokenDeliveryPatch>,
     #[serde(skip)]
     pub idle_asr_enabled: Option<bool>,
     #[serde(skip)]
@@ -892,6 +1171,13 @@ impl Default for FollowWindowPolicy {
             ms: DEFAULT_FOLLOW_WINDOW_MS,
             credits: None,
         }
+    }
+}
+
+impl FollowWindowPolicy {
+    pub(super) fn for_device(s: &VoiceSettings, device: &str) -> Self {
+        let eff = s.effective_for(device);
+        Self::from(&eff)
     }
 }
 

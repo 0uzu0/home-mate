@@ -925,6 +925,13 @@ impl Tool for HomeSetTool {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolCtx) -> ToolResult {
+        if ctx.is_lan_exempt() {
+            return ToolResult::failed(
+                "PAIRING_REQUIRED",
+                "未认证的局域网访问不允许控制智能家居设备，请使用配对令牌认证",
+                false,
+            );
+        }
         let snapshot = self.rt.snapshot();
         let cfg = &snapshot.config;
         // Checked BEFORE anything else: no backend = no request, no fact that

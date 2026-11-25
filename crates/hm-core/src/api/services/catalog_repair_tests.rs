@@ -43,7 +43,12 @@ async fn persisted_provider_collision_keeps_app_status_and_management_repair_ali
         MockInject::default(),
         Some(Arc::new(llm.clone())),
     );
-    let diagnostic = status(State(state.clone())).await.0;
+    let diagnostic = status(
+        State(state.clone()),
+        axum::extract::Query(StatusQuery::default()),
+    )
+    .await
+    .0;
     assert!(diagnostic["tool_catalog_error"]
         .as_str()
         .unwrap()
@@ -79,7 +84,13 @@ async fn persisted_provider_collision_keeps_app_status_and_management_repair_ali
         .open_sockets
         .remove(&state.registry, "workmem.get", "test-management")
         .unwrap());
-    assert!(status(State(state.clone())).await.0["tool_catalog_error"].is_null());
+    assert!(status(
+        State(state.clone()),
+        axum::extract::Query(StatusQuery::default()),
+    )
+    .await
+    .0["tool_catalog_error"]
+        .is_null());
     assert!(!state.registry.specs().is_empty());
     let events: Vec<_> = run_turn(
         state.agent_env().unwrap(),

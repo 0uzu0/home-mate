@@ -116,10 +116,11 @@ async fn close_api_checks_generation_closes_and_returns_the_new_authority() {
         started.elapsed() < Duration::from_secs(1),
         "new authority must be visible within one second"
     );
-    assert!(hm_core::session::SessionStore::new(state.store.clone())
-        .history("dev:dot2-d", 100)
-        .unwrap()
-        .is_empty());
+    let sessions = hm_core::session::SessionStore::new(state.store.clone());
+    let current_sid = sessions.device_session_id("dot2-d").unwrap();
+    assert_ne!(current_sid, "dev:dot2-d");
+    assert!(sessions.history(&current_sid, 100).unwrap().is_empty());
+    assert!(!sessions.history("dev:dot2-d", 100).unwrap().is_empty());
     assert!(stops_within(&gw, Duration::from_millis(100))
         .await
         .contains(&play));

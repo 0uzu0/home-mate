@@ -459,8 +459,35 @@ impl WorkingMemoryStore {
     }
 
     pub fn clear(&self) -> Result<usize, String> {
+        self.clear_scoped(None, None)
+    }
+
+    pub fn clear_scoped(
+        &self,
+        scope_person: Option<&str>,
+        scope_device: Option<&str>,
+    ) -> Result<usize, String> {
+        let person = scope_person.map(normalize_scope).filter(|s| !s.is_empty());
+        let device = scope_device.map(normalize_scope).filter(|s| !s.is_empty());
         self.store
-            .with(|c| Ok(c.execute("DELETE FROM working_memory", [])?))
+            .with(|c| {
+                let n = match (person.as_deref(), device.as_deref()) {
+                    (Some(p), Some(d)) => c.execute(
+                        "DELETE FROM working_memory WHERE scope_person=?1 AND scope_device=?2",
+                        rusqlite::params![p, d],
+                    )?,
+                    (Some(p), None) => c.execute(
+                        "DELETE FROM working_memory WHERE scope_person=?1",
+                        rusqlite::params![p],
+                    )?,
+                    (None, Some(d)) => c.execute(
+                        "DELETE FROM working_memory WHERE scope_device=?1",
+                        rusqlite::params![d],
+                    )?,
+                    (None, None) => c.execute("DELETE FROM working_memory", [])?,
+                };
+                Ok(n)
+            })
             .map_err(|e| e.to_string())
     }
 

@@ -287,7 +287,8 @@ async fn blocked_answer_and_local_clock_synthesis_cannot_speak_after_exit() {
             state.voice.paused_bookmark("dot2-d").is_none(),
             "released old capped TTS must not rebuild a bookmark"
         );
-        assert!(state.sessions.messages("dev:dot2-d").unwrap().is_empty());
+        let current_sid = state.sessions.device_session_id("dot2-d").unwrap();
+        assert!(state.sessions.messages(&current_sid).unwrap().is_empty());
     }
 }
 

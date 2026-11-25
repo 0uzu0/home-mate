@@ -92,17 +92,18 @@ impl Tool for MusicSearchTool {
             _ => None,
         };
 
-        if source == Some(Source::Online) && query.is_empty() && cfg.library.is_none() {
+        if source == Some(Source::Online) && query.is_empty() {
             // The online service is query-driven; "随便放一首" cannot be a
             // search. Saying so lets the model ask for a title instead of
             // reporting "the online source returned nothing" (device log
             // 2026-11-12 13:22: an empty-query online search looked like an
             // empty catalogue).
-            return ToolResult::failed(
-                "MUSIC_QUERY_REQUIRED",
-                "在线源需要一个歌名或歌手（不能空着“随便”搜）；本地曲库没有配置",
-                false,
-            );
+            let msg = if cfg.library.is_none() {
+                "在线源需要一个歌名或歌手（不能空着“随便”搜）；本地曲库没有配置"
+            } else {
+                "在线源需要一个歌名或歌手（不能空着“随便”搜）"
+            };
+            return ToolResult::failed("MUSIC_QUERY_REQUIRED", msg, false);
         }
         let mut tracks: Vec<Track> = Vec::new();
         let mut used_online = false;
@@ -285,9 +286,43 @@ impl Tool for MusicPlayTool {
             );
         };
         let track = tracks[index].clone();
-        let Some(device) = self.rt.hub.primary_audio_out().map(|d| d.stable_id) else {
-            return ToolResult::failed("NO_DEVICE", "没有已连接的输出设备：没有播放任何音频", true);
+        let device = match ctx
+            .device_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(explicit) => explicit.to_string(),
+            None => match self.rt.hub.resolve_default_audio_out() {
+                Ok(Some(d)) => d.stable_id,
+                Ok(None) => {
+                    return ToolResult::failed(
+                        "NO_DEVICE",
+                        "没有已连接的输出设备：没有播放任何音频",
+                        true,
+                    );
+                }
+                Err(msg) => {
+                    return ToolResult::failed("AMBIGUOUS_DEVICE", msg, false);
+                }
+            },
         };
+        if ctx.is_lan_exempt() && !self.rt.hub.device_is_known_lan_device(&device) {
+            return ToolResult::failed(
+                "PAIRING_REQUIRED",
+                format!(
+                    "未认证的局域网访问不允许在本机音箱「{device}」播放音乐，请使用配对令牌认证"
+                ),
+                false,
+            );
+        }
+        if !self.rt.hub.device_online_with_cap(&device, "audio_out") {
+            return ToolResult::failed(
+                "NO_DEVICE",
+                format!("输出设备 {device} 当前不在线或不支持音频输出：没有播放任何音频"),
+                true,
+            );
+        }
         if !self.rt.hub.device_supports(&device, "play_stream") {
             return ToolResult::failed(
                 "DEVICE_NO_STREAM",
@@ -410,11 +445,11 @@ impl Tool for MusicControlTool {
             name: "music.control".into(),
             service: "music".into(),
             side_effect: SideEffect::Mutate,
-            description: "控制当前正在播放/暂停的内容：action=pause 暂停、resume 继续（从暂停位置）、next 下一首/换个台（不重新搜索，电台会切到队列里的下一个台）、stop 停止并丢弃、repeat 设置音乐循环模式（需配合 mode=off|one|all：off 关闭循环、one 单曲循环、all 列表循环；仅支持音乐，电台不能循环）。target 不填就按「当前可控对象」：正在放的音乐优先，其次暂停的故事；两者都在时会反问是哪一项".into(),
+            description: "控制当前正在播放/暂停的内容：action=pause 暂停、resume 继续（从暂停位置）、next 下一首/下一集/换个台（不重新搜索，电台会切到队列里的下一个台）、previous 上一首/上一集、stop 停止并丢弃、repeat 设置音乐循环模式（需配合 mode=off|one|all：off 关闭循环、one 单曲循环、all 列表循环；仅支持音乐，电台不能循环）。target 不填就按「当前可控对象」：正在放的音乐/故事/电台优先，其次暂停的节目；两者都在时会反问是哪一项".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["pause", "resume", "next", "stop", "repeat"] },
+                    "action": { "type": "string", "enum": ["pause", "resume", "next", "previous", "stop", "repeat"] },
                     "mode": {
                         "type": "string",
                         "enum": ["off", "one", "all"],
@@ -429,11 +464,9 @@ impl Tool for MusicControlTool {
     }
 
     fn availability(&self) -> Availability {
-        match self.rt.ready() {
-            Ok(_) => Availability::Ready,
-            Err(MusicError::Disabled | MusicError::SourceDisabled) => Availability::Disabled,
-            Err(_) => Availability::Unconfigured,
-        }
+        // Always ready: `music.control` governs stories, radios, and paused
+        // spoken programs in addition to Navidrome/online music.
+        Availability::Ready
     }
 
     async fn execute(&self, args: Value, ctx: &ToolCtx) -> ToolResult {
@@ -443,10 +476,13 @@ impl Tool for MusicControlTool {
         let Some(action) = args.get("action").and_then(Value::as_str) else {
             return ToolResult::failed("BAD_ARGS", "缺少 action", false);
         };
-        if !matches!(action, "pause" | "resume" | "next" | "stop" | "repeat") {
+        if !matches!(
+            action,
+            "pause" | "resume" | "next" | "previous" | "stop" | "repeat"
+        ) {
             return ToolResult::failed(
                 "BAD_ARGS",
-                "action 必须是 pause/resume/next/stop/repeat",
+                "action 必须是 pause/resume/next/previous/stop/repeat",
                 false,
             );
         }
@@ -455,9 +491,37 @@ impl Tool for MusicControlTool {
             return ToolResult::failed("BAD_ARGS", "设置循环时 mode 必须是 off/one/all", false);
         }
         let target = args.get("target").and_then(Value::as_str);
-        let Some(device) = self.rt.hub.primary_audio_out().map(|d| d.stable_id) else {
-            return ToolResult::failed("NO_DEVICE", "没有已连接的输出设备", true);
+        let device = match ctx
+            .device_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(explicit) => explicit.to_string(),
+            None => match self.rt.hub.resolve_default_audio_out() {
+                Ok(Some(d)) => d.stable_id,
+                Ok(None) => {
+                    return ToolResult::failed("NO_DEVICE", "没有已连接的输出设备", true);
+                }
+                Err(msg) => {
+                    return ToolResult::failed("AMBIGUOUS_DEVICE", msg, false);
+                }
+            },
         };
+        if ctx.is_lan_exempt() && !self.rt.hub.device_is_known_lan_device(&device) {
+            return ToolResult::failed(
+                "PAIRING_REQUIRED",
+                format!("未认证的局域网访问不允许控制本机音箱「{device}」播放，请使用配对令牌认证"),
+                false,
+            );
+        }
+        if !self.rt.hub.device_online_with_cap(&device, "audio_out") {
+            return ToolResult::failed(
+                "NO_DEVICE",
+                format!("输出设备 {device} 当前不在线或不支持音频输出"),
+                true,
+            );
+        }
         match self
             .rt
             .control_with_mode(

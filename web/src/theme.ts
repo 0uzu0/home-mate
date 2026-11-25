@@ -5,10 +5,10 @@
  * paint, so the console never flashes the wrong theme. This module owns the
  * switch after that; `resolvedTheme` mirrors what the document actually has.
  */
-import { computed, ref } from 'vue'
+import { ref } from 'vue'
 
-export type ThemePref = 'auto' | 'light' | 'dark'
-export type ResolvedTheme = 'light' | 'dark'
+type ThemePref = 'auto' | 'light' | 'dark'
+type ResolvedTheme = 'light' | 'dark'
 
 const STORAGE_KEY = 'hm.theme'
 
@@ -33,7 +33,7 @@ function readPreference(): ThemePref {
 }
 
 export const themePref = ref<ThemePref>(readPreference())
-export const resolvedTheme = ref<ResolvedTheme>('light')
+const resolvedTheme = ref<ResolvedTheme>('light')
 
 const query =
   typeof window !== 'undefined' && window.matchMedia
@@ -45,7 +45,7 @@ function resolve(): ResolvedTheme {
   return query?.matches ? 'dark' : 'light'
 }
 
-export function applyTheme(): void {
+function applyTheme(): void {
   resolvedTheme.value = resolve()
   document.documentElement.dataset.theme = resolvedTheme.value
   // The browser chrome colour comes from the tokens themselves, so there is
@@ -57,7 +57,7 @@ export function applyTheme(): void {
   }
 }
 
-export function setThemePref(next: ThemePref): void {
+function setThemePref(next: ThemePref): void {
   themePref.value = next
   try {
     localStorage.setItem(STORAGE_KEY, next)
@@ -78,14 +78,3 @@ export function initTheme(): void {
 export function cycleTheme(): void {
   setThemePref(themePref.value === 'auto' ? 'light' : themePref.value === 'light' ? 'dark' : 'auto')
 }
-
-export const themeLabelKey = computed(() => {
-  switch (themePref.value) {
-    case 'light':
-      return 'themeLight' as const
-    case 'dark':
-      return 'themeDark' as const
-    default:
-      return 'themeAuto' as const
-  }
-})

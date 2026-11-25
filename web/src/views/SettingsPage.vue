@@ -11,7 +11,7 @@
 import { computed, nextTick, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { getStatus } from '../api'
-import { mode, selected, refresh } from '../stores/devices'
+import { mode, refresh } from '../stores/devices'
 import AgentPersonaCard from '../components/settings/AgentPersonaCard.vue'
 import PromptCard from '../components/settings/PromptCard.vue'
 import { t, type Key } from '../i18n'
@@ -169,7 +169,7 @@ function onFactoryReset(): void {
       role="tabpanel"
       aria-labelledby="tab-assistant"
     >
-      <PromptCard :key="`prompt-${resetKey}`" :mode="mode" :device="selected" :refresh="refresh" />
+      <PromptCard :key="`prompt-${resetKey}`" :mode="mode" :refresh="refresh" />
       <MemoryCard :key="`mem-${resetKey}`" />
       <AgentPersonaCard :key="`persona-${resetKey}`" />
       <WorkingMemoryCard v-if="advancedMode" :key="`wm-${resetKey}`" />

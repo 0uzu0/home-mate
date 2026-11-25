@@ -8,7 +8,9 @@
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
     "test:browser": "playwright test",
-    "test:confirmations": "node tests/confirmations.mjs"
+    "test:confirmations": "node tests/confirmations.mjs",
+    "test:multigateway": "node tests/multigateway-console.mjs",
+    "test:audit-wave5": "node tests/audit-wave5.mjs"
   },
   "dependencies": {
     "lucide-vue-next": "^1.0.0",

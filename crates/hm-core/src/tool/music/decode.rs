@@ -15,6 +15,94 @@ pub(crate) struct PcmBlock {
     pub(crate) pcm: Vec<i16>,
 }
 
+/// Maximum PCM sample rate pushed over constrained WAN / VPN / cellular links.
+/// Keeping constrained remote media at `<= 24 kHz` cuts uncompressed Base64-JSON
+/// wire bandwidth in half (`44.1 kHz` `119.5 KB/s` → `22.05 kHz` `60.6 KB/s`;
+/// `48 kHz` → `24 kHz`) so high-RTT cellular/Tailscale links sustain real-time
+/// playback with generous headroom while preserving `11–12 kHz` audio bandwidth.
+/// Local loopback speakers AND low-RTT home LAN Wi-Fi gateways (`compact_link == false`)
+/// always keep native lossless sample rates (`44.1 / 48 kHz`) untouched.
+pub(crate) const COMPACT_MEDIA_MAX_RATE_HZ: u32 = 24_000;
+
+/// Compute the power-of-two decimation factor (`1`, `2`, `4`, ...) and output
+/// sample rate for a target gateway. Both local loopback speakers and healthy
+/// home LAN gateways pass `compact_link = false` and keep `(1, native_rate)`.
+pub(crate) fn select_media_decimation(native_rate: u32, compact_link: bool) -> (usize, u32) {
+    if !compact_link || native_rate <= COMPACT_MEDIA_MAX_RATE_HZ {
+        return (1, native_rate);
+    }
+    let mut factor: usize = 1;
+    let mut out_rate = native_rate;
+    while out_rate > COMPACT_MEDIA_MAX_RATE_HZ {
+        let next = out_rate / 2;
+        if next < 8_000 {
+            break;
+        }
+        factor *= 2;
+        out_rate = next;
+    }
+    (factor, out_rate)
+}
+
+/// Stateful boxcar-averaging integer decimator with carry across `PcmBlock`
+/// boundaries so odd-length decoded frames never drop samples or click.
+pub(crate) struct PcmDecimator {
+    factor: usize,
+    carry: Vec<i16>,
+}
+
+impl PcmDecimator {
+    pub(crate) fn new(factor: usize) -> Self {
+        let factor = factor.max(1);
+        Self {
+            factor,
+            carry: Vec::with_capacity(factor),
+        }
+    }
+
+    pub(crate) fn push_into(&mut self, input: &[i16], out: &mut Vec<i16>) {
+        if self.factor <= 1 {
+            out.extend_from_slice(input);
+            return;
+        }
+        let f = self.factor;
+        let mut idx = 0usize;
+        if !self.carry.is_empty() {
+            let need = f - self.carry.len();
+            if input.len() < need {
+                self.carry.extend_from_slice(input);
+                return;
+            }
+            let mut sum: i32 = self.carry.iter().map(|&s| s as i32).sum();
+            for &s in &input[..need] {
+                sum += s as i32;
+            }
+            out.push((sum / f as i32) as i16);
+            self.carry.clear();
+            idx = need;
+        }
+        let rem = &input[idx..];
+        let full = rem.len() / f;
+        out.reserve(full);
+        for chunk in rem[..full * f].chunks_exact(f) {
+            let sum: i32 = chunk.iter().map(|&s| s as i32).sum();
+            out.push((sum / f as i32) as i16);
+        }
+        let tail = &rem[full * f..];
+        if !tail.is_empty() {
+            self.carry.extend_from_slice(tail);
+        }
+    }
+
+    pub(crate) fn flush_into(&mut self, out: &mut Vec<i16>) {
+        if !self.carry.is_empty() {
+            let sum: i32 = self.carry.iter().map(|&s| s as i32).sum();
+            out.push((sum / self.carry.len() as i32) as i16);
+            self.carry.clear();
+        }
+    }
+}
+
 /// A `Read` over the HTTP body: the async side pulls chunks, this side blocks
 /// on them. That single seam keeps a 4-minute song at one block of memory
 /// instead of a 46 MB PCM buffer on a box with 482 MB of RAM, and it gives the

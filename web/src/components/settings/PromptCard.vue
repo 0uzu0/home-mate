@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
-import { getMode, putPrompts, type ModeDevice, type ModeSnapshot } from '../../api'
+import { getMode, putPrompts, type ModeSnapshot } from '../../api'
 import { t } from '../../i18n'
 import { useSave } from '../../hooks/useSave'
 import { advancedMode } from '../../stores/advanced'
 import Panel from '../Panel.vue'
-const props = defineProps<{ mode: ModeSnapshot | null; device: ModeDevice | null; refresh: () => void | Promise<void> }>()
+import Pill from '../Pill.vue'
+const props = defineProps<{ mode: ModeSnapshot | null; refresh: () => void | Promise<void> }>()
 const assistantName = ref('')
 const persona = ref('')
 const override = ref('')
@@ -34,6 +35,9 @@ async function save(): Promise<void> {
 </script>
 <template>
   <Panel icon="settings" apply="next-turn" :title="t('promptTitle')" :hint="t('promptHint')">
+    <template #actions>
+      <Pill size="sm" tone="info" mono>{{ t('scopeNodeGlobal') }}</Pill>
+    </template>
     <label class="field">{{ t('promptAssistantName') }}
       <input v-model="assistantName" type="text" maxlength="64" placeholder="Home Mate" :disabled="busy" @input="touched = true" />
       <span>{{ t('promptAssistantNameHint') }}</span>

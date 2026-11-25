@@ -45,8 +45,24 @@ const taskId = ref<string | null>(null)
 const listEl = ref<HTMLElement | null>(null)
 const controller = ref<AbortController | null>(null)
 
-const stored = localStorage.getItem('hm.session')
-const sessionId = ref<string | null>(stored)
+function readStoredSession(): string | null {
+  try {
+    return localStorage.getItem('hm.session')
+  } catch {
+    return null
+  }
+}
+
+function writeStoredSession(id: string | null): void {
+  try {
+    if (id) localStorage.setItem('hm.session', id)
+    else localStorage.removeItem('hm.session')
+  } catch {
+    /* private mode / storage disabled */
+  }
+}
+
+const sessionId = ref<string | null>(readStoredSession())
 const sendError = ref('')
 const scopeError = ref('')
 const scopeBusy = ref(false)
@@ -98,7 +114,7 @@ function detail(err: unknown): string {
 
 function resetConversation(): void {
   sessionId.value = null
-  localStorage.removeItem('hm.session')
+  writeStoredSession(null)
   bubbles.value = []
   sendError.value = ''
 }
@@ -210,7 +226,7 @@ async function send(): Promise<void> {
             accepted = true
             input.value = ''
             sessionId.value = String(event.session_id)
-            if (!binding.value) localStorage.setItem('hm.session', sessionId.value)
+            if (!binding.value) writeStoredSession(sessionId.value)
             break
           case 'task':
             taskId.value = String(event.task_id)
@@ -253,6 +269,9 @@ async function send(): Promise<void> {
             break
           case 'turn_end':
             reply.traceId = String(event.trace_id)
+            if (event.status === 'failed' && !reply.text.trim()) {
+              reply.text += `\n⚠ ${t('chatTurnFailed')}`
+            }
             break
           case 'error':
             if (binding.value && /scope binding|scope principal|execution data epoch/i.test(String(event.message))) {
@@ -281,7 +300,17 @@ async function send(): Promise<void> {
 }
 
 async function stop(): Promise<void> {
-  if (taskId.value) await cancelTask(taskId.value)
+  const id = taskId.value
+  const activeController = controller.value
+  const last = bubbles.value[bubbles.value.length - 1]
+  if (last?.role === 'assistant') last.cancelled = true
+  try {
+    if (id) await cancelTask(id)
+  } catch (err) {
+    sendError.value = detail(err)
+  } finally {
+    activeController?.abort()
+  }
 }
 
 async function cancelPending(bubble: Bubble): Promise<void> {

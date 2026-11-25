@@ -878,14 +878,23 @@ async fn coordinator_dispatches_node_wake_phrases_as_full_compiled_kws_and_led_w
                                 kw.contains("n ǐ h ǎo x iǎo zh ì @你好小智\n"),
                                 "KWS keywords must be compiled with pinyin tokens: {kw}"
                             );
-                            for non_wake in ["@暂停播放", "@继续播放", "@下一首", "@停止播放"]
-                            {
+                            for non_wake in [
+                                "@暂停播放",
+                                "@继续播放",
+                                "@下一首",
+                                "@停止播放",
+                                "@退下",
+                                "@退下吧",
+                            ] {
                                 assert!(
                                     kw.contains(non_wake),
                                     "KWS must preserve non-wake reflex words ({non_wake}): {kw}"
                                 );
                             }
-                            assert_eq!(values["retreat_words"], json!(["停止播放"]));
+                            assert_eq!(
+                                values["retreat_words"],
+                                json!(["停止播放", "退下", "退下吧"])
+                            );
                             assert!(values["intents_hash"]
                                 .as_str()
                                 .is_some_and(|s| !s.is_empty()));
@@ -1718,5 +1727,530 @@ async fn deploy_reflex_auto_recovers_after_invalid_kws_rejection_and_fences_stal
             .iter()
             .any(|e| e["kind"] == "keyword" && e["kws_generation"] == g),
         "expected active keyword hit for generation {g}: {hub_events:?}"
+    );
+}
+
+async fn connect_v2_device_with_caps(
+    state: &Arc<AppState>,
+    device_id: &str,
+    caps: Vec<&str>,
+) -> (
+    tokio::io::Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
+    tokio::net::tcp::OwnedWriteHalf,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hub = state.hub.clone();
+    tokio::spawn(async move {
+        let (stream, peer) = listener.accept().await.unwrap();
+        let _ = hub.serve_connection_from(stream, Some(peer)).await;
+    });
+    let stream = TcpStream::connect(addr).await.unwrap();
+    let (rd, mut wr) = stream.into_split();
+    let mut lines = BufReader::new(rd).lines();
+    let hello = GatewayFrame::Hello {
+        protocol: 2,
+        min_protocol: 0,
+        supported_versions: vec![0, 2],
+        gateway: format!("gw-{device_id}"),
+        gateway_version: "2.3.5".into(),
+        devices: vec![HelloDevice {
+            stable_id: device_id.into(),
+            model: "android".into(),
+            firmware: Some("2.3.5".into()),
+            capabilities: caps.into_iter().map(String::from).collect(),
+            audio_profile: "p".into(),
+            wifi_ssid: None,
+        }],
+        aec_tail_ms: None,
+        profile_version: None,
+        auth_token: None,
+    };
+    send_gw(&mut wr, &hello).await;
+    let _ack = lines.next_line().await.unwrap().unwrap();
+    for _ in 0..40 {
+        if state
+            .hub
+            .device_online_with_cap(device_id, "config_apply_v2")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    (lines, wr)
+}
+
+/// Wave 2 Core P1-4: Multi-device `run_gateway_jobs` must:
+/// 1. Cleanly skip unsupported blocks (`skipped_unsupported`) when online v2 devices
+///    lack the requested block capability (`MG-P1-02` #4: never fail an Android-only
+///    fleet on `audio_eq`/`led`).
+/// 2. Isolate sibling failure (`MG-P1-02` #1): when `android-b` fails, healthy sibling
+///    `android-a` is NEVER rolled back, and a follow-up `rev+1` forward apply uses a
+///    strictly higher `block_generation`.
+#[tokio::test]
+async fn multi_device_worker_unsupported_block_and_monotonic_rollback_generation() {
+    let (_dir, state) = make_app();
+    let delivery = ConfigDelivery::for_app(&state);
+    let enrolled = delivery.enroll("nas-core").unwrap();
+    let hh = enrolled["household_id"].as_str().unwrap().to_string();
+
+    // Connect two Android v2 gateways that support KWS but NOT audio_eq.
+    let (mut lines_a, mut wr_a) = connect_v2_device_with_caps(
+        &state,
+        "android-a",
+        vec!["audio_out", "config_apply_v2", "config_block_kws"],
+    )
+    .await;
+    let (mut lines_b, mut wr_b) = connect_v2_device_with_caps(
+        &state,
+        "android-b",
+        vec!["audio_out", "config_apply_v2", "config_block_kws"],
+    )
+    .await;
+    let _worker = ConfigApplyCoordinator::start_for_app(&state);
+
+    // 1. audio_eq apply when NEITHER online v2 gateway advertises config_block_audio_eq
+    // must cleanly skip unsupported devices (`MG-P1-02` #4) without failing the plan.
+    let eq_pkg = make_pkg(
+        &hh,
+        Purpose::NodeConfig,
+        "nas-core",
+        Some("nas-core"),
+        vec![Block {
+            name: "audio_eq".into(),
+            schema_version: 1,
+            operations: vec![Operation::Set {
+                path: "audio_eq.curve".into(),
+                value: json!("official"),
+            }],
+        }],
+    );
+    let eq_pre = delivery.preflight("admin", eq_pkg, json!({})).unwrap();
+    let eq_app_id = "22222222-2222-4222-8222-222222222201";
+    delivery
+        .commit(
+            "admin",
+            &Commit {
+                plan_id: eq_pre["plan_id"].as_str().unwrap().into(),
+                plan_hash: eq_pre["plan_hash"].as_str().unwrap().into(),
+                expected_revision: eq_pre["expected_revision"].as_u64().unwrap(),
+                application_id: eq_app_id.into(),
+            },
+        )
+        .unwrap();
+    let mut eq_rb = json!({});
+    for _ in 0..80 {
+        eq_rb = delivery.readback("admin", eq_app_id).unwrap();
+        if eq_rb["publication"]["state"] == "failed" || eq_rb["publication"]["state"] == "applied" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(eq_rb["publication"]["state"], json!("applied"), "{eq_rb}");
+    let eq_receipts = eq_rb["publication"]["gateway_receipt"]
+        .as_array()
+        .expect("gateway_receipt array");
+    assert_eq!(eq_receipts.len(), 2, "{eq_rb}");
+    assert!(
+        eq_receipts
+            .iter()
+            .all(|r| r["state"] == "skipped_unsupported"),
+        "{eq_rb}"
+    );
+
+    // 2. Multi-device mode.kws_threshold apply where one device fails -> rollback uses
+    // strictly monotonic `rev*10+2`, and the follow-up `rev+1` forward apply (`(rev+1)*10+1`)
+    // strictly exceeds the rollback generation and succeeds on both devices!
+    let gens_a = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+    let gens_a_task = gens_a.clone();
+    let gw_a = tokio::spawn(async move {
+        let mut state_rev = 1u64;
+        let mut last_gen = 0u64;
+        let mut applies = 0usize;
+        while let Ok(Some(line)) = tokio::time::timeout(Duration::from_secs(5), lines_a.next_line())
+            .await
+            .unwrap_or(Ok(None))
+        {
+            let Ok(frame) = serde_json::from_str::<CoreFrame>(&line) else {
+                continue;
+            };
+            match frame {
+                CoreFrame::ConfigStateGet { request_id, device } => {
+                    send_gw(
+                        &mut wr_a,
+                        &GatewayFrame::ConfigState {
+                            request_id: Some(request_id),
+                            device,
+                            gateway_boot_id: Some("boot-a".into()),
+                            state_revision: Some(state_rev),
+                            capability_fingerprint: Some("fp-a".into()),
+                            blocks: vec![],
+                            ts: 100,
+                        },
+                    )
+                    .await;
+                }
+                CoreFrame::ConfigValidate {
+                    request_id,
+                    device,
+                    block,
+                    schema_version,
+                    block_hash,
+                    ..
+                } => {
+                    send_gw(
+                        &mut wr_a,
+                        &GatewayFrame::ConfigValidated {
+                            request_id,
+                            device,
+                            block,
+                            schema_version,
+                            block_hash,
+                            ok: true,
+                            supported: true,
+                            blockers: Vec::new(),
+                            state: ConfigReceiptStatus::Validated,
+                            reason: None,
+                            retryable: false,
+                            gateway_boot_id: Some("boot-a".into()),
+                            state_revision: Some(state_rev),
+                            capability_fingerprint: None,
+                            evidence: None,
+                            ts: 101,
+                        },
+                    )
+                    .await;
+                }
+                CoreFrame::ConfigApply {
+                    device,
+                    core_node_id,
+                    data_epoch,
+                    application_id,
+                    operation_id,
+                    desired_revision,
+                    block_generation,
+                    block,
+                    schema_version,
+                    block_hash,
+                    values,
+                    ..
+                } => {
+                    assert!(
+                        block_generation > last_gen,
+                        "android-a block_generation must strictly increase ({block_generation} <= {last_gen})"
+                    );
+                    last_gen = block_generation;
+                    gens_a_task.lock().unwrap().push(block_generation);
+                    state_rev += 1;
+                    send_gw(
+                        &mut wr_a,
+                        &GatewayFrame::ConfigReceipt {
+                            device: device.clone(),
+                            core_node_id: core_node_id.clone(),
+                            data_epoch,
+                            application_id: application_id.clone(),
+                            operation_id: operation_id.clone(),
+                            desired_revision,
+                            block_generation,
+                            block,
+                            schema_version,
+                            block_hash: block_hash.clone(),
+                            state: ConfigReceiptStatus::Persisted,
+                            reason: None,
+                            retryable: false,
+                            gateway_boot_id: Some("boot-a".into()),
+                            state_revision: Some(state_rev),
+                            persisted_hash: Some(block_hash.clone()),
+                            active_hash: None,
+                            active_values: None,
+                            evidence: None,
+                            ts: 102,
+                        },
+                    )
+                    .await;
+                    send_gw(
+                        &mut wr_a,
+                        &GatewayFrame::ConfigReceipt {
+                            device,
+                            core_node_id,
+                            data_epoch,
+                            application_id,
+                            operation_id,
+                            desired_revision,
+                            block_generation,
+                            block,
+                            schema_version,
+                            block_hash: block_hash.clone(),
+                            state: ConfigReceiptStatus::Active,
+                            reason: None,
+                            retryable: false,
+                            gateway_boot_id: Some("boot-a".into()),
+                            state_revision: Some(state_rev),
+                            persisted_hash: Some(block_hash.clone()),
+                            active_hash: Some(block_hash),
+                            active_values: Some(values),
+                            evidence: None,
+                            ts: 103,
+                        },
+                    )
+                    .await;
+                    applies += 1;
+                    if applies == 2 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let gw_b = tokio::spawn(async move {
+        let mut state_rev = 1u64;
+        let mut fail_first = true;
+        while let Ok(Some(line)) = tokio::time::timeout(Duration::from_secs(5), lines_b.next_line())
+            .await
+            .unwrap_or(Ok(None))
+        {
+            let Ok(frame) = serde_json::from_str::<CoreFrame>(&line) else {
+                continue;
+            };
+            match frame {
+                CoreFrame::ConfigStateGet { request_id, device } => {
+                    send_gw(
+                        &mut wr_b,
+                        &GatewayFrame::ConfigState {
+                            request_id: Some(request_id),
+                            device,
+                            gateway_boot_id: Some("boot-b".into()),
+                            state_revision: Some(state_rev),
+                            capability_fingerprint: Some("fp-b".into()),
+                            blocks: vec![],
+                            ts: 100,
+                        },
+                    )
+                    .await;
+                }
+                CoreFrame::ConfigValidate {
+                    request_id,
+                    device,
+                    block,
+                    schema_version,
+                    block_hash,
+                    ..
+                } => {
+                    send_gw(
+                        &mut wr_b,
+                        &GatewayFrame::ConfigValidated {
+                            request_id,
+                            device,
+                            block,
+                            schema_version,
+                            block_hash,
+                            ok: true,
+                            supported: true,
+                            blockers: Vec::new(),
+                            state: ConfigReceiptStatus::Validated,
+                            reason: None,
+                            retryable: false,
+                            gateway_boot_id: Some("boot-b".into()),
+                            state_revision: Some(state_rev),
+                            capability_fingerprint: None,
+                            evidence: None,
+                            ts: 101,
+                        },
+                    )
+                    .await;
+                }
+                CoreFrame::ConfigApply {
+                    device,
+                    core_node_id,
+                    data_epoch,
+                    application_id,
+                    operation_id,
+                    desired_revision,
+                    block_generation,
+                    block,
+                    schema_version,
+                    block_hash,
+                    values,
+                    ..
+                } => {
+                    if fail_first {
+                        fail_first = false;
+                        send_gw(
+                            &mut wr_b,
+                            &GatewayFrame::ConfigReceipt {
+                                device,
+                                core_node_id,
+                                data_epoch,
+                                application_id,
+                                operation_id,
+                                desired_revision,
+                                block_generation,
+                                block,
+                                schema_version,
+                                block_hash,
+                                state: ConfigReceiptStatus::Failed,
+                                reason: Some("simulated_fail".into()),
+                                retryable: false,
+                                gateway_boot_id: Some("boot-b".into()),
+                                state_revision: Some(state_rev),
+                                persisted_hash: None,
+                                active_hash: None,
+                                active_values: None,
+                                evidence: None,
+                                ts: 102,
+                            },
+                        )
+                        .await;
+                    } else {
+                        state_rev += 1;
+                        send_gw(
+                            &mut wr_b,
+                            &GatewayFrame::ConfigReceipt {
+                                device: device.clone(),
+                                core_node_id: core_node_id.clone(),
+                                data_epoch,
+                                application_id: application_id.clone(),
+                                operation_id: operation_id.clone(),
+                                desired_revision,
+                                block_generation,
+                                block,
+                                schema_version,
+                                block_hash: block_hash.clone(),
+                                state: ConfigReceiptStatus::Persisted,
+                                reason: None,
+                                retryable: false,
+                                gateway_boot_id: Some("boot-b".into()),
+                                state_revision: Some(state_rev),
+                                persisted_hash: Some(block_hash.clone()),
+                                active_hash: None,
+                                active_values: None,
+                                evidence: None,
+                                ts: 102,
+                            },
+                        )
+                        .await;
+                        send_gw(
+                            &mut wr_b,
+                            &GatewayFrame::ConfigReceipt {
+                                device,
+                                core_node_id,
+                                data_epoch,
+                                application_id,
+                                operation_id,
+                                desired_revision,
+                                block_generation,
+                                block,
+                                schema_version,
+                                block_hash: block_hash.clone(),
+                                state: ConfigReceiptStatus::Active,
+                                reason: None,
+                                retryable: false,
+                                gateway_boot_id: Some("boot-b".into()),
+                                state_revision: Some(state_rev),
+                                persisted_hash: Some(block_hash.clone()),
+                                active_hash: Some(block_hash),
+                                active_values: Some(values),
+                                evidence: None,
+                                ts: 103,
+                            },
+                        )
+                        .await;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+
+    // Apply #1: android-a succeeds, android-b fails -> android-a receives rollback!
+    let kws_pkg1 = make_pkg(
+        &hh,
+        Purpose::NodeConfig,
+        "nas-core",
+        Some("nas-core"),
+        vec![Block {
+            name: "mode".into(),
+            schema_version: 1,
+            operations: vec![Operation::Set {
+                path: "mode.kws_threshold".into(),
+                value: json!(0.24),
+            }],
+        }],
+    );
+    let pre1 = delivery.preflight("admin", kws_pkg1, json!({})).unwrap();
+    let app1_id = "22222222-2222-4222-8222-222222222202";
+    delivery
+        .commit(
+            "admin",
+            &Commit {
+                plan_id: pre1["plan_id"].as_str().unwrap().into(),
+                plan_hash: pre1["plan_hash"].as_str().unwrap().into(),
+                expected_revision: pre1["expected_revision"].as_u64().unwrap(),
+                application_id: app1_id.into(),
+            },
+        )
+        .unwrap();
+    let mut rb1 = json!({});
+    for _ in 0..80 {
+        rb1 = delivery.readback("admin", app1_id).unwrap();
+        if rb1["publication"]["state"] == "failed" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(rb1["publication"]["state"], json!("failed"), "{rb1}");
+
+    // Apply #2: next revision succeeds on BOTH devices with strictly higher generation!
+    let kws_pkg2 = make_pkg(
+        &hh,
+        Purpose::NodeConfig,
+        "nas-core",
+        Some("nas-core"),
+        vec![Block {
+            name: "mode".into(),
+            schema_version: 1,
+            operations: vec![Operation::Set {
+                path: "mode.kws_threshold".into(),
+                value: json!(0.26),
+            }],
+        }],
+    );
+    let pre2 = delivery.preflight("admin", kws_pkg2, json!({})).unwrap();
+    let app2_id = "22222222-2222-4222-8222-222222222203";
+    delivery
+        .commit(
+            "admin",
+            &Commit {
+                plan_id: pre2["plan_id"].as_str().unwrap().into(),
+                plan_hash: pre2["plan_hash"].as_str().unwrap().into(),
+                expected_revision: pre2["expected_revision"].as_u64().unwrap(),
+                application_id: app2_id.into(),
+            },
+        )
+        .unwrap();
+    let mut rb2 = json!({});
+    for _ in 0..80 {
+        rb2 = delivery.readback("admin", app2_id).unwrap();
+        if rb2["publication"]["state"] == "applied" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(rb2["publication"]["state"], json!("applied"), "{rb2}");
+
+    gw_a.await.unwrap();
+    gw_b.await.unwrap();
+    let recorded = gens_a.lock().unwrap().clone();
+    assert_eq!(
+        recorded.len(),
+        2,
+        "healthy sibling android-a must NOT be rolled back when android-b fails: expected rev1 forward + rev2 forward only: {recorded:?}"
+    );
+    assert!(
+        recorded[0] < recorded[1],
+        "block_generation must be strictly monotonic across revisions: {recorded:?}"
     );
 }

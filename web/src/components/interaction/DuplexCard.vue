@@ -19,13 +19,13 @@ const props = defineProps<{
 }>()
 
 const { busy, message, tone, run } = useSave()
-const reason = ref('')
+const reasons = ref<Record<string, string>>({})
 
 async function request(device: ModeDevice, value: 'half' | 'full'): Promise<void> {
-  reason.value = ''
+  reasons.value = { ...reasons.value, [device.device]: '' }
   await run(async () => {
     const result = await putMode(device.device, { duplex_requested: value })
-    reason.value = result.reason ?? ''
+    reasons.value = { ...reasons.value, [device.device]: result.reason ?? '' }
     await props.refresh()
   })
 }
@@ -68,7 +68,9 @@ async function request(device: ModeDevice, value: 'half' | 'full'): Promise<void
         >
           {{ t('requestHalf') }}
         </button>
-        <span v-if="reason" class="duplex__reason">{{ t('duplexReason') }}: {{ reason }}</span>
+        <span v-if="reasons[device.device]" class="duplex__reason">
+          {{ t('duplexReason') }}: {{ reasons[device.device] }}
+        </span>
       </div>
     </div>
 

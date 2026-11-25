@@ -133,6 +133,21 @@ pub fn default_reflex_words() -> Vec<ReflexWord> {
             intent: ReflexIntent::Retreat,
             enabled: true,
         },
+        // Include both 2-syllable 「退下」 (verified toned spelling `t uì x ià`)
+        // and 3-syllable 「退下吧」 so users can dismiss media directly via offline
+        // KWS even when no voice session is open.
+        ReflexWord {
+            text: "退下".into(),
+            tokens: "t uì x ià".into(),
+            intent: ReflexIntent::Retreat,
+            enabled: true,
+        },
+        ReflexWord {
+            text: "退下吧".into(),
+            tokens: "t uì x ià b a".into(),
+            intent: ReflexIntent::Retreat,
+            enabled: true,
+        },
     ]
 }
 

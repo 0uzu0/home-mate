@@ -20,7 +20,7 @@ pub struct FakeGateway {
 /// `an_answer_ends_the_conversation_by_default`.
 pub fn enable_follow_window(state: &Arc<AppState>) {
     let _ = state.voice.set_mode_with_follow_window(
-        "dot2-d",
+        "global",
         None,
         None,
         None,

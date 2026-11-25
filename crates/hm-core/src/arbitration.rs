@@ -599,18 +599,22 @@ pub struct Arbiter {
 
 #[derive(Default)]
 struct ArbiterState {
-    round: Option<Round>,
+    /// Active arbitration rounds keyed by local `device` id (bounded to 64
+    /// entries so multi-gateway Cores never clobber concurrent rooms).
+    rounds: std::collections::HashMap<String, Round>,
     recent_foreign: Vec<ForeignEntry>,
     /// RTT-bounded pairwise wall-clock offsets (`peer_id` / `device` -> estimate)
     /// used to normalize peer `heard_ms` into local clock time (#76 / #171).
     peer_clocks: std::collections::HashMap<String, PeerClockEstimate>,
-    /// Fresh event-driven `NearEndPresence` claim for passive peer contention
-    /// when this node did not fire local KWS.
-    passive_presence: Option<(Claim, Instant)>,
-    /// Last device that won arbitration (explicit or passive) for passive ASR
-    /// resolution when KWS missed.
-    last_won_at: Option<(String, Instant)>,
+    /// Fresh event-driven `NearEndPresence` claims keyed by local `device` id
+    /// for passive peer contention when that device did not fire local KWS.
+    passive_presence: std::collections::HashMap<String, (Claim, Instant)>,
+    /// Per-device last arbitration win timestamp (explicit or passive) for
+    /// passive ASR resolution when KWS missed.
+    last_won_at: std::collections::HashMap<String, Instant>,
 }
+
+const MAX_ARBITER_DEVICES: usize = 64;
 
 struct Round {
     id: String,
@@ -787,17 +791,99 @@ impl Arbiter {
             .map(|e| (e.offset_ms, e.error_ms))
     }
 
+    fn prune_device_maps_locked(st: &mut ArbiterState) {
+        let round_ttl = Duration::from_millis((COALESCE_MS as u64) * 2);
+        st.rounds.retain(|_, r| r.started.elapsed() <= round_ttl);
+        while st.rounds.len() > MAX_ARBITER_DEVICES {
+            if let Some(oldest) = st
+                .rounds
+                .iter()
+                .min_by_key(|(_, r)| r.started)
+                .map(|(k, _)| k.clone())
+            {
+                st.rounds.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        st.passive_presence
+            .retain(|_, (_, seen)| seen.elapsed() <= round_ttl);
+        while st.passive_presence.len() > MAX_ARBITER_DEVICES {
+            if let Some(oldest) = st
+                .passive_presence
+                .iter()
+                .min_by_key(|(_, (_, seen))| *seen)
+                .map(|(k, _)| k.clone())
+            {
+                st.passive_presence.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        let win_ttl = Duration::from_secs(60);
+        st.last_won_at.retain(|_, at| at.elapsed() <= win_ttl);
+        while st.last_won_at.len() > MAX_ARBITER_DEVICES {
+            if let Some(oldest) = st
+                .last_won_at
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(k, _)| k.clone())
+            {
+                st.last_won_at.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn claim_in_household_domain(claim: &Claim) -> bool {
+        !crate::gateway::DeviceHub::is_mobile_profile_version(claim.profile_version.as_deref())
+    }
+
+    /// Collect compatible claims from sibling local devices attached to this
+    /// same Core (both active rounds and fresh passive presence), so two local
+    /// gateways hearing the same wake word contend cleanly instead of both winning.
+    fn local_sibling_claims_locked(
+        st: &ArbiterState,
+        exclude_device: &str,
+        heard_ms: i64,
+    ) -> Vec<Claim> {
+        let coalesce = Duration::from_millis(COALESCE_MS as u64);
+        let mut out: Vec<Claim> = Vec::new();
+        for round in st.rounds.values() {
+            if round.claim.device != exclude_device
+                && Self::claim_in_household_domain(&round.claim)
+                && round.started.elapsed() <= coalesce
+                && (round.claim.heard_ms - heard_ms).abs() <= COALESCE_MS
+            {
+                Self::merge_foreign_claim(&mut out, round.claim.clone());
+            }
+        }
+        for (passive, seen) in st.passive_presence.values() {
+            if passive.device != exclude_device
+                && Self::claim_in_household_domain(passive)
+                && seen.elapsed() <= coalesce
+                && (passive.heard_ms - heard_ms).abs() <= COALESCE_MS
+            {
+                Self::merge_foreign_claim(&mut out, passive.clone());
+            }
+        }
+        out
+    }
+
     /// Open a round for this node's claim. Returns the round id.
     ///
     /// A previous round older than [`COALESCE_MS`] is discarded: it belongs to
     /// a different utterance and must not contaminate this one. Re-triggers on
     /// the same device within [`COALESCE_MS`] update the round id and claim
-    /// consistently while preserving compatible peer claims.
+    /// consistently while preserving compatible peer and local-sibling claims.
     pub fn begin(&self, claim: Claim) -> String {
         let id = Self::claim_id(&claim);
+        let device = claim.device.clone();
         let mut st = crate::lock_or_recover(&self.state, "arbitration.state");
         Self::prune_recent_locked(&mut st.recent_foreign);
-        let seeded: Vec<Claim> = st
+        Self::prune_device_maps_locked(&mut st);
+        let mut seeded: Vec<Claim> = st
             .recent_foreign
             .iter()
             .filter(|e| {
@@ -806,12 +892,27 @@ impl Arbiter {
             })
             .map(|e| e.claim.clone())
             .collect();
+        for local in Self::local_sibling_claims_locked(&st, &claim.device, claim.heard_ms) {
+            Self::merge_foreign_claim(&mut seeded, local);
+        }
         let coalesce = Duration::from_millis(COALESCE_MS as u64);
-        match st.round.as_mut() {
+        // Propagate this new claim into any already-open compatible sibling local rounds.
+        for other in st.rounds.values_mut() {
+            if other.claim.device != claim.device
+                && other.started.elapsed() <= coalesce
+                && (other.claim.heard_ms - claim.heard_ms).abs() <= COALESCE_MS
+            {
+                Self::merge_foreign_claim(&mut other.foreign, claim.clone());
+            }
+        }
+        match st.rounds.get_mut(&device) {
             Some(r) if r.id == id => {
                 r.exchanging = true;
+                for s in seeded {
+                    Self::merge_foreign_claim(&mut r.foreign, s);
+                }
             }
-            Some(r) if r.started.elapsed() <= coalesce && r.claim.device == claim.device => {
+            Some(r) if r.started.elapsed() <= coalesce => {
                 let mut foreign: Vec<Claim> = r
                     .foreign
                     .iter()
@@ -830,15 +931,19 @@ impl Arbiter {
                 };
             }
             _ => {
-                st.round = Some(Round {
-                    id: id.clone(),
-                    claim,
-                    started: Instant::now(),
-                    foreign: seeded,
-                    exchanging: true,
-                });
+                st.rounds.insert(
+                    device,
+                    Round {
+                        id: id.clone(),
+                        claim,
+                        started: Instant::now(),
+                        foreign: seeded,
+                        exchanging: true,
+                    },
+                );
             }
         }
+        Self::prune_device_maps_locked(&mut st);
         id
     }
 
@@ -848,12 +953,14 @@ impl Arbiter {
     /// vocal peak `rms_dbfs` and `snr_db` so a softer trailing syllable never
     /// downgrades the wake peak.
     pub fn record_passive_presence(&self, mut claim: Claim) {
+        if !Self::claim_in_household_domain(&claim) {
+            return;
+        }
+        let device = claim.device.clone();
+        let coalesce = Duration::from_millis(COALESCE_MS as u64);
         let mut st = crate::lock_or_recover(&self.state, "arbitration.state");
-        if let Some((prev, seen)) = st.passive_presence.as_ref() {
-            if prev.device == claim.device
-                && seen.elapsed() <= Duration::from_millis(COALESCE_MS as u64)
-                && (claim.heard_ms - prev.heard_ms).abs() <= COALESCE_MS
-            {
+        if let Some((prev, seen)) = st.passive_presence.get(&device) {
+            if seen.elapsed() <= coalesce && (claim.heard_ms - prev.heard_ms).abs() <= COALESCE_MS {
                 if let (Some(p_rms), Some(c_rms)) = (prev.rms_dbfs, claim.rms_dbfs) {
                     if p_rms > c_rms {
                         claim.rms_dbfs = Some(p_rms);
@@ -865,7 +972,16 @@ impl Arbiter {
                 }
             }
         }
-        st.passive_presence = Some((claim, Instant::now()));
+        for other in st.rounds.values_mut() {
+            if other.claim.device != claim.device
+                && other.started.elapsed() <= coalesce
+                && (other.claim.heard_ms - claim.heard_ms).abs() <= COALESCE_MS
+            {
+                Self::merge_foreign_claim(&mut other.foreign, claim.clone());
+            }
+        }
+        st.passive_presence.insert(device, (claim, Instant::now()));
+        Self::prune_device_maps_locked(&mut st);
     }
 
     /// Refresh the liveness timestamp of an existing `passive_presence` for
@@ -874,10 +990,8 @@ impl Arbiter {
     /// expire right before `admit_asr_wake` runs.
     pub fn refresh_passive_presence(&self, device: &str) {
         let mut st = crate::lock_or_recover(&self.state, "arbitration.state");
-        if let Some((claim, seen)) = st.passive_presence.as_mut() {
-            if claim.device == device
-                && seen.elapsed() <= Duration::from_millis((COALESCE_MS as u64) * 2)
-            {
+        if let Some((_, seen)) = st.passive_presence.get_mut(device) {
+            if seen.elapsed() <= Duration::from_millis((COALESCE_MS as u64) * 2) {
                 *seen = Instant::now();
             }
         }
@@ -888,36 +1002,29 @@ impl Arbiter {
     pub fn passive_presence_for(&self, device: &str) -> Option<Claim> {
         let st = crate::lock_or_recover(&self.state, "arbitration.state");
         st.passive_presence
-            .as_ref()
-            .filter(|(c, seen)| {
-                c.device == device && seen.elapsed() <= Duration::from_millis(COALESCE_MS as u64)
-            })
+            .get(device)
+            .filter(|(_, seen)| seen.elapsed() <= Duration::from_millis(COALESCE_MS as u64))
             .map(|(c, _)| c.clone())
     }
 
     pub fn clear_passive_presence(&self, device: &str) {
         let mut st = crate::lock_or_recover(&self.state, "arbitration.state");
-        if st
-            .passive_presence
-            .as_ref()
-            .is_some_and(|(c, _)| c.device == device)
-        {
-            st.passive_presence = None;
-        }
+        st.passive_presence.remove(device);
     }
 
     /// Record that `device` won arbitration (so passive ASR resolution can
     /// transcribe its segment even if `proactive_asr_wake` is off).
     pub fn record_win(&self, device: &str) {
         let mut st = crate::lock_or_recover(&self.state, "arbitration.state");
-        st.last_won_at = Some((device.to_string(), Instant::now()));
+        st.last_won_at.insert(device.to_string(), Instant::now());
+        Self::prune_device_maps_locked(&mut st);
     }
 
     pub fn won_recently(&self, device: &str, within: Duration) -> bool {
         let st = crate::lock_or_recover(&self.state, "arbitration.state");
         st.last_won_at
-            .as_ref()
-            .is_some_and(|(d, at)| d == device && at.elapsed() <= within)
+            .get(device)
+            .is_some_and(|at| at.elapsed() <= within)
     }
 
     /// Synchronously revoke `last_won_at` when `device` loses arbitration
@@ -925,17 +1032,23 @@ impl Arbiter {
     /// subsequent passive ASR segments.
     pub fn clear_win(&self, device: &str) {
         let mut st = crate::lock_or_recover(&self.state, "arbitration.state");
-        if st.last_won_at.as_ref().is_some_and(|(d, _)| d == device) {
-            st.last_won_at = None;
-        }
+        st.last_won_at.remove(device);
     }
 
     /// A peer's claim arrived. Always retains it in the sliding window
-    /// (`COALESCE_MS * 2`), records it in the open round when it belongs to the
-    /// open phrase, and returns this node's own claim (or fresh passive
-    /// `NearEndPresence` claim) so the peer learns it from the same round trip.
+    /// (`COALESCE_MS * 2`), records it in all matching open rounds when it
+    /// belongs to the same phrase, and returns this node's strongest own claim
+    /// (or fresh passive `NearEndPresence` claim) so the peer learns it from
+    /// the same round trip.
     pub fn inbound(&self, mut claim: Claim) -> Value {
         let server_time_ms = crate::id::now_ms();
+        if !Self::claim_in_household_domain(&claim) {
+            return json!({
+                "state": "no_round",
+                "claim": Value::Null,
+                "server_time_ms": server_time_ms,
+            });
+        }
         let raw_heard_ms = claim.heard_ms;
         let sent_at_ms = claim.sent_at_ms.take();
         let mut st = crate::lock_or_recover(&self.state, "arbitration.state");
@@ -950,60 +1063,105 @@ impl Arbiter {
             }
         }
         Self::record_recent_locked(&mut st.recent_foreign, raw_heard_ms, claim.clone());
-        let Some(round) = st.round.as_mut() else {
-            if let Some((passive, seen)) = st.passive_presence.as_ref().cloned() {
-                if seen.elapsed() <= Duration::from_millis(COALESCE_MS as u64)
-                    && (passive.heard_ms - claim.heard_ms).abs() <= COALESCE_MS
-                {
-                    let mut all = vec![passive.clone()];
-                    for entry in &st.recent_foreign {
-                        if entry.claim.device != passive.device
-                            && (entry.claim.heard_ms - passive.heard_ms).abs() <= COALESCE_MS
-                        {
-                            Self::merge_foreign_claim(&mut all, entry.claim.clone());
-                        }
+        Self::prune_device_maps_locked(&mut st);
+
+        let mut matched_claims: Vec<Claim> = Vec::new();
+        for round in st.rounds.values_mut() {
+            if round.claim.device != claim.device
+                && Self::claim_in_household_domain(&round.claim)
+                && (claim.heard_ms - round.claim.heard_ms).abs() <= COALESCE_MS
+            {
+                Self::merge_foreign_claim(&mut round.foreign, claim.clone());
+                matched_claims.push(round.claim.clone());
+            }
+        }
+
+        // Evaluate every fresh local passive presence (including when another
+        // sibling local device has an active round) against ALL competitors:
+        // recent foreign peers, active local rounds, AND sibling passives.
+        let fresh_passives: Vec<Claim> = st
+            .passive_presence
+            .values()
+            .filter(|(p, seen)| {
+                p.device != claim.device
+                    && Self::claim_in_household_domain(p)
+                    && !matched_claims.iter().any(|m| m.device == p.device)
+                    && seen.elapsed() <= Duration::from_millis(COALESCE_MS as u64)
+                    && (p.heard_ms - claim.heard_ms).abs() <= COALESCE_MS
+            })
+            .map(|(p, _)| p.clone())
+            .collect();
+        if !fresh_passives.is_empty() {
+            let recent_foreign: Vec<Claim> =
+                st.recent_foreign.iter().map(|e| e.claim.clone()).collect();
+            for passive in &fresh_passives {
+                let mut all = vec![passive.clone()];
+                for foreign in &recent_foreign {
+                    if foreign.device != passive.device
+                        && (foreign.heard_ms - passive.heard_ms).abs() <= COALESCE_MS
+                    {
+                        Self::merge_foreign_claim(&mut all, foreign.clone());
                     }
-                    if let Some(dec) = decide_around(&passive, &all, &[]) {
-                        if dec.winner.device == passive.device {
-                            st.last_won_at = Some((passive.device.clone(), Instant::now()));
-                        } else if st
-                            .last_won_at
-                            .as_ref()
-                            .is_some_and(|(d, _)| d == &passive.device)
-                        {
-                            st.last_won_at = None;
-                        }
+                }
+                for active in &matched_claims {
+                    if active.device != passive.device
+                        && (active.heard_ms - passive.heard_ms).abs() <= COALESCE_MS
+                    {
+                        Self::merge_foreign_claim(&mut all, active.clone());
                     }
-                    return json!({
-                        "state": "passive_presence",
-                        "claim": passive,
-                        "server_time_ms": server_time_ms,
-                    });
+                }
+                for sibling in &fresh_passives {
+                    if sibling.device != passive.device
+                        && (sibling.heard_ms - passive.heard_ms).abs() <= COALESCE_MS
+                    {
+                        Self::merge_foreign_claim(&mut all, sibling.clone());
+                    }
+                }
+                if let Some(dec) = decide_around(passive, &all, &[]) {
+                    if dec.winner.device == passive.device {
+                        st.last_won_at
+                            .insert(passive.device.clone(), Instant::now());
+                    } else {
+                        st.last_won_at.remove(&passive.device);
+                    }
                 }
             }
-            // No wake in flight and no fresh passive presence: answer with
-            // "nothing of mine to compare" so the peer's round does not wait.
+        }
+
+        if !matched_claims.is_empty() || !fresh_passives.is_empty() {
+            let mut candidates: Vec<Claim> =
+                Vec::with_capacity(matched_claims.len() + fresh_passives.len());
+            candidates.extend(matched_claims.iter().cloned());
+            candidates.extend(fresh_passives.iter().cloned());
+            let best = decide(&candidates, &[])
+                .map(|d| d.winner)
+                .unwrap_or_else(|| candidates.remove(0));
+            let state = if matched_claims.iter().any(|c| c.device == best.device) {
+                "collected"
+            } else {
+                "passive_presence"
+            };
             return json!({
-                "state": "no_round",
-                "claim": Value::Null,
+                "state": state,
+                "claim": best,
                 "server_time_ms": server_time_ms,
             });
-        };
-        // Only claims about THIS utterance are collected — and for a
-        // different one we hand back NOTHING. Returning our own claim there
-        // was a live defect (dot2-b, 2026-11-15 23:38): the peer merged a
-        // claim from four seconds earlier into its round and lost to it.
-        if (claim.heard_ms - round.claim.heard_ms).abs() > COALESCE_MS {
+        }
+
+        if !st.rounds.is_empty() {
+            // Only claims about THIS utterance are collected — and for a
+            // different one we hand back NOTHING.
             return json!({
                 "state": "other_utterance",
                 "claim": Value::Null,
                 "server_time_ms": server_time_ms,
             });
         }
-        Self::merge_foreign_claim(&mut round.foreign, claim);
+        // No wake in flight and no fresh passive presence: answer with
+        // "nothing of mine to compare" so the peer's round does not wait.
         json!({
-            "state": "collected",
-            "claim": round.claim,
+            "state": "no_round",
+            "claim": Value::Null,
             "server_time_ms": server_time_ms,
         })
     }
@@ -1011,22 +1169,27 @@ impl Arbiter {
     /// Whether an initial `WINDOW_MS` exchange is currently in-flight for `device`.
     pub fn is_exchanging(&self, device: &str) -> bool {
         let st = crate::lock_or_recover(&self.state, "arbitration.state");
-        st.round.as_ref().is_some_and(|r| {
-            r.claim.device == device
-                && r.exchanging
-                && r.started.elapsed() <= Duration::from_millis(WINDOW_MS + 50)
+        st.rounds.get(device).is_some_and(|r| {
+            r.exchanging && r.started.elapsed() <= Duration::from_millis(WINDOW_MS + 50)
         })
     }
 
-    /// Recent incoming peer claims within the `COALESCE_MS * 2` sliding window.
+    /// Recent incoming peer and local-sibling claims within the `COALESCE_MS * 2` sliding window.
     pub fn recent_foreign_claims(&self, exclude_device: &str) -> Vec<Claim> {
         let mut st = crate::lock_or_recover(&self.state, "arbitration.state");
         Self::prune_recent_locked(&mut st.recent_foreign);
-        st.recent_foreign
+        Self::prune_device_maps_locked(&mut st);
+        let mut out: Vec<Claim> = st
+            .recent_foreign
             .iter()
             .filter(|e| e.claim.device != exclude_device)
             .map(|e| e.claim.clone())
-            .collect()
+            .collect();
+        let now_ms = crate::id::now_ms() as i64;
+        for c in Self::local_sibling_claims_locked(&st, exclude_device, now_ms) {
+            Self::merge_foreign_claim(&mut out, c);
+        }
+        out
     }
 
     /// Publish our claim to every peer and wait `window` for theirs.
@@ -1037,7 +1200,7 @@ impl Arbiter {
     pub async fn exchange(&self, id: &str, window: Duration) -> (Vec<Claim>, usize, usize) {
         let claim = {
             let st = crate::lock_or_recover(&self.state, "arbitration.state");
-            match st.round.as_ref().filter(|r| r.id == id) {
+            match st.rounds.values().find(|r| r.id == id) {
                 Some(r) => r.claim.clone(),
                 None => return (Vec::new(), 0, self.peer_count()),
             }
@@ -1111,7 +1274,7 @@ impl Arbiter {
             }
             let recent_claims: Vec<Claim> =
                 st.recent_foreign.iter().map(|e| e.claim.clone()).collect();
-            if let Some(r) = st.round.as_mut().filter(|r| r.id == id) {
+            if let Some(r) = st.rounds.values_mut().find(|r| r.id == id) {
                 for c in recent_claims {
                     if c.device == r.claim.device
                         || (c.heard_ms - r.claim.heard_ms).abs() > COALESCE_MS
@@ -1132,9 +1295,18 @@ impl Arbiter {
             Self::prune_recent_locked(&mut st.recent_foreign);
             let recent_claims: Vec<Claim> =
                 st.recent_foreign.iter().map(|e| e.claim.clone()).collect();
+            let target_info = st
+                .rounds
+                .values()
+                .find(|r| r.id == id)
+                .map(|r| (r.claim.device.clone(), r.claim.heard_ms));
+            let local_siblings = match target_info {
+                Some((ref dev, heard_ms)) => Self::local_sibling_claims_locked(&st, dev, heard_ms),
+                None => Vec::new(),
+            };
             let mut all = Vec::new();
-            if let Some(r) = st.round.as_mut().filter(|r| r.id == id) {
-                for c in recent_claims {
+            if let Some(r) = st.rounds.values_mut().find(|r| r.id == id) {
+                for c in recent_claims.into_iter().chain(local_siblings) {
                     if c.device != r.claim.device
                         && (c.heard_ms - r.claim.heard_ms).abs() <= COALESCE_MS
                     {
@@ -1171,12 +1343,17 @@ impl Arbiter {
     /// Does not close the round.
     pub fn claims_so_far(&self, id: &str) -> Vec<Claim> {
         let st = crate::lock_or_recover(&self.state, "arbitration.state");
-        match st.round.as_ref().filter(|r| r.id == id) {
+        match st.rounds.values().find(|r| r.id == id) {
             Some(r) => {
                 let mut all = vec![r.claim.clone()];
                 for c in &r.foreign {
                     if !all.iter().any(|a| a.device == c.device) {
                         all.push(c.clone());
+                    }
+                }
+                for c in Self::local_sibling_claims_locked(&st, &r.claim.device, r.claim.heard_ms) {
+                    if !all.iter().any(|a| a.device == c.device) {
+                        all.push(c);
                     }
                 }
                 all
@@ -1189,9 +1366,7 @@ impl Arbiter {
     /// no round and answers honestly.
     pub fn finish(&self, id: &str) {
         let mut st = crate::lock_or_recover(&self.state, "arbitration.state");
-        if st.round.as_ref().map(|r| r.id.as_str()) == Some(id) {
-            st.round = None;
-        }
+        st.rounds.retain(|_, r| r.id != id);
     }
 }
 

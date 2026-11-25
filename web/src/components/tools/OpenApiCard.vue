@@ -59,6 +59,7 @@ interface OpConfigDraft {
 }
 
 const draft = ref<Draft | null>(null)
+const touched = ref(false)
 const discovered = ref<DiscoveredOperation[]>([])
 const selected = ref<string[]>([])
 const opConfigs = ref<Record<string, OpConfigDraft>>({})
@@ -127,21 +128,17 @@ function defaultOpConfig(op: Pick<OpenApiOperation, 'method' | 'effect_level' | 
   }
 }
 
-function syncOpConfigs(ops: Array<Pick<OpenApiOperation, 'id' | 'method' | 'effect_level' | 'verification'>>): void {
-  const next = { ...opConfigs.value }
+function syncOpConfigs(
+  ops: Array<Pick<OpenApiOperation, 'id' | 'method' | 'effect_level' | 'verification'>>,
+  reset = false,
+): void {
+  const next: Record<string, OpConfigDraft> = reset ? {} : { ...opConfigs.value }
   for (const op of ops) {
     if (!next[op.id] || op.verification !== undefined) {
       next[op.id] = defaultOpConfig(op)
     }
   }
   opConfigs.value = next
-}
-
-function getOpConfig(op: DiscoveredOperation): OpConfigDraft {
-  if (!opConfigs.value[op.id]) {
-    opConfigs.value[op.id] = defaultOpConfig(op)
-  }
-  return opConfigs.value[op.id]
 }
 
 function isWriteOp(op: DiscoveredOperation): boolean {
@@ -169,13 +166,13 @@ watch(
   () => openapi.data.value,
   (status) => {
     if (!status) return
-    if (draft.value === null) draft.value = fromStatus(status)
-    // The stored catalogue is what the model may call; show it even before a
-    // new discovery, so the card never looks empty while it is configured.
-    if (discovered.value.length === 0 && status.operations.length) {
+    if (draft.value === null || !touched.value) {
+      draft.value = fromStatus(status)
+      // The stored catalogue is what the model may call; show it even before a
+      // new discovery, so the card never looks empty while it is configured.
       discovered.value = status.operations.map((op) => ({ ...op, callable: true }))
       selected.value = status.operations.map((op) => op.id)
-      syncOpConfigs(status.operations)
+      syncOpConfigs(status.operations, true)
     }
   },
   { immediate: true },
@@ -206,9 +203,17 @@ const stateTone = computed(() => {
 const callableCount = computed(() => discovered.value.filter((op) => op.callable).length)
 
 function toggle(id: string): void {
+  touched.value = true
   const at = selected.value.indexOf(id)
-  if (at >= 0) selected.value.splice(at, 1)
-  else selected.value.push(id)
+  if (at >= 0) {
+    selected.value.splice(at, 1)
+  } else {
+    selected.value.push(id)
+    if (!opConfigs.value[id]) {
+      const op = discovered.value.find((o) => o.id === id)
+      if (op) opConfigs.value = { ...opConfigs.value, [id]: defaultOpConfig(op) }
+    }
+  }
 }
 
 function isSelected(id: string): boolean {
@@ -216,7 +221,10 @@ function isSelected(id: string): boolean {
 }
 
 function selectAll(): void {
-  selected.value = discovered.value.filter((op) => op.callable).map((op) => op.id)
+  touched.value = true
+  const callable = discovered.value.filter((op) => op.callable)
+  selected.value = callable.map((op) => op.id)
+  syncOpConfigs(callable)
 }
 
 function paramsText(op: DiscoveredOperation): string {
@@ -243,6 +251,7 @@ async function discover(): Promise<void> {
       return
     }
     discovered.value = result.operations ?? []
+    touched.value = true
     syncOpConfigs(discovered.value)
     const available = new Set(discovered.value.filter((op) => op.callable).map((op) => op.id))
     const before = selected.value.length
@@ -314,6 +323,7 @@ async function save(): Promise<void> {
     }
     syncOpConfigs(status.operations)
     selected.value = status.operations.map((op) => op.id)
+    touched.value = false
     await openapi.load()
   })
 }
@@ -337,6 +347,8 @@ function reload(): void {
       draft.value = fromStatus(openapi.data.value)
       discovered.value = openapi.data.value.operations.map((op) => ({ ...op, callable: true }))
       selected.value = openapi.data.value.operations.map((op) => op.id)
+      syncOpConfigs(openapi.data.value.operations, true)
+      touched.value = false
     }
   })
   probe.value = null
@@ -364,7 +376,7 @@ function reload(): void {
     <ErrorNotice v-if="openapi.error.value" :error="openapi.error.value" compact @retry="openapi.load()" />
 
     <template v-if="draft">
-      <Toggle v-model="draft.enabled" :label="t('openapiEnabled')" />
+      <Toggle v-model="draft.enabled" :label="t('openapiEnabled')" @update:model-value="touched = true" />
 
       <div class="oa__grid">
         <TextInput
@@ -372,22 +384,43 @@ function reload(): void {
           :label="t('openapiSpecUrl')"
           wide
           placeholder="https://api.example.com/openapi.json"
+          @update:model-value="touched = true"
         />
-        <TextInput v-model="draft.baseUrl" :label="t('openapiBaseUrl')" wide :placeholder="t('openapiBasePlaceholder')" />
+        <TextInput
+          v-model="draft.baseUrl"
+          :label="t('openapiBaseUrl')"
+          wide
+          :placeholder="t('openapiBasePlaceholder')"
+          @update:model-value="touched = true"
+        />
         <TextInput
           v-model="draft.authHeader"
           :label="t('openapiAuthHeader')"
           :placeholder="t('openapiAuthHeaderPlaceholder')"
           :hint="t('openapiAuthHeaderHint')"
+          @update:model-value="touched = true"
         />
         <PasswordField
           v-model="draft.token"
           :label="t('openapiToken')"
           :is-set="openapi.data.value?.token_set ?? false"
           :hint="t('openapiTokenHint')"
+          @update:model-value="touched = true"
         />
-        <NumberField v-model="draft.timeoutMs" :label="t('openapiTimeout')" :min="500" :max="15000" />
-        <NumberField v-model="draft.retries" :label="t('openapiRetries')" :min="0" :max="3" />
+        <NumberField
+          v-model="draft.timeoutMs"
+          :label="t('openapiTimeout')"
+          :min="500"
+          :max="15000"
+          @update:model-value="touched = true"
+        />
+        <NumberField
+          v-model="draft.retries"
+          :label="t('openapiRetries')"
+          :min="0"
+          :max="3"
+          @update:model-value="touched = true"
+        />
       </div>
 
       <div class="oa__discover">
@@ -426,10 +459,10 @@ function reload(): void {
               <Pill v-if="!op.callable" tone="warn" size="sm">{{ t('openapiNotCallable') }}</Pill>
               <span v-if="!op.callable && op.reason" class="oa__msg oa__msg--error">{{ op.reason }}</span>
             </div>
-            <div v-if="op.callable && isSelected(op.id)" class="oa__op-cfg">
+            <div v-if="op.callable && isSelected(op.id) && opConfigs[op.id]" class="oa__op-cfg">
               <label class="oa__field">
                 <span>{{ t('openapiEffectLevel') }}</span>
-                <select v-model="getOpConfig(op).effectLevel" class="oa__select">
+                <select v-model="opConfigs[op.id].effectLevel" class="oa__select" @change="touched = true">
                   <option value="query">{{ t('openapiEffectQuery') }}</option>
                   <option value="mutate">{{ t('openapiEffectMutate') }}</option>
                   <option value="destructive">{{ t('openapiEffectDestructive') }}</option>
@@ -438,27 +471,39 @@ function reload(): void {
               <template v-if="isWriteOp(op)">
                 <label class="oa__field">
                   <span>{{ t('openapiVerifyStrategy') }}</span>
-                  <select v-model="getOpConfig(op).verifyType" class="oa__select">
+                  <select v-model="opConfigs[op.id].verifyType" class="oa__select" @change="touched = true">
                     <option value="transport_only">{{ t('openapiVerifyTransportOnly') }}</option>
                     <option value="readback_op">{{ t('openapiVerifyReadbackOp') }}</option>
                     <option value="response_assert">{{ t('openapiVerifyResponseAssert') }}</option>
                   </select>
                 </label>
-                <label v-if="getOpConfig(op).verifyType === 'readback_op'" class="oa__field">
+                <label v-if="opConfigs[op.id].verifyType === 'readback_op'" class="oa__field">
                   <span>{{ t('openapiVerifyReadbackTarget') }}</span>
-                  <select v-model="getOpConfig(op).opId" class="oa__select">
+                  <select v-model="opConfigs[op.id].opId" class="oa__select" @change="touched = true">
                     <option value="">{{ t('openapiSelectGetOp') }}</option>
                     <option v-for="g in getOperations" :key="g.id" :value="g.id">{{ g.id }}</option>
                   </select>
                 </label>
-                <template v-if="getOpConfig(op).verifyType !== 'transport_only'">
+                <template v-if="opConfigs[op.id].verifyType !== 'transport_only'">
                   <label class="oa__field">
                     <span>{{ t('openapiVerifyJsonPath') }}</span>
-                    <input v-model="getOpConfig(op).jsonPath" type="text" class="oa__input mono" placeholder="status" />
+                    <input
+                      v-model="opConfigs[op.id].jsonPath"
+                      type="text"
+                      class="oa__input mono"
+                      placeholder="status"
+                      @input="touched = true"
+                    />
                   </label>
                   <label class="oa__field">
                     <span>{{ t('openapiVerifyExpected') }}</span>
-                    <input v-model="getOpConfig(op).expectedRaw" type="text" class="oa__input mono" placeholder="ok / true" />
+                    <input
+                      v-model="opConfigs[op.id].expectedRaw"
+                      type="text"
+                      class="oa__input mono"
+                      placeholder="ok / true"
+                      @input="touched = true"
+                    />
                   </label>
                 </template>
                 <span v-else class="oa__msg">{{ t('openapiVerifyTransportNote') }}</span>

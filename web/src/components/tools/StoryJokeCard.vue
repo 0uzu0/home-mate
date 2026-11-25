@@ -14,6 +14,7 @@ import {
 import { t } from '../../i18n'
 import { errorDetail } from '../../format'
 import Panel from '../Panel.vue'
+import ErrorNotice from '../ErrorNotice.vue'
 import Toggle from '../Toggle.vue'
 import TextInput from '../TextInput.vue'
 import PasswordField from '../PasswordField.vue'
@@ -33,11 +34,14 @@ const radioUrl = ref('')
 const radioToken = ref('')
 const radioTokenSet = ref(false)
 
+const loaded = ref(false)
+const loadError = ref<unknown>(null)
 const busy = ref(false)
 const message = ref('')
 const tone = ref<'ok' | 'error'>('ok')
 
 async function load(): Promise<void> {
+  loadError.value = null
   try {
     const [s, j, r] = await Promise.all([getStoryConfig(), getJokeConfig(), getRadioConfig()])
     storyEnabled.value = s.enabled
@@ -49,13 +53,16 @@ async function load(): Promise<void> {
     radioEnabled.value = r.enabled
     radioUrl.value = r.url
     radioTokenSet.value = r.bearer_token_set
+    loaded.value = true
   } catch (err) {
+    loadError.value = err
     tone.value = 'error'
     message.value = errorDetail(err)
   }
 }
 
 async function save(): Promise<void> {
+  if (!loaded.value) return
   busy.value = true
   message.value = ''
   try {
@@ -100,7 +107,7 @@ async function testAll(): Promise<void> {
   message.value = ''
   try {
     const [s, j, r] = await Promise.all([testStoryConfig(), testJokeConfig(), testRadioConfig()])
-    tone.value = s.ok || j.ok || r.ok ? 'ok' : 'error'
+    tone.value = s.ok && j.ok && r.ok ? 'ok' : 'error'
     message.value = `story: ${s.ok ? 'ok' : s.detail || s.state} · joke: ${j.ok ? 'ok' : j.detail || j.state} · radio: ${r.ok ? 'ok' : r.detail || r.state}`
   } catch (err) {
     tone.value = 'error'
@@ -117,6 +124,8 @@ onMounted(() => {
 
 <template>
   <Panel icon="music" :title="t('personalMediaTitle')" :hint="t('personalMediaHint')">
+    <ErrorNotice v-if="loadError" :error="loadError" compact @retry="load" />
+
     <div class="pm__group">
       <Toggle v-model="storyEnabled" :label="t('storyEnabled')" :disabled="busy" />
       <TextInput v-model="storyUrl" :label="t('storyUrl')" placeholder="http://192.168.1.10:18083" wide />
@@ -151,7 +160,7 @@ onMounted(() => {
     </div>
 
     <div class="pm__actions">
-      <button type="button" class="btn btn--primary" :disabled="busy" @click="save">
+      <button type="button" class="btn btn--primary" :disabled="busy || !loaded || Boolean(loadError)" @click="save">
         {{ t('personalSave') }}
       </button>
       <button type="button" class="btn" :disabled="busy" @click="testAll">

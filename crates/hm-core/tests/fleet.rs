@@ -106,7 +106,7 @@ async fn give_it_a_wake_word(node: &Node, wake: &str, tokens: &str) {
     node.state
         .voice
         .set_mode(
-            "dot2-local",
+            "global",
             None,
             None,
             Some(vec![wake.to_string()]),

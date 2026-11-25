@@ -45,18 +45,24 @@ const { busy, message, tone, run } = useSave()
 
 watch(
   [() => props.mode, () => props.device],
-  ([mode, device]) => {
-    if (!mode || touched.value) return
-    wakeWords.value = [...(mode.wake_words ?? [])]
-    threshold.value = mode.kws_threshold ?? 0.25
-    score.value = mode.kws_score ?? 3.0
-    asrFallback.value = mode.asr_wake_fallback !== false
+  ([mode, device], [, prevDevice]) => {
+    const switchedDevice = prevDevice?.device !== undefined && prevDevice.device !== device?.device
+    if (switchedDevice) touched.value = false
+    if ((!mode && !device) || touched.value) return
+    wakeWords.value = [...(device?.wake_words ?? mode?.wake_words ?? [])]
+    threshold.value = device?.kws_threshold ?? mode?.kws_threshold ?? 0.25
+    score.value = device?.kws_score ?? mode?.kws_score ?? 3.0
+    asrFallback.value = (device?.asr_wake_fallback ?? mode?.asr_wake_fallback) !== false
     if (device?.wake_ack) {
       wakeAckEnabled.value = device.wake_ack.enabled !== false
       wakeAckPhrases.value = [...(device.wake_ack.phrases ?? [])]
     }
   },
   { immediate: true },
+)
+
+const effectiveFollowWindowMs = computed(
+  () => props.device?.follow_window_ms ?? props.mode?.follow_window_ms ?? 20000,
 )
 
 const activePreset = computed<SensitivityPreset>(() => {
@@ -100,9 +106,12 @@ async function saveAndDeploy(resynth = false): Promise<void> {
         ...(resynth ? { resynth: true } : {}),
       },
     })
-    await deployReflex({ device: props.device!.device })
     touched.value = false
-    await props.refresh()
+    try {
+      await deployReflex({ device: props.device!.device })
+    } finally {
+      await props.refresh()
+    }
     return resynth ? t('resynthQueued') : t('wakePanelSaved')
   })
 }
@@ -111,6 +120,9 @@ async function saveAndDeploy(resynth = false): Promise<void> {
 <template>
   <Panel icon="wake" apply="immediate" :title="t('panelWakeTitle')" :hint="t('panelWakeHint')">
     <template #actions>
+      <Pill v-if="device" size="sm" tone="accent" mono>
+        {{ t('scopeThisDevice', { device: device.device }) }}
+      </Pill>
       <Pill size="sm" :tone="asrFallback ? 'neutral' : 'warn'">
         {{ asrFallback ? t('wakePathAsr') : t('wakePathAsrOff') }}
       </Pill>
@@ -155,6 +167,7 @@ async function saveAndDeploy(resynth = false): Promise<void> {
             :label="t('kwsThreshold')"
             :min="0.05"
             :max="0.9"
+            :step="0.01"
             :disabled="busy"
             :hint="t('kwsThresholdHint')"
             @update:model-value="touched = true"
@@ -164,6 +177,7 @@ async function saveAndDeploy(resynth = false): Promise<void> {
             :label="t('kwsScore')"
             :min="0.5"
             :max="6"
+            :step="0.1"
             :disabled="busy"
             :hint="t('kwsScoreHint')"
             @update:model-value="touched = true"
@@ -200,7 +214,7 @@ async function saveAndDeploy(resynth = false): Promise<void> {
           @update:model-value="touched = true"
         />
         <p class="wp__note" :class="asrFallback ? 'wp__note--warn' : 'wp__note--ok'">
-          {{ asrFallback ? t('asrFallbackOnNote') : t('asrFallbackOffNote', { seconds: (mode?.follow_window_ms ?? 20000) / 1000 }) }}
+          {{ asrFallback ? t('asrFallbackOnNote') : t('asrFallbackOffNote', { seconds: effectiveFollowWindowMs / 1000 }) }}
         </p>
       </div>
 
@@ -213,7 +227,7 @@ async function saveAndDeploy(resynth = false): Promise<void> {
         >
           {{ busy ? t('saving') : t('wakePanelSave') }}
         </button>
-        <button type="button" class="btn" :disabled="busy" @click="saveAndDeploy(true)">
+        <button type="button" class="btn" :disabled="busy || !wakeWords.length" @click="saveAndDeploy(true)">
           {{ t('resynth') }}
         </button>
         <span v-if="message" class="wp__msg" :class="`wp__msg--${tone}`" role="status">{{ message }}</span>

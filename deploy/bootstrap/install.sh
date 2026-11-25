@@ -144,6 +144,7 @@ fi
 bb mkdir -p "$HM/bin" "$HM/data/models" "$FW" "$KWS" "$BIN" || die "mkdir"
 cp_a "$SEED/hm/bin/core_a" "$HM/bin/core_a" || die "copy core"
 cp_a "$SEED/hm/hm-core-supervisor.sh" "$HM/hm-core-supervisor.sh" || die "copy core supervisor"
+bb rm -rf "$HM/web" || die "clean console"
 cp_a "$SEED/hm/web" "$HM/web" || die "copy console"
 cp_a "$SEED/hm/data/models/silero_vad.onnx" "$HM/data/models/silero_vad.onnx" || die "copy model"
 # Pre-synthesized wake acks (data_dir/assets/wake-acks). Without them a fresh

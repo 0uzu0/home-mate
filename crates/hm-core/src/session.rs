@@ -84,6 +84,15 @@ impl SessionStore {
         device: &str,
         expected: &str,
     ) -> std::result::Result<usize, String> {
+        self.clear_device_conversation_with_archives(device, expected, false)
+    }
+
+    pub fn clear_device_conversation_with_archives(
+        &self,
+        device: &str,
+        expected: &str,
+        include_archived: bool,
+    ) -> std::result::Result<usize, String> {
         let authority = crate::execution::Authority::internal(
             self.store.clone(),
             crate::working_memory::ScopeContext {
@@ -92,19 +101,90 @@ impl SessionStore {
                 room: None,
             },
         )?;
-        self.store.with(|c| {
-            let tx=c.unchecked_transaction()?;
-            authority.check_in(&tx)?;
-            let mut current=tx.query_row("SELECT session_id FROM device_contexts WHERE device=?1 AND data_epoch=?2 ORDER BY generation DESC LIMIT 1",rusqlite::params![device,authority.epoch() as i64],|r|r.get::<_,String>(0)).optional()?;
-            for candidate in [format!("dev:{device}"),format!("dev:scope11:{device}:{}",authority.epoch())] {
-                if current.is_some() { break; }
-                if authority.session_is_bound_in(&tx,&candidate)? { current=Some(candidate); break; }
-            }
-            if current.as_deref()!=Some(expected) { return Err(crate::store::StoreError::Authority("SESSION_CHANGED".into())); }
-            crate::confirmation::store::invalidate_session(&tx,expected)?;
-            let cleared=tx.execute("DELETE FROM messages WHERE session_id=?1",[expected])?;
-            tx.commit()?; Ok(cleared)
-        }).map_err(|e|e.to_string())
+        self.store
+            .with(|c| {
+                let tx = c.unchecked_transaction()?;
+                authority.check_in(&tx)?;
+                let mut current = tx
+                    .query_row(
+                        "SELECT session_id FROM device_contexts WHERE device=?1 AND data_epoch=?2 ORDER BY generation DESC LIMIT 1",
+                        rusqlite::params![device, authority.epoch() as i64],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?;
+                for candidate in [
+                    format!("dev:{device}"),
+                    format!("dev:scope11:{device}:{}", authority.epoch()),
+                ] {
+                    if current.is_some() {
+                        break;
+                    }
+                    if authority.session_is_bound_in(&tx, &candidate)? {
+                        current = Some(candidate);
+                        break;
+                    }
+                }
+                if include_archived && expected.is_empty() && current.is_none() {
+                    tx.commit()?;
+                    return Ok(0);
+                }
+                if current.as_deref() != Some(expected) {
+                    return Err(crate::store::StoreError::Authority(
+                        "SESSION_CHANGED".into(),
+                    ));
+                }
+                if !include_archived {
+                    crate::confirmation::store::invalidate_session(&tx, expected)?;
+                    let cleared = tx.execute("DELETE FROM messages WHERE session_id=?1", [expected])?;
+                    tx.commit()?;
+                    return Ok(cleared);
+                }
+                let mut sessions_to_clear: Vec<String> = Vec::new();
+                {
+                    let mut stmt = tx.prepare(
+                        "SELECT session_id FROM device_contexts WHERE device=?1 AND data_epoch=?2",
+                    )?;
+                    let rows = stmt
+                        .query_map(rusqlite::params![device, authority.epoch() as i64], |r| {
+                            r.get::<_, String>(0)
+                        })?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    for sid in rows {
+                        if !authority.session_is_bound_in(&tx, &sid)? {
+                            return Err(crate::store::StoreError::Authority(
+                                "context scope changed".into(),
+                            ));
+                        }
+                        if !sessions_to_clear.contains(&sid) {
+                            sessions_to_clear.push(sid);
+                        }
+                    }
+                }
+                for candidate in [
+                    expected.to_string(),
+                    format!("dev:{device}"),
+                    format!("dev:scope11:{device}:{}", authority.epoch()),
+                ] {
+                    if !candidate.is_empty()
+                        && !sessions_to_clear.contains(&candidate)
+                        && (candidate == expected || authority.session_is_bound_in(&tx, &candidate)?)
+                    {
+                        sessions_to_clear.push(candidate);
+                    }
+                }
+                let mut cleared = 0usize;
+                for sid in &sessions_to_clear {
+                    crate::confirmation::store::invalidate_session(&tx, sid)?;
+                    cleared += tx.execute("DELETE FROM messages WHERE session_id=?1", [sid])?;
+                }
+                tx.execute(
+                    "DELETE FROM device_contexts WHERE device=?1 AND data_epoch=?2 AND session_id!=?3",
+                    rusqlite::params![device, authority.epoch() as i64, expected],
+                )?;
+                tx.commit()?;
+                Ok(cleared)
+            })
+            .map_err(|e| e.to_string())
     }
 
     pub fn create(&self) -> Result<String> {

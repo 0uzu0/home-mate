@@ -4,7 +4,7 @@
  * does — PUT then probe — because a wizard that configures things differently
  * is a second, unverified configuration path.
  */
-import { ref } from 'vue'
+import { ref, watch } from 'vue'
 import { putService, testService, type ServiceName, type ServiceStatus } from '../../api'
 import { t } from '../../i18n'
 import { errorDetail } from '../../format'
@@ -17,15 +17,14 @@ const props = defineProps<{
 const emit = defineEmits<{ done: [verified: boolean] }>()
 
 const defaults = {
-  llm: { provider: 'deepseek', base_url: 'https://api.deepseek.com', model: 'deepseek-flash', voice: '', extra: 'seed-tts-2.0' },
+  llm: { provider: 'deepseek', base_url: 'https://api.deepseek.com', model: 'deepseek-flash', voice: '' },
   asr: {
     provider: 'openai-asr',
     base_url: 'https://api.siliconflow.cn/v1',
     model: 'FunAudioLLM/SenseVoiceSmall',
     voice: '',
-    extra: '',
   },
-  tts: { provider: 'volc', base_url: '', model: 'seed-tts-2.0', voice: 'zh_female_xiaohe_uranus_bigtts', extra: '' },
+  tts: { provider: 'volc', base_url: '', model: 'seed-tts-2.0', voice: 'zh_female_xiaohe_uranus_bigtts' },
 }
 
 /**
@@ -43,7 +42,6 @@ function fromStatus(): typeof defaults.llm {
     base_url: st.base_url || d.base_url,
     model: st.model || d.model,
     voice: st.voice || d.voice,
-    extra: d.extra,
   }
 }
 
@@ -52,9 +50,21 @@ const apiKey = ref('')
 /** Carried through untouched so a key referenced by environment variable
  * survives a wizard save. */
 const apiKeyEnv = ref(props.status?.api_key_env || '')
+const dirty = ref(false)
 const busy = ref(false)
 const result = ref('')
 const failed = ref(false)
+
+watch(
+  () => props.status,
+  (st) => {
+    if (!dirty.value && st) {
+      form.value = { ...fromStatus() }
+      apiKeyEnv.value = st.api_key_env || ''
+    }
+  },
+  { deep: true },
+)
 
 async function saveAndTest(): Promise<void> {
   busy.value = true
@@ -66,6 +76,7 @@ async function saveAndTest(): Promise<void> {
       base_url: form.value.base_url || undefined,
       model: form.value.model,
       voice: props.service === 'tts' ? form.value.voice : undefined,
+      ...(props.service === 'llm' && props.status?.thinking !== undefined ? { thinking: props.status.thinking } : {}),
       api_key: apiKey.value || undefined,
       ...(apiKeyEnv.value ? { api_key_env: apiKeyEnv.value } : {}),
     })
@@ -98,16 +109,17 @@ async function saveAndTest(): Promise<void> {
 <template>
   <div class="wizsvc">
     <div class="wizsvc__row">
-      <TextInput v-model="form.base_url" :label="t('baseUrl')" wide :placeholder="defaults[service].base_url" />
-      <TextInput v-model="form.model" :label="t('model')" :placeholder="defaults[service].model" />
+      <TextInput v-model="form.base_url" :label="t('baseUrl')" wide :placeholder="defaults[service].base_url" @update:model-value="dirty = true" />
+      <TextInput v-model="form.model" :label="t('model')" :placeholder="defaults[service].model" @update:model-value="dirty = true" />
       <TextInput
         v-if="service === 'tts'"
         v-model="form.voice"
         :label="t('ttsVoice')"
         wide
         :placeholder="defaults.tts.voice"
+        @update:model-value="dirty = true"
       />
-      <TextInput v-model="apiKey" :label="t('apiKey')" type="password" :placeholder="status?.api_key_set ? t('apiKeySet') : t('apiKeyUnset')" />
+      <TextInput v-model="apiKey" :label="t('apiKey')" type="password" :placeholder="status?.api_key_set ? t('apiKeySet') : t('apiKeyUnset')" @update:model-value="dirty = true" />
       <button type="button" class="btn" :disabled="busy" @click="saveAndTest">
         {{ busy ? t('setupWorking') : t('setupSaveTest') }}
       </button>

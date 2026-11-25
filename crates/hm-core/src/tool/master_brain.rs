@@ -434,7 +434,7 @@ impl MasterBrainRuntime {
         }
     }
 
-    fn task_snapshot(&self, task_id: &str) -> Option<DelegatedTaskRecord> {
+    pub(crate) fn task_snapshot(&self, task_id: &str) -> Option<DelegatedTaskRecord> {
         crate::lock_or_recover(&self.recent_tasks, "master_brain.recent_tasks")
             .iter()
             .find(|r| r.task_id == task_id)
@@ -448,12 +448,18 @@ impl MasterBrainRuntime {
 
     fn latest_task_id(&self, device: Option<&str>) -> Option<String> {
         let guard = crate::lock_or_recover(&self.recent_tasks, "master_brain.recent_tasks");
-        if let Some(dev) = device {
-            if let Some(rec) = guard.iter().find(|r| r.device.as_deref() == Some(dev)) {
-                return Some(rec.task_id.clone());
-            }
+        if let Some(dev) = device.map(str::trim).filter(|s| !s.is_empty()) {
+            return guard
+                .iter()
+                .find(|r| r.device.as_deref() == Some(dev))
+                .map(|r| r.task_id.clone());
         }
-        guard.front().map(|r| r.task_id.clone())
+        // Unbound console/chat callers must only resolve unbound tasks so they
+        // never silently steer, approve, or cancel a physical speaker's task.
+        guard
+            .iter()
+            .find(|r| r.device.is_none())
+            .map(|r| r.task_id.clone())
     }
 
     fn room_for_device(&self, device: Option<&str>) -> Option<String> {
@@ -604,6 +610,17 @@ impl MasterBrainRuntime {
             );
             return;
         };
+        let has_device = device
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty());
+        if !has_device && voice.hub().online_device_count() > 1 {
+            tracing::info!(
+                task_id = %task_id,
+                "master_brain: skipping unbound spoken announcement with multiple devices online"
+            );
+            return;
+        }
         let req = AnnounceRequest {
             text,
             title: None,
@@ -614,7 +631,7 @@ impl MasterBrainRuntime {
             source: Some("master_brain".to_string()),
             ttl_ms: None,
         };
-        if let Err(err) = voice.enqueue_announce(req) {
+        if let Err(err) = voice.enqueue_announce_checked(req, true) {
             tracing::warn!(
                 task_id = %task_id,
                 code = %err.code,
@@ -960,7 +977,7 @@ impl MasterBrainRuntime {
                                     "主脑需要你的确认：{cleaned}。同意请说批准，拒绝请说不要。"
                                 ),
                                 run_id,
-                                "urgent",
+                                "high",
                                 true,
                             );
                         }
@@ -1144,6 +1161,13 @@ impl Tool for BrainDelegateTool {
         if ctx.is_cancelled() {
             return ToolResult::cancelled();
         }
+        if ctx.is_lan_exempt() {
+            return ToolResult::failed(
+                "PAIRING_REQUIRED",
+                "未认证的局域网访问不允许委派主脑后台任务，请使用配对令牌认证",
+                false,
+            );
+        }
         let (cfg, tok) = match self.rt.require_ready() {
             Ok(v) => v,
             Err(r) => return *r,
@@ -1252,15 +1276,26 @@ impl Tool for BrainDelegateTool {
                     });
                 }
 
-                let ack = extract_str(&body, &["ack"])
-                    .map(|s| clip_str(s, MAX_ACK_CHARS))
-                    .unwrap_or_else(|| "好的，这件事我交给主脑在后台处理，好了我叫你。".into());
+                let voice_callback_skipped =
+                    device.as_deref().map(str::trim).is_none_or(str::is_empty)
+                        && self
+                            .rt
+                            .voice_pipeline()
+                            .is_some_and(|v| v.hub().online_device_count() > 1);
+                let ack = if voice_callback_skipped {
+                    "好的，这件事我交给主脑在后台处理。当前有多台设备在线且未绑定具体音箱，完成后不会自动语音播报，请在控制台查看进度。".into()
+                } else {
+                    extract_str(&body, &["ack"])
+                        .map(|s| clip_str(s, MAX_ACK_CHARS))
+                        .unwrap_or_else(|| "好的，这件事我交给主脑在后台处理，好了我叫你。".into())
+                };
                 ToolResult::observed_ok(json!({
                     "task_id": task_id,
                     "status": status,
                     "protocol": cfg.protocol,
                     "device": device,
                     "room": room,
+                    "voice_callback_skipped": voice_callback_skipped,
                     "rendered_answer": ack,
                     "replace_answer": true,
                 }))
@@ -1307,6 +1342,13 @@ impl Tool for BrainStatusTool {
     async fn execute(&self, args: Value, ctx: &ToolCtx) -> ToolResult {
         if ctx.is_cancelled() {
             return ToolResult::cancelled();
+        }
+        if ctx.is_lan_exempt() {
+            return ToolResult::failed(
+                "PAIRING_REQUIRED",
+                "未认证的局域网访问不允许查询主脑后台任务状态，请使用配对令牌认证",
+                false,
+            );
         }
         let (cfg, tok) = match self.rt.require_ready() {
             Ok(v) => v,
@@ -1405,6 +1447,13 @@ impl Tool for BrainSteerTool {
     async fn execute(&self, args: Value, ctx: &ToolCtx) -> ToolResult {
         if ctx.is_cancelled() {
             return ToolResult::cancelled();
+        }
+        if ctx.is_lan_exempt() {
+            return ToolResult::failed(
+                "PAIRING_REQUIRED",
+                "未认证的局域网访问不允许向主脑任务补充指示，请使用配对令牌认证",
+                false,
+            );
         }
         let (cfg, tok) = match self.rt.require_ready() {
             Ok(v) => v,
@@ -1572,6 +1621,13 @@ impl Tool for BrainCancelTool {
     async fn execute(&self, args: Value, ctx: &ToolCtx) -> ToolResult {
         if ctx.is_cancelled() {
             return ToolResult::cancelled();
+        }
+        if ctx.is_lan_exempt() {
+            return ToolResult::failed(
+                "PAIRING_REQUIRED",
+                "未认证的局域网访问不允许取消主脑后台任务，请使用配对令牌认证",
+                false,
+            );
         }
         let (cfg, tok) = match self.rt.require_ready() {
             Ok(v) => v,
@@ -2194,6 +2250,81 @@ mod tests {
                 .unwrap()
                 .contains_key("run_poll_404"),
             "cancel_notifiers must be cleaned up after poll 404 exit"
+        );
+    }
+
+    #[test]
+    fn latest_task_id_is_strictly_scoped_by_device() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let rt = MasterBrainRuntime::new(store);
+
+        rt.record_task(DelegatedTaskRecord {
+            task_id: "run_dot2".into(),
+            summary: "study room task".into(),
+            device: Some("dot2-d".into()),
+            room: Some("书房".into()),
+            status: "running".into(),
+            last_tool: None,
+            pending_approval: None,
+            created_ms: 100,
+            updated_ms: 100,
+        });
+
+        assert_eq!(
+            rt.latest_task_id(Some("dot2-d")).as_deref(),
+            Some("run_dot2")
+        );
+        assert_eq!(
+            rt.latest_task_id(Some("android-2")),
+            None,
+            "device-scoped lookup must never fall through to another device's task"
+        );
+        assert_eq!(
+            rt.latest_task_id(None),
+            None,
+            "unscoped console lookup must not cross-target a speaker-bound task"
+        );
+        assert_eq!(rt.latest_task_id(Some("  ")), None);
+
+        rt.record_task(DelegatedTaskRecord {
+            task_id: "run_console".into(),
+            summary: "console task".into(),
+            device: None,
+            room: None,
+            status: "running".into(),
+            last_tool: None,
+            pending_approval: None,
+            created_ms: 150,
+            updated_ms: 150,
+        });
+        assert_eq!(
+            rt.latest_task_id(None).as_deref(),
+            Some("run_console"),
+            "unscoped lookup resolves unbound console tasks only"
+        );
+        assert_eq!(
+            rt.latest_task_id(Some("  ")).as_deref(),
+            Some("run_console")
+        );
+
+        rt.record_task(DelegatedTaskRecord {
+            task_id: "run_android".into(),
+            summary: "living room task".into(),
+            device: Some("android-2".into()),
+            room: Some("客厅".into()),
+            status: "running".into(),
+            last_tool: None,
+            pending_approval: None,
+            created_ms: 200,
+            updated_ms: 200,
+        });
+        assert_eq!(
+            rt.latest_task_id(Some("dot2-d")).as_deref(),
+            Some("run_dot2")
+        );
+        assert_eq!(
+            rt.latest_task_id(Some("android-2")).as_deref(),
+            Some("run_android")
         );
     }
 }

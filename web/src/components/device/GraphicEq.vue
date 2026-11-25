@@ -9,7 +9,6 @@
  * arrow keys all move the same value; each fader is a real ARIA slider.
  */
 import { computed, ref } from 'vue'
-import { t } from '../../i18n'
 
 const props = defineProps<{
   modelValue: number[]

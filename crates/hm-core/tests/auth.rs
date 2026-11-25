@@ -27,8 +27,8 @@ struct App {
     _dir: PathBuf,
 }
 
-/// `lan = true` makes every request look like it arrived from 203.0.113.9
-/// (TEST-NET-3) instead of loopback.
+/// `lan = true` makes every request look like it arrived from 192.168.1.9
+/// (private RFC1918 LAN) instead of loopback.
 async fn spawn(web: Option<String>, lan: bool) -> App {
     let dir = std::env::temp_dir().join(format!(
         "hm-auth-test-{}-{}",
@@ -78,7 +78,7 @@ async fn fake_lan_peer(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     req.extensions_mut().insert(axum::extract::ConnectInfo(
-        "203.0.113.9:54321".parse::<SocketAddr>().unwrap(),
+        "192.168.1.9:54321".parse::<SocketAddr>().unwrap(),
     ));
     next.run(req).await
 }
@@ -514,6 +514,7 @@ async fn option_1a_lan_gateway_exempt_allows_private_everyday_routes_and_gates_p
         ("POST", "/api/v0/devices/dot2-d/wifi"),
         ("POST", "/api/v0/reflex/deploy"),
         ("PUT", "/api/v0/prompts"),
+        ("DELETE", "/api/v0/devices/dot2-d/conversation"),
     ] {
         let req = match method {
             "GET" => client.get(format!("{}{path}", lan_app.base)),
@@ -523,6 +524,9 @@ async fn option_1a_lan_gateway_exempt_allows_private_everyday_routes_and_gates_p
             "PUT" => client
                 .put(format!("{}{path}", lan_app.base))
                 .json(&serde_json::json!({})),
+            "DELETE" => client
+                .delete(format!("{}{path}", lan_app.base))
+                .json(&serde_json::json!({ "expected_session_id": "", "include_archived": true })),
             _ => unreachable!(),
         };
         let resp = req.send().await.unwrap();
@@ -558,8 +562,7 @@ async fn option_1a_lan_gateway_exempt_allows_private_everyday_routes_and_gates_p
 
     // 6. Public IP (203.0.113.9) is NEVER exempt even when lan_gateway_exempt=true!
     let pub_app = spawn_with_peer("203.0.113.9:54321").await;
-    let (_, pub_body) = post(&pub_app.base, "/api/v0/auth/provision", None).await;
-    let pub_tok = pub_body["token"].as_str().unwrap().to_string();
+    let pub_tok = pub_app.state.auth.provision("family").unwrap();
     client
         .put(format!("{}/api/v0/auth/lan-exempt", pub_app.base))
         .header("Authorization", format!("Bearer {pub_tok}"))
@@ -572,6 +575,173 @@ async fn option_1a_lan_gateway_exempt_allows_private_everyday_routes_and_gates_p
         assert_eq!(
             code, 401,
             "public IP must NEVER be exempt on {path} even with lan_gateway_exempt=true"
+        );
+    }
+}
+
+#[tokio::test]
+async fn unpaired_core_restricts_public_peers_and_high_risk_lan_endpoints() {
+    let client = reqwest::Client::new();
+
+    // 1. Loopback unpaired stays fully open for local dev, smoke tests, and unit tests.
+    let lb_app = spawn(None, false).await;
+    let (code, _, body) = get(&lb_app.base, "/api/v0/status", None).await;
+    assert_eq!(code, 200);
+    assert_eq!(body["auth"]["configured"], false);
+    let resp = client
+        .post(format!("{}/api/v0/config/export?secrets=1", lb_app.base))
+        .header("X-HM-Confirm-Secrets", "EXPORT_SECRETS")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "loopback unpaired export with confirm header must keep working"
+    );
+    let (code, prov) = post(&lb_app.base, "/api/v0/auth/provision", None).await;
+    assert_eq!(code, 200);
+    assert!(prov["token"].as_str().unwrap().starts_with("hm1_"));
+
+    // 2. Non-private / public IPs (IPv4 TEST-NET & global IPv6) on an unpaired Core
+    //    must be rejected outright with 403 Forbidden on ALL /api/* routes,
+    //    including /api/v0/auth/provision, /api/v0/status, and /api/v0/config/export.
+    for public_peer in ["203.0.113.9:54321", "[2001:db8::1]:54321"] {
+        let pub_app = spawn_with_peer(public_peer).await;
+        let (code, _) = post(&pub_app.base, "/api/v0/auth/provision", None).await;
+        assert_eq!(
+            code, 403,
+            "public peer {public_peer} must get 403 on /api/v0/auth/provision while unpaired"
+        );
+        assert!(
+            !pub_app.state.auth.configured(),
+            "rejected public provision must leave Core unpaired"
+        );
+        for path in ["/api/v0/auth", "/api/v0/status", "/api/v0/config/export"] {
+            let (code, _, _) = get(&pub_app.base, path, None).await;
+            assert_eq!(
+                code, 403,
+                "public peer {public_peer} must get 403 on GET {path} while unpaired"
+            );
+        }
+        let resp = client
+            .post(format!("{}/api/v0/config/export?secrets=1", pub_app.base))
+            .header("X-HM-Confirm-Secrets", "EXPORT_SECRETS")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            403,
+            "public peer {public_peer} must get 403 on POST /api/v0/config/export?secrets=1"
+        );
+        let resp = client
+            .post(format!("{}/api/v0/system/factory-reset", pub_app.base))
+            .json(&serde_json::json!({ "confirm": "FACTORY_RESET" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            403,
+            "public peer {public_peer} must get 403 on POST /api/v0/system/factory-reset"
+        );
+    }
+
+    // 3. Private LAN (RFC1918), Tailscale CGNAT (100.64.0.0/10), and IPv6 ULA (fc00::/7)
+    //    on an unpaired Core:
+    //    - Read-only /api/v0/auth and /api/v0/status succeed.
+    //    - High-risk irreversible / secret-exfiltration routes are blocked with 401.
+    //    - One-shot POST /api/v0/auth/provision succeeds so the household owner can pair.
+    for lan_peer in [
+        "192.168.1.50:54321",
+        "100.64.10.20:54321",
+        "[fd12:3456::1]:54321",
+    ] {
+        let lan_app = spawn_with_peer(lan_peer).await;
+        let (code, _, auth_body) = get(&lan_app.base, "/api/v0/auth", None).await;
+        assert_eq!(code, 200, "private peer {lan_peer} can read /api/v0/auth");
+        assert_eq!(auth_body["configured"], false);
+        let (code, _, _) = get(&lan_app.base, "/api/v0/status", None).await;
+        assert_eq!(code, 200, "private peer {lan_peer} can read /api/v0/status");
+
+        let export_resp = client
+            .post(format!("{}/api/v0/config/export?secrets=1", lan_app.base))
+            .header("X-HM-Confirm-Secrets", "EXPORT_SECRETS")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            export_resp.status().as_u16(),
+            401,
+            "unpaired LAN peer {lan_peer} must be blocked (401) on POST /api/v0/config/export?secrets=1"
+        );
+        let export_body: Value = export_resp.json().await.unwrap();
+        assert!(
+            export_body["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("pair a household token")),
+            "expected pairing detail, got {export_body}"
+        );
+
+        let reset_resp = client
+            .post(format!("{}/api/v0/system/factory-reset", lan_app.base))
+            .json(&serde_json::json!({ "confirm": "FACTORY_RESET" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            reset_resp.status().as_u16(),
+            401,
+            "unpaired LAN peer {lan_peer} must be blocked (401) on POST /api/v0/system/factory-reset"
+        );
+
+        for (method, path) in [
+            ("GET", "/api/v0/config/export"),
+            ("POST", "/api/v0/config/import"),
+            ("POST", "/api/v0/devices/dot2-d/mic/capture"),
+            ("GET", "/api/v0/devices/dot2-d/mic/capture.wav"),
+            ("POST", "/api/v0/release/install"),
+            ("GET", "/api/v0/release"),
+            ("POST", "/api/v0/firmware/core"),
+            ("GET", "/api/v0/firmware"),
+        ] {
+            let req = match method {
+                "GET" => client.get(format!("{}{path}", lan_app.base)),
+                "POST" => client
+                    .post(format!("{}{path}", lan_app.base))
+                    .json(&serde_json::json!({})),
+                _ => unreachable!(),
+            };
+            let resp = req.send().await.unwrap();
+            assert_eq!(
+                resp.status().as_u16(),
+                401,
+                "unpaired LAN peer {lan_peer} must get 401 on {method} {path}"
+            );
+        }
+
+        // Pairing via one-shot /api/v0/auth/provision succeeds from private LAN / Tailscale / ULA.
+        let (code, body) = post(&lan_app.base, "/api/v0/auth/provision", None).await;
+        assert_eq!(
+            code, 200,
+            "private peer {lan_peer} must be able to pair via POST /api/v0/auth/provision"
+        );
+        let token = body["token"].as_str().unwrap();
+        assert!(token.starts_with("hm1_"));
+
+        // Once paired, presenting the Bearer token unlocks /api/v0/config/export?secrets=1.
+        let paired_export = client
+            .post(format!("{}/api/v0/config/export?secrets=1", lan_app.base))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-HM-Confirm-Secrets", "EXPORT_SECRETS")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            paired_export.status().as_u16(),
+            200,
+            "paired LAN peer {lan_peer} with Bearer token must be allowed to export secrets"
         );
     }
 }

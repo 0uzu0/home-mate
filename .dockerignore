@@ -2,6 +2,8 @@ target/
 web/node_modules/
 web/dist/
 data/
+crates/hm-core/data-test/
+**/data-test/
 .git/
 .github/
 docs/

@@ -1287,7 +1287,8 @@ pub(in crate::voice) mod phase3_event_pump_tests {
             Ok(0.1)
         });
         let proc = MicProcessor::new(pipe.live_vad_config()).with_silero(det);
-        crate::lock_or_recover(&pipe.mic, "voice.mic").insert("dot2-d".into(), proc);
+        crate::lock_or_recover(&pipe.mic, "voice.mic")
+            .insert("dot2-d".into(), Arc::new(Mutex::new(proc)));
         pipe.start();
 
         // Send a 1280-sample (80 ms) AudioChunk so the audio worker enters slow Silero inference.
@@ -1756,5 +1757,178 @@ pub(in crate::voice) mod phase3_event_pump_tests {
             .wake_claim_for(dev, "你好高达", id::now_ms(), None, Some(-30.0))
             .unwrap();
         assert!((claim.rms_dbfs.unwrap() - (-21.5)).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn p1_09_media_playback_clears_follow_open_edge_and_prevents_bogus_farewell() {
+        let pipe = test_pipeline(DeviceHub::new());
+        let dev = "dot2-d";
+        let now = id::now_ms();
+        {
+            let mut states = pipe.states.lock().unwrap();
+            let st = states.entry(dev.into()).or_default();
+            st.participation
+                .activate(
+                    st.participation.identity(),
+                    FollowWindowPolicy {
+                        ms: 5_000,
+                        ..Default::default()
+                    },
+                    CreditGrant::Full,
+                    now.saturating_sub(20_000),
+                )
+                .unwrap();
+            st.follow_open_last_tick = true;
+            st.follow_close_pending_at = Some(now.saturating_sub(1_000));
+            st.outputs.insert(
+                "media-1".into(),
+                OutputRecord {
+                    answer_text: String::new(),
+                    request: None,
+                    task_id: None,
+                    channel: "media".into(),
+                    kind: "media".into(),
+                    content_ref: "song".into(),
+                    stage: "playing".into(),
+                    started_ms: now.saturating_sub(5_000),
+                    stage_ms: now.saturating_sub(5_000),
+                    end_sent_ms: None,
+                    expected_ms: 0,
+                    synth_ms: 0,
+                },
+            );
+        }
+        // Sweep while media is live must clear `follow_open_last_tick` & `follow_close_pending_at`.
+        pipe.follow_window_tone_sweep();
+        {
+            let mut states = pipe.states.lock().unwrap();
+            let st = states.get_mut(dev).unwrap();
+            assert!(!st.follow_open_last_tick);
+            assert!(st.follow_close_pending_at.is_none());
+            // Now music ends.
+            st.outputs.remove("media-1");
+        }
+        // Subsequent sweep after music finishes must NOT emit a delayed bogus farewell.
+        pipe.follow_window_tone_sweep();
+        assert!(
+            !pipe
+                .recent(20)
+                .iter()
+                .any(|e| e["kind"] == "follow_window_close" && e["device"] == dev),
+            "finishing music must never trigger a delayed bogus follow_window_close farewell"
+        );
+    }
+
+    #[tokio::test]
+    async fn p1_09_session_sweep_logs_program_cut_dropped_once_without_double_drop() {
+        let pipe = test_pipeline(DeviceHub::new());
+        let dev = "dot2-d";
+        let now = id::now_ms();
+        {
+            let mut states = pipe.states.lock().unwrap();
+            let st = states.entry(dev.into()).or_default();
+            st.participation
+                .activate(
+                    st.participation.identity(),
+                    FollowWindowPolicy {
+                        ms: 5_000,
+                        ..Default::default()
+                    },
+                    CreditGrant::Full,
+                    now.saturating_sub(20_000),
+                )
+                .unwrap();
+            st.follow_open_last_tick = true;
+            st.paused_program = Some(Program {
+                text: "这是一段被系统截断的长答案文本".into(),
+                cursor: 0,
+                complete: true,
+                origin_task: None,
+                created_ms: now.saturating_sub(15_000),
+                resumable: true,
+                system_cut: true,
+                short_chars: 10,
+                cont: None,
+                lead_said: false,
+            });
+        }
+        let closed = pipe.session_sweep_at(now);
+        assert_eq!(closed, vec![dev.to_string()]);
+        pipe.follow_window_tone_sweep();
+        let cut_notes = pipe
+            .recent(30)
+            .into_iter()
+            .filter(|e| e["kind"] == "program_cut_dropped" && e["device"] == dev)
+            .count();
+        assert_eq!(
+            cut_notes, 1,
+            "program_cut_dropped must be logged exactly once across session_sweep_at + follow_window_tone_sweep"
+        );
+    }
+
+    #[tokio::test]
+    async fn p1_04_failed_v2_reconciliation_resets_flags_for_retry() {
+        let pipe = test_pipeline(DeviceHub::new());
+        let dev = "dot2-d";
+        let cfg = crate::config::ConfigService::new(pipe.store.clone());
+        cfg.save_unit_acoustic_profile(
+            dev,
+            crate::config::UnitAcousticProfile {
+                volume_cap: 0.75,
+                ..Default::default()
+            },
+            "test",
+        )
+        .unwrap();
+        pipe.set_mode_with_follow_window(
+            dev,
+            None,
+            None,
+            Some(vec!["你好小花".into()]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            FollowWindowPatch::default(),
+            "test",
+        )
+        .unwrap();
+        // Trigger on_device_online with v2 caps while hub has NO active outbound for `dev`,
+        // so both acoustics and KWS dispatches fail transiently and must reset reconciled flags!
+        pipe.on_device_online(
+            dev,
+            &[
+                "config_apply_v2".into(),
+                "config_block_acoustics".into(),
+                "config_block_kws".into(),
+            ],
+        );
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let (ac, kw) = {
+                let states = pipe.states.lock().unwrap();
+                let st = &states[dev];
+                (st.acoustics_reconciled, st.kws_reconciled)
+            };
+            if !ac && !kw {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "failed v2 reconciliation must reset acoustics_reconciled ({ac}) and kws_reconciled ({kw})"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 }

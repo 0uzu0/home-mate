@@ -182,6 +182,53 @@ impl TaskRegistry {
             .cloned()
     }
 
+    /// Resolve the `session_id` of `task_id` from in-memory active tasks or
+    /// persisted SQLite `tasks` (used for fail-closed loopback isolation on
+    /// `POST /api/v0/session/cancel`).
+    pub fn session_id_for(&self, task_id: &str) -> Option<String> {
+        let tid = task_id.trim();
+        if tid.is_empty() {
+            return None;
+        }
+        if let Some(t) = crate::lock_or_recover(&self.tasks, "task.registry").get(tid) {
+            return Some(t.session_id.clone());
+        }
+        use rusqlite::OptionalExtension;
+        self.store
+            .with(|c| {
+                c.query_row(
+                    "SELECT session_id FROM tasks WHERE id = ?1 LIMIT 1",
+                    [tid],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(Into::into)
+            })
+            .ok()
+            .flatten()
+    }
+
+    /// True if `task_id` matches an in-memory or persisted task in SQLite `tasks`.
+    pub fn exists(&self, task_id: &str) -> bool {
+        let tid = task_id.trim();
+        if tid.is_empty() {
+            return false;
+        }
+        if crate::lock_or_recover(&self.tasks, "task.registry").contains_key(tid) {
+            return true;
+        }
+        self.store
+            .with(|c| {
+                let exists: bool = c.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1)",
+                    [tid],
+                    |r| r.get(0),
+                )?;
+                Ok(exists)
+            })
+            .unwrap_or(false)
+    }
+
     /// Request cancellation: the honest boundary — running tools check the
     /// flag before side effects; already-submitted actions are NOT undone.
     pub fn request_cancel(&self, task_id: &str) -> Option<bool> {

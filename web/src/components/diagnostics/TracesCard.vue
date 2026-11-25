@@ -3,8 +3,8 @@
  * Request traces: the list, then one trace's events. A row opens the detail;
  * the detail is an ordered evidence log, not a summary.
  */
-import { ref, watch } from 'vue'
-import { getTrace, getTraces, type TraceDetail } from '../../api'
+import { onBeforeUnmount, ref, watch } from 'vue'
+import { getTrace, getTraces, isAbort, type TraceDetail } from '../../api'
 import { t } from '../../i18n'
 import { errorDetail, formatDateTime, formatTime } from '../../format'
 import { useResource } from '../../hooks/useResource'
@@ -16,6 +16,7 @@ import LoadingBlock from '../LoadingBlock.vue'
 import ErrorNotice from '../ErrorNotice.vue'
 
 const props = withDefaults(defineProps<{ focus?: string | null }>(), { focus: null })
+const emit = defineEmits<{ 'clear-focus': [] }>()
 
 const list = useResource((signal) => getTraces({ signal }), { timeoutMs: 6000, retries: 1 })
 void list.load()
@@ -23,6 +24,8 @@ void list.load()
 const detail = ref<TraceDetail | null>(null)
 const detailBusy = ref(false)
 const detailError = ref('')
+let openSeq = 0
+let openController: AbortController | null = null
 
 watch(
   () => props.focus,
@@ -32,16 +35,39 @@ watch(
 )
 
 async function open(id: string): Promise<void> {
+  const seq = ++openSeq
+  openController?.abort()
+  const controller = new AbortController()
+  openController = controller
   detailBusy.value = true
   detailError.value = ''
   try {
-    detail.value = await getTrace(id)
+    const res = await getTrace(id, { signal: controller.signal })
+    if (seq !== openSeq) return
+    detail.value = res
   } catch (err) {
+    if (seq !== openSeq || isAbort(err)) return
     detailError.value = errorDetail(err)
   } finally {
-    detailBusy.value = false
+    if (seq === openSeq) detailBusy.value = false
   }
 }
+
+function back(): void {
+  openSeq += 1
+  openController?.abort()
+  openController = null
+  detail.value = null
+  detailBusy.value = false
+  detailError.value = ''
+  emit('clear-focus')
+}
+
+onBeforeUnmount(() => {
+  openSeq += 1
+  openController?.abort()
+  openController = null
+})
 
 function statusTone(status: string): 'ok' | 'warn' | 'danger' | 'accent' | 'neutral' {
   switch (status) {
@@ -137,7 +163,7 @@ function eventSummary(kind: string, payload: Record<string, unknown>): string {
 
     <template v-else>
       <div class="traces__detail-head">
-        <button type="button" class="btn" @click="detail = null">
+        <button type="button" class="btn" @click="back">
           <AppIcon name="back" :size="14" /> {{ t('traceBack') }}
         </button>
         <Pill :tone="statusTone(detail.status)" size="sm" mono>{{ detail.status }}</Pill>

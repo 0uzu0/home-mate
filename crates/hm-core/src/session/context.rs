@@ -97,6 +97,23 @@ impl SessionStore {
             Ok(found)
         }).map_err(|e|e.to_string())
     }
+    /// Return the owning `device` for `session` from `device_contexts` across
+    /// ALL data epochs (not filtered to `current_epoch`) so prior-epoch context
+    /// sessions cannot bypass loopback isolation checks.
+    pub fn device_for_context_session_any_epoch(&self, session: &str) -> Option<String> {
+        self.store
+            .with(|c| {
+                c.query_row(
+                    "SELECT device FROM device_contexts WHERE session_id=?1 LIMIT 1",
+                    [session],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(Into::into)
+            })
+            .ok()
+            .flatten()
+    }
     pub fn context_ticket(&self, session: &str, epoch: u64) -> Result<Option<ContextTicket>> {
         self.store.with(|c| Ok(c.query_row("SELECT generation,data_epoch FROM device_contexts WHERE session_id=?1 AND data_epoch=?2",rusqlite::params![session,epoch as i64],|r|Ok(ContextTicket {generation:r.get::<_,i64>(0)? as u64,data_epoch:r.get::<_,i64>(1)? as u64})).optional()?))
     }
@@ -203,5 +220,112 @@ impl SessionStore {
             let changed=c.execute("UPDATE device_contexts SET last_activity_ms=MAX(last_activity_ms,?1) WHERE session_id=?2 AND generation=?3 AND data_epoch=?4 AND data_epoch=(SELECT data_epoch FROM config_head WHERE id=1) AND generation=(SELECT MAX(other.generation) FROM device_contexts other WHERE other.device=device_contexts.device AND other.data_epoch=device_contexts.data_epoch)",rusqlite::params![now as i64,session,ticket.generation as i64,ticket.data_epoch as i64])?;
             Ok(changed==1)
         })
+    }
+    /// Archive the device's current conversation context and rotate to a fresh
+    /// empty context head so the next wake starts with 0 carried-over turns
+    /// (`退下＝清零`) while finished turns stay readable in `archived_contexts`.
+    pub fn archive_and_rotate_device_context(
+        &self,
+        device: &str,
+        now: u64,
+    ) -> std::result::Result<(String, usize), String> {
+        let authority = self.device_authority(device)?;
+        self.store
+            .with(|c| {
+                let tx = c.unchecked_transaction()?;
+                authority.check_in(&tx)?;
+                let existing_ctx = tx
+                    .query_row(
+                        &format!(
+                            "SELECT {COLUMNS} FROM device_contexts WHERE device=?1 AND data_epoch=?2 ORDER BY generation DESC LIMIT 1"
+                        ),
+                        rusqlite::params![device, authority.epoch() as i64],
+                        row,
+                    )
+                    .optional()?;
+                let old_sid = if let Some(ctx) = &existing_ctx {
+                    if !authority.session_is_bound_in(&tx, &ctx.session_id)? {
+                        return Err(crate::store::StoreError::Authority(
+                            "context scope changed".into(),
+                        ));
+                    }
+                    ctx.session_id.clone()
+                } else {
+                    let mut legacy = None;
+                    for candidate in [
+                        format!("dev:{device}"),
+                        format!("dev:scope11:{device}:{}", authority.epoch()),
+                    ] {
+                        if authority.session_is_bound_in(&tx, &candidate)? {
+                            legacy = Some(candidate);
+                            break;
+                        }
+                    }
+                    match legacy {
+                        Some(sid) => sid,
+                        None => {
+                            let base = format!("dev:{device}");
+                            crate::confirmation::store::invalidate_session(&tx, &base)?;
+                            tx.commit()?;
+                            return Ok((base, 0));
+                        }
+                    }
+                };
+                crate::confirmation::store::invalidate_session(&tx, &old_sid)?;
+                let old_count: usize = tx.query_row(
+                    "SELECT count(*) FROM messages WHERE session_id=?1",
+                    [&old_sid],
+                    |r| r.get::<_, i64>(0),
+                )? as usize;
+                if old_count > 0 {
+                    if existing_ctx.is_none() {
+                        let last_activity: u64 = tx
+                            .query_row(
+                                "SELECT ts_ms FROM messages WHERE session_id=?1 ORDER BY id DESC LIMIT 1",
+                                [&old_sid],
+                                |r| r.get::<_, i64>(0),
+                            )
+                            .optional()?
+                            .map(|v| v as u64)
+                            .unwrap_or(now);
+                        let first_activity: u64 = tx
+                            .query_row(
+                                "SELECT ts_ms FROM messages WHERE session_id=?1 ORDER BY id ASC LIMIT 1",
+                                [&old_sid],
+                                |r| r.get::<_, i64>(0),
+                            )
+                            .optional()?
+                            .map(|v| v as u64)
+                            .unwrap_or(last_activity);
+                        tx.execute(
+                            "INSERT OR IGNORE INTO sessions (id, created_ms, title) VALUES (?1, ?2, ?3)",
+                            rusqlite::params![&old_sid, first_activity as i64, "device"],
+                        )?;
+                        tx.execute(
+                            "INSERT INTO device_contexts(session_id,device,data_epoch,created_ms,last_activity_ms) VALUES (?1,?2,?3,?4,?5)",
+                            rusqlite::params![
+                                &old_sid,
+                                device,
+                                authority.epoch() as i64,
+                                first_activity as i64,
+                                last_activity as i64
+                            ],
+                        )?;
+                    }
+                    let fresh = format!("dev:context12:{device}:{}", id::next("ctx"));
+                    tx.execute(
+                        "INSERT INTO sessions (id, created_ms, title) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![&fresh, now as i64, "device"],
+                    )?;
+                    authority.bind_session_in(&tx, &fresh)?;
+                    tx.execute(
+                        "INSERT INTO device_contexts(session_id,device,data_epoch,created_ms,last_activity_ms) VALUES (?1,?2,?3,?4,?4)",
+                        rusqlite::params![&fresh, device, authority.epoch() as i64, now as i64],
+                    )?;
+                }
+                tx.commit()?;
+                Ok((old_sid, old_count))
+            })
+            .map_err(|e| e.to_string())
     }
 }
