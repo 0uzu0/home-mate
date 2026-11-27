@@ -32,13 +32,14 @@ RUN apt-get update \
 WORKDIR /app
 COPY --from=core-builder /src/target/release/hm-core /usr/local/bin/hm-core
 COPY --from=web-builder /src/web/dist /app/web/dist
+COPY LICENSE LICENSE-PROTOCOL-APACHE-2.0 LICENSING.md THIRD_PARTY_NOTICES.md /usr/share/doc/home-mate/
 
 # Run as a dedicated non-root user (1000:1001 matches NAS bind-mount ownership)
 # and lock /data to 0750 rather than world-writable 0777.
 RUN groupadd -g 1001 -f hm \
     && useradd -u 1000 -g 1001 -M -s /usr/sbin/nologin hm \
     && chmod 0755 /usr/local/bin/hm-core \
-    && chmod -R a+rX /app/web/dist \
+    && chmod -R a+rX /app/web/dist /usr/share/doc/home-mate \
     && mkdir -p /data/models \
     && chown -R 1000:1001 /data \
     && chmod 0750 /data /data/models

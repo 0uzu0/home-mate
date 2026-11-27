@@ -415,7 +415,7 @@ After your speaker or NAS Core is online at `http://<CORE_IP>:8930`, open **Serv
 
 Home Mate stands on the shoulders of many open-source projects and hardware communities. Full license details live in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-- **On-Speaker & Gateway Pipeline**: [idootop/open-xiaoai](https://github.com/idootop/open-xiaoai) & [@coderzc/open-xiaoai](https://github.com/coderzc/open-xiaoai) (MIT), [k2-fsa/sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) (Apache-2.0), [Microsoft ONNX Runtime](https://github.com/microsoft/onnxruntime) (MIT), [snakers4/silero-vad](https://github.com/snakers4/silero-vad) (MIT), [xiph/speexdsp](https://github.com/xiph/speexdsp) (BSD-3-Clause), [pdeljanov/Symphonia](https://github.com/pdeljanov/Symphonia) (MPL-2.0), Tokio, Axum, Rusqlite, RustCrypto, Vue 3, and Lucide.
+- **On-Speaker & Gateway Pipeline**: [idootop/open-xiaoai](https://github.com/idootop/open-xiaoai) & [@coderzc/open-xiaoai](https://github.com/coderzc/open-xiaoai) (MIT), [k2-fsa/sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) (Apache-2.0), [Microsoft ONNX Runtime](https://onnxruntime.ai/) (MIT), [snakers4/silero-vad](https://github.com/snakers4/silero-vad) (MIT), [xiph/speexdsp](https://github.com/xiph/speexdsp) (BSD-3-Clause), [pdeljanov/Symphonia](https://github.com/pdeljanov/Symphonia) (MPL-2.0), Tokio, Axum, Rusqlite, RustCrypto, Vue 3, and Lucide.
 - **Community Contributors**: Special thanks to **[@jiantongzh](https://github.com/jiantongzh)** for hardware-validating the 128 MB LX06 batch and inspiring Thin Gateway mode.
 - **Architectural Lineage**: [yes999zc/rui](https://github.com/yes999zc/rui), [wilbowes/EchoMuse](https://github.com/wilbowes/EchoMuse), [Rhasspy](https://github.com/rhasspy/rhasspy) / [Wyoming](https://github.com/rhasspy/wyoming), [Home Assistant](https://github.com/home-assistant/core), and [Navidrome](https://github.com/navidrome/navidrome).
 
@@ -423,6 +423,6 @@ Home Mate stands on the shoulders of many open-source projects and hardware comm
 
 ## License & Contact
 
-- **Open-Source License**: **[GNU AGPL v3.0](LICENSE)** for personal, family, and community self-hosting. The Northbound v2 protocol specification is licensed under **[Apache-2.0](LICENSE-PROTOCOL-APACHE-2.0)**.
+- **Open-Source License**: Licensed under **[GNU AGPL v3.0 (`AGPL-3.0-only`)](LICENSE)**. The Northbound v2 protocol specification (`crates/hm-core/src/gateway/`) is additionally licensed under **[Apache-2.0](LICENSE-PROTOCOL-APACHE-2.0)** (see [`LICENSING.md`](LICENSING.md)).
 - **Official Website**: **[https://mymate.homes](https://mymate.homes)**
 - **Contact (Custom Speaker R&D / Commercial OEM Licensing)**: **`zhangcong1985@gmail.com`** / **`yes999zc@163.com`**

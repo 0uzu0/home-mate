@@ -415,7 +415,7 @@ async fn bug1_wake_slice_cursor_race_under_arbitration_admits_command() {
     .await;
     let _dot2_b = MockGw::connect(
         state.hub.clone(),
-        "192.168.1.100:42102".parse().unwrap(),
+        "192.168.10.77:42102".parse().unwrap(),
         "dot2-b",
         Some("v1"),
         Some(token),
@@ -682,7 +682,7 @@ async fn bug3_adaptive_play_ahead_and_asr_wake_media_pause() {
     .await;
     let mut android = MockGw::connect(
         state.hub.clone(),
-        "192.168.1.100:42302".parse().unwrap(),
+        "192.168.10.96:42302".parse().unwrap(),
         ANDROID_ID,
         Some("android-v2"),
         Some(token),
@@ -815,7 +815,7 @@ async fn mg_p0_01_unbound_callers_fail_closed_and_scope_bound_chat_targets_bound
     .await;
     let mut android = MockGw::connect(
         state.hub.clone(),
-        "192.168.1.100:42402".parse().unwrap(),
+        "192.168.10.96:42402".parse().unwrap(),
         ANDROID_ID,
         Some("android-v2"),
         Some(token.clone()),
@@ -1020,7 +1020,7 @@ async fn mg_p0_03_lan_gateway_exempt_protects_loopback_speaker_and_global_mode_f
     .await;
     let _android = MockGw::connect(
         state.hub.clone(),
-        "192.168.1.100:42502".parse().unwrap(),
+        "192.168.10.96:42502".parse().unwrap(),
         ANDROID_ID,
         Some("android-v2"),
         Some(token.clone()),
@@ -1061,7 +1061,7 @@ async fn mg_p0_03_lan_gateway_exempt_protects_loopback_speaker_and_global_mode_f
     let dot2_scope11_task = state.tasks.create(&scope11_sid).unwrap();
     let android_task = state.tasks.create(&format!("dev:{ANDROID_ID}")).unwrap();
 
-    let base = spawn_http_as(state.clone(), "192.168.1.100:55555".parse().unwrap()).await;
+    let base = spawn_http_as(state.clone(), "192.168.10.88:55555".parse().unwrap()).await;
     let http = reqwest::Client::new();
 
     // Every per-device & session route targeting loopback-protected `dot2-d` MUST return 401.
@@ -1283,7 +1283,7 @@ async fn mg_p0_04_mobile_android_v2_isolated_from_household_acoustic_domain() {
     .await;
     let android = MockGw::connect(
         state.hub.clone(),
-        "192.168.1.100:42602".parse().unwrap(),
+        "192.168.10.96:42602".parse().unwrap(),
         ANDROID_ID,
         Some("android-v2"),
         Some(token),

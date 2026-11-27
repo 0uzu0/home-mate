@@ -231,7 +231,7 @@ async fn p0_2_factory_reset_clears_lan_exempt_and_preserves_core_id() {
     state.auth.set_lan_gateway_exempt(true).unwrap();
     assert!(state.auth.lan_gateway_exempt());
 
-    let lan_base = spawn_http_as(state.clone(), "192.168.1.100:51000".parse().unwrap()).await;
+    let lan_base = spawn_http_as(state.clone(), "192.168.10.90:51000".parse().unwrap()).await;
     let http = reqwest::Client::new();
 
     // Before reset: unauth LAN peer is admitted to everyday /status.
@@ -292,7 +292,7 @@ async fn p1_1_announce_never_lan_exempt_and_rejects_forged_task_id() {
         .await
         .is_some());
 
-    let lan_base = spawn_http_as(state.clone(), "192.168.1.100:51001".parse().unwrap()).await;
+    let lan_base = spawn_http_as(state.clone(), "192.168.10.91:51001".parse().unwrap()).await;
     let http = reqwest::Client::new();
 
     // Even with lan_gateway_exempt=true, unauthenticated LAN POST /voice/announce MUST return 401.
@@ -377,7 +377,7 @@ async fn p1_2_offline_device_id_reservation_blocks_unauth_lan_hijack() {
     // 2. While dot2-d is offline, an unauthenticated LAN peer attempts to claim dot2-d via Hello.
     let mut attacker = MockGw::connect(
         state.hub.clone(),
-        "192.168.1.100:41202".parse().unwrap(),
+        "192.168.10.92:41202".parse().unwrap(),
         &["dot2-d"],
         vec!["audio_in", "audio_out"],
         None,
@@ -396,7 +396,7 @@ async fn p1_2_offline_device_id_reservation_blocks_unauth_lan_hijack() {
     // 3. Same unauthenticated LAN peer connects under a benign id, then tries to hijack dot2-d via DeviceStatus.
     let mut attacker2 = MockGw::connect(
         state.hub.clone(),
-        "192.168.1.100:41203".parse().unwrap(),
+        "192.168.10.93:41203".parse().unwrap(),
         &["android-guest"],
         vec!["audio_out"],
         None,
@@ -436,7 +436,7 @@ async fn p1_2_offline_device_id_reservation_blocks_unauth_lan_hijack() {
     {
         let mut authed = MockGw::connect(
             state.hub.clone(),
-            "192.168.1.100:41204".parse().unwrap(),
+            "192.168.10.94:41204".parse().unwrap(),
             &["android-owner"],
             vec!["audio_out"],
             Some(token),
@@ -462,7 +462,7 @@ async fn p1_2_offline_device_id_reservation_blocks_unauth_lan_hijack() {
     );
     let mut unauth_claim = MockGw::connect(
         state.hub.clone(),
-        "192.168.1.100:41205".parse().unwrap(),
+        "192.168.10.95:41205".parse().unwrap(),
         &["android-owner"],
         vec!["audio_out"],
         None,
@@ -547,7 +547,7 @@ async fn p1_4_single_core_multi_gateway_arbitration_with_zero_fleet_peers() {
     .await;
     let mut gw_b = MockGw::connect(
         state.hub.clone(),
-        "192.168.1.100:41402".parse().unwrap(),
+        "192.168.10.96:41402".parse().unwrap(),
         &["android-2"],
         vec!["audio_in", "audio_out", "kws"],
         None,
@@ -1304,7 +1304,7 @@ async fn p2_8_p2_9_export_import_personal_agent_md_llm_fallback_restore_and_auth
             STORY_TOKEN_SECRET,
             PersonalEndpointConfig {
                 enabled: true,
-                url: "http://192.168.1.100:18083".into(),
+                url: "http://192.168.10.168:18083".into(),
                 timeout_ms: 4000,
             },
             Some("story-secret-xyz"),
@@ -1318,7 +1318,7 @@ async fn p2_8_p2_9_export_import_personal_agent_md_llm_fallback_restore_and_auth
             LEARNING_TOKEN_SECRET,
             PersonalEndpointConfig {
                 enabled: true,
-                url: "http://192.168.1.100:18084".into(),
+                url: "http://192.168.10.168:18084".into(),
                 timeout_ms: 4000,
             },
             Some("learn-secret-xyz"),
@@ -1348,8 +1348,8 @@ async fn p2_8_p2_9_export_import_personal_agent_md_llm_fallback_restore_and_auth
 
     // 1. Export WITH secrets -> includes story, learning, agent_md, and personal secrets!
     let doc = build_config_document(&state, true).unwrap();
-    assert_eq!(doc["story"]["url"], "http://192.168.1.100:18083");
-    assert_eq!(doc["learning"]["url"], "http://192.168.1.100:18084");
+    assert_eq!(doc["story"]["url"], "http://192.168.10.168:18083");
+    assert_eq!(doc["learning"]["url"], "http://192.168.10.168:18084");
     assert_eq!(doc["agent_md"]["content"], "# Household Persona\nBe kind.");
     assert_eq!(doc["secrets"][STORY_TOKEN_SECRET], "story-secret-xyz");
     assert_eq!(doc["secrets"][LEARNING_TOKEN_SECRET], "learn-secret-xyz");
@@ -1363,7 +1363,7 @@ async fn p2_8_p2_9_export_import_personal_agent_md_llm_fallback_restore_and_auth
     assert!(out.applied.contains(&"agent_md".to_string()));
     assert_eq!(
         state2.config.personal_endpoint(STORY_KEY).unwrap().url,
-        "http://192.168.1.100:18083"
+        "http://192.168.10.168:18083"
     );
     assert_eq!(
         state2
@@ -1470,7 +1470,7 @@ async fn p1_6_unit_acoustic_profile_update_ignores_untouched_secondary_unit() {
     .await;
     let mut gw_android = MockGw::connect(
         state.hub.clone(),
-        "192.168.1.100:42602".parse().unwrap(),
+        "192.168.10.106:42602".parse().unwrap(),
         &["android-2"],
         vec!["audio_out", "config_apply_v2", "config_block_acoustics"],
         None,
@@ -1866,7 +1866,7 @@ async fn p2_8_p2_9_failed_import_rolls_back_agent_md_and_personal_while_preservi
             STORY_TOKEN_SECRET,
             PersonalEndpointConfig {
                 enabled: true,
-                url: "http://192.168.1.100:18083".into(),
+                url: "http://192.168.10.168:18083".into(),
                 timeout_ms: 4000,
             },
             Some("orig-story-tok"),
@@ -1893,7 +1893,7 @@ async fn p2_8_p2_9_failed_import_rolls_back_agent_md_and_personal_while_preservi
     let bad_import: ConfigImportBody = serde_json::from_value(json!({
         "story": {
             "enabled": true,
-            "url": "http://192.168.1.100:19999",
+            "url": "http://192.168.10.199:19999",
             "timeout_ms": 5000
         },
         "agent_md": {
@@ -1918,7 +1918,7 @@ async fn p2_8_p2_9_failed_import_rolls_back_agent_md_and_personal_while_preservi
     // 1. Both story (config + secret) and agent_md MUST have rolled back to baseline.
     assert_eq!(
         state.config.personal_endpoint(STORY_KEY).unwrap().url,
-        "http://192.168.1.100:18083"
+        "http://192.168.10.168:18083"
     );
     assert_eq!(
         state
@@ -1947,7 +1947,7 @@ async fn p2_12_stale_play_frames_dropped_and_single_device_reclaim_evicts_plays(
     // Gateway A connects owning TWO devices ("dev-1" and "dev-2").
     let mut gw_a = MockGw::connect(
         state.hub.clone(),
-        "192.168.1.100:42901".parse().unwrap(),
+        "192.168.10.120:42901".parse().unwrap(),
         &["dev-1", "dev-2"],
         vec!["audio_out", "play_stream"],
         None,
@@ -1978,7 +1978,7 @@ async fn p2_12_stale_play_frames_dropped_and_single_device_reclaim_evicts_plays(
     // Gateway B connects under a temporary ID, then reclaims ONLY "dev-1" via DeviceStatus.
     let mut gw_b = MockGw::connect(
         state.hub.clone(),
-        "192.168.1.100:42902".parse().unwrap(),
+        "192.168.10.121:42902".parse().unwrap(),
         &["dev-b-tmp"],
         vec!["audio_out", "play_stream"],
         None,

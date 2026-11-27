@@ -27,7 +27,7 @@ This document defines the 3-layer split for **Dot2** units running Home Mate (on
   - **Night LED & Ring Orientation (`DeviceLedConfig`)**: per-unit night dimming window (`night_enabled`, `night_start_minute`, `night_end_minute`, `night_brightness_pct`) and physical LED ring orientation (`orientation_rotation`, `orientation_reverse`).
 - Two `stable_id`s (e.g. `dot2-d` in `客厅` and `dot2-e` in `儿童房`) maintain independent `UnitAcousticProfile`, `DeviceLedConfig`, volume, mute state, and `device_meta` without overwriting each other.
 
-### 3. Port (Device Gateway — `home-mate-device-gateway-b`)
+### 3. Port (Device Gateway — `home-mate-gateway-linux`)
 - Runs on loopback only and adapts the physical Dot2 hardware to the versioned Core–Gateway protocol (`HelloDevice`, `DeviceStatus`, `VolumeReceipt`, `MuteState`, `Button`, `PlayStream`, `Stop`, `Flush`).
 - Streams audio via sentence-chunked `PlayStream` (`Start` -> `Chunk` -> `End` with `PlayStage` receipts); legacy monolithic WAV `Play` is retired.
 - Owns ALSA/audio I/O, AEC/KWS front-end, LED ring rendering, DSP/loudness execution (including the `echomuse` biscuit voicing chain), and Wi-Fi provisioning execution.

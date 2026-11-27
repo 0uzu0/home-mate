@@ -44,8 +44,8 @@ pub mod working_memory;
 /// gateway. Must match the gateway's PROTOCOL_VERSION contract tests at G1.
 pub const DEVICE_PROTOCOL_VERSION: u32 = 2;
 
-/// Lowest peer protocol version this core accepts (protocol v1 mechanism,
-/// 2026-11-16: home-mate-b#8 / gateway#11). Compatibility is INTERVAL
+/// Lowest peer protocol version this core accepts (protocol v1 negotiation
+/// mechanism, 2026-11-16). Compatibility is INTERVAL
 /// intersection — `max(both min) <= min(both max)` — not equality, so a
 /// mixed window (new firmware + old core) still inter-operates.
 pub const DEVICE_PROTOCOL_MIN_VERSION: u32 = 0;

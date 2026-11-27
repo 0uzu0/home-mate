@@ -624,7 +624,7 @@ async fn the_console_can_adopt_or_ignore_a_pending_candidate() {
 #[tokio::test]
 async fn working_memory_persists_across_sessions_and_is_recalled_in_new_session() {
     let work_detail = format!(
-        "仓库在 /Users/dev/home-mate-b，当前做到 Phase 7 M6 长期工作记忆，已完成 SQLite v7 迁移与单元测试。{}",
+        "仓库在 /srv/home-mate，当前做到 Phase 7 M6 长期工作记忆，已完成 SQLite v7 迁移与单元测试。{}",
         "补充上下文细节。".repeat(20)
     );
     assert!(work_detail.chars().count() > 200);
@@ -648,9 +648,7 @@ async fn working_memory_persists_across_sessions_and_is_recalled_in_new_session(
         },
         // Session 2 (brand new session): assistant recalls from injected working memory.
         Scripted::Text {
-            chunks: vec![
-                "你的项目在 /Users/dev/home-mate-b，上次做到 Phase 7 M6 长期工作记忆。".into(),
-            ],
+            chunks: vec!["你的项目在 /srv/home-mate，上次做到 Phase 7 M6 长期工作记忆。".into()],
         },
     ]);
     let (base, state, _token) = spawn_app(llm.clone()).await;
@@ -715,7 +713,7 @@ async fn working_memory_persists_across_sessions_and_is_recalled_in_new_session(
     assert!(
         last_system.contains("工作记忆")
             && last_system.contains("home_mate_m6")
-            && last_system.contains("/Users/dev/home-mate-b"),
+            && last_system.contains("/srv/home-mate"),
         "new session system prompt must inject working memory: {last_system}"
     );
     let answer = ev2
@@ -726,7 +724,7 @@ async fn working_memory_persists_across_sessions_and_is_recalled_in_new_session(
                 .flatten()
         })
         .expect("session 2 answer");
-    assert!(answer.contains("/Users/dev/home-mate-b"), "{answer}");
+    assert!(answer.contains("/srv/home-mate"), "{answer}");
 }
 
 #[tokio::test]

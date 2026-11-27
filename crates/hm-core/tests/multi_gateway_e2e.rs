@@ -333,7 +333,7 @@ async fn boot_dual_gateway_env() -> (Arc<AppState>, TestGateway, TestGateway, St
     .await;
     let android = TestGateway::connect(
         state.hub.clone(),
-        "192.168.1.100:42002".parse().unwrap(),
+        "192.168.10.99:42002".parse().unwrap(),
         "android-gw",
         "android-2",
         Some(token.clone()),
@@ -801,7 +801,7 @@ async fn secondary_device_can_retreat_own_media_while_primary_has_open_voice_win
     ));
     let mut idle_gw = TestGateway::connect(
         state.hub.clone(),
-        "192.168.1.100:42003".parse().unwrap(),
+        "192.168.10.105:42003".parse().unwrap(),
         "idle-gw",
         "dot2-idle",
         Some(_token),
@@ -1046,7 +1046,7 @@ async fn lan_gateway_exempt_blocks_privileged_mode_fields_and_preserves_wake_ack
     let (state, _dot2, _android, token) = boot_dual_gateway_env().await;
     state.auth.set_lan_gateway_exempt(true).unwrap();
 
-    // Serve router with a private-LAN ConnectInfo (192.168.1.100) so the middleware
+    // Serve router with a private-LAN ConnectInfo (192.168.10.88) so the middleware
     // takes the non-loopback `lan_gateway_exempt` branch over real HTTP.
     let lan_peer = ConnectInfo(SocketAddr::from(([192, 168, 5, 88], 54321)));
     let api = hm_core::api::router(state.clone()).layer(axum::Extension(lan_peer));

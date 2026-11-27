@@ -651,9 +651,7 @@ mod tests {
         assert!(s.render_for_prompt(None, None).is_none());
 
         // Set global, per-person, and per-device items with same key.
-        let g = s
-            .set("", "", "project_path", "/Users/dev/home-mate-b")
-            .unwrap();
+        let g = s.set("", "", "project_path", "/srv/home-mate").unwrap();
         let p = s
             .set("alice", "", "project_path", "/Users/alice/workspace")
             .unwrap();
@@ -680,25 +678,23 @@ mod tests {
         assert_eq!(s.list(None, Some("dot2-a")).unwrap().len(), 1);
 
         // Upsert updates content and preserves id/created_ms.
-        let updated = s
-            .set("", "", "project_path", "/Users/dev/home-mate-b-v2")
-            .unwrap();
+        let updated = s.set("", "", "project_path", "/srv/home-mate-v2").unwrap();
         assert_eq!(updated.id, g.id);
         assert_eq!(updated.created_ms, g.created_ms);
-        assert_eq!(updated.content, "/Users/dev/home-mate-b-v2");
+        assert_eq!(updated.content, "/srv/home-mate-v2");
 
         // Prompt rendering filters by device and person while keeping global items,
         // and NEVER leaks person-scoped or other-device entries.
         let global_only = s
             .render_for_prompt_scoped(&ScopeContext::default())
             .unwrap();
-        assert!(global_only.contains("/Users/dev/home-mate-b-v2"));
+        assert!(global_only.contains("/srv/home-mate-v2"));
         assert!(!global_only.contains("/Users/alice/workspace"));
         assert!(!global_only.contains("Finished M6 schema and store"));
         assert!(!global_only.contains("Debugging gateway reconnect"));
 
         let dev_a_prompt = s.render_for_prompt(None, Some("dot2-a")).unwrap();
-        assert!(dev_a_prompt.contains("/Users/dev/home-mate-b-v2"));
+        assert!(dev_a_prompt.contains("/srv/home-mate-v2"));
         assert!(dev_a_prompt.contains("Finished M6 schema and store"));
         assert!(!dev_a_prompt.contains("Debugging gateway reconnect"));
         assert!(!dev_a_prompt.contains("/Users/alice/workspace"));

@@ -17,7 +17,7 @@
 
 ## 本轮新增的架构共识
 
-- 核心采用模块化单体、设备网关外部独立：Home Mate一个主服务，核心内部按职责组织；外部工程正式名Home Mate Device Gateway，由接手Agent新建`home-mate-device-gateway-b`私有仓库从零实现，独立维护、测试和发布，通过版本化协议接入。旧桥仅供经验参考；详见[设备网关工程交接](device-gateway-project.md)。必要的音频/推理隔离按实际需求决定。
+- 核心采用模块化单体、设备网关外部独立：Home Mate一个主服务，核心内部按职责组织；外部工程正式名Home Mate Device Gateway，由独立仓库 `yes999zc/home-mate-gateway-linux` 实现，独立维护、测试和发布，通过版本化协议接入。旧桥仅供经验参考。必要的音频/推理隔离按实际需求决定。
 - Rust作为核心服务首选；模型对话与工具循环也可在Rust内实现。Python只在关键引擎确有需要且边界清楚时引入；语言收益不等于智能或声学问题已解决。
 - Agent内核优先Rust原生组件或小型实现，不默认额外引入跨语言服务；允许学习Pi等项目的上下文、工具钩子和事件机制。框架与自研按总维护成本选择，详见 [内核调研](agent-kernel-research.md)；M3.5 选型结论（2026-11-07，经独立评审）：自有循环＋自写客户端，genai 0.7.3 为已验证替换路径，见 [kernel-selection](kernel-selection.md)。
 - 管理页面沿用Vue＋TypeScript方向，管理接口属于Rust服务；TypeScript并非旧RUI没有的新技术。

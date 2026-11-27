@@ -1,6 +1,5 @@
 # Release packages: signing, bootstrap, install, rollback
 
-M8a (2026-11-13). Design: [docs/d/m8a-design-20261113.md](../../docs/d/m8a-design-20261113.md).
 This file is the operator's runbook: where the keys live, how a package is built and signed offline,
 how the installer gets onto the device, and how activation/rollback are observed.
 
@@ -111,9 +110,8 @@ The core looks for the tool at `<data-dir>/../bin/hm-release` (`/data/hm/bin/hm-
 `HM_RELEASE_TOOL` overrides it on a host. The installer derives its roots from `HM_RELEASE_ROOT`
 (default `/data/hm`) and `HM_FW_DIR` (default `/data/local/tmp/hm-direct`).
 
-> **不明重启的排查顺序**：先热复位，再读 `/proc/last_kmsg`（上一次启动的内核日志，跨热复位保留，
-> 下一次重启即毁）；**不要先拔电**。当前 p10 是原始镜像，未经演练不要重刷。
-> 完整说明：[pre-m8b-freeze-checklist §3.1](../../docs/d/pre-m8b-freeze-checklist-20261114.md)。
+> **Troubleshooting unexpected reboots**: warm-reboot first and read `/proc/last_kmsg`
+> (previous boot kernel log; survives warm reboot, lost on the next boot) before pulling power.
 
 ## 4. Install and activate
 
@@ -190,5 +188,5 @@ hm-release install --package <tar> --drill-stall-ms 30000   # half-install drill
   M8a only versions the application layer on the writable `/data` layout.
 - Distribution is LAN-only HTTP (user decision); there is no fleet push, no delta package and no
   installer self-update. Signing the SBOM/dependencies is not part of M8a.
-- The management API is unauthenticated on the home LAN today (same trust domain as the console);
-  the installer runs as root because the slots and supervisors are root-owned.
+- Management API write/admin/release routes require a paired Bearer token (`Authorization: Bearer hm1_...`);
+  the on-device `hm-release` installer runs as root over loopback because the A/B slots and supervisors are root-owned.

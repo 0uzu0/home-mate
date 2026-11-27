@@ -413,7 +413,7 @@ docker run -d \
 
 感谢所有让 Home Mate 成为可能的开源项目与硬件社区（完整许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)）：
 
-- **音箱与网关管线**：[idootop/open-xiaoai](https://github.com/idootop/open-xiaoai) & [@coderzc/open-xiaoai](https://github.com/coderzc/open-xiaoai)（MIT）、[k2-fsa/sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)（Apache-2.0）、[Microsoft ONNX Runtime](https://github.com/microsoft/onnxruntime)（MIT）、[snakers4/silero-vad](https://github.com/snakers4/silero-vad)（MIT）、[xiph/speexdsp](https://github.com/xiph/speexdsp)（BSD-3-Clause）、[pdeljanov/Symphonia](https://github.com/pdeljanov/Symphonia)（MPL-2.0）、Tokio、Axum、Rusqlite、RustCrypto、Vue 3 与 Lucide。
+- **音箱与网关管线**：[idootop/open-xiaoai](https://github.com/idootop/open-xiaoai) & [@coderzc/open-xiaoai](https://github.com/coderzc/open-xiaoai)（MIT）、[k2-fsa/sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)（Apache-2.0）、[Microsoft ONNX Runtime](https://onnxruntime.ai/)（MIT）、[snakers4/silero-vad](https://github.com/snakers4/silero-vad)（MIT）、[xiph/speexdsp](https://github.com/xiph/speexdsp)（BSD-3-Clause）、[pdeljanov/Symphonia](https://github.com/pdeljanov/Symphonia)（MPL-2.0）、Tokio、Axum、Rusqlite、RustCrypto、Vue 3 与 Lucide。
 - **社区贡献致谢**：特别感谢 **[@jiantongzh](https://github.com/jiantongzh)** 实机验证 128 MB 批次 LX06 并贡献瘦网关方案思路。
 - **架构渊源与参考**：[yes999zc/rui（小瑞）](https://github.com/yes999zc/rui)、[wilbowes/EchoMuse](https://github.com/wilbowes/EchoMuse)、[Rhasspy](https://github.com/rhasspy/rhasspy) / [Wyoming](https://github.com/rhasspy/wyoming)、[Home Assistant](https://github.com/home-assistant/core) 与 [Navidrome](https://github.com/navidrome/navidrome)。
 
@@ -421,6 +421,6 @@ docker run -d \
 
 ## 开源协议与联系方式
 
-- **开源协议**：遵循 **[GNU AGPL v3.0](LICENSE)** 面向个人、极客与家庭免费开源；北向 v2 网关通信协议规范遵循 **[Apache-2.0](LICENSE-PROTOCOL-APACHE-2.0)**。
+- **开源协议**：遵循 **[GNU AGPL v3.0（`AGPL-3.0-only`）](LICENSE)** 开源；北向 v2 网关通信协议规范（`crates/hm-core/src/gateway/`）额外遵循 **[Apache-2.0](LICENSE-PROTOCOL-APACHE-2.0)**（详见 [`LICENSING.md`](LICENSING.md)）。
 - **官方网站**：**[https://mymate.homes](https://mymate.homes)**
 - **联系作者（自研定制音箱合作 / 商业 OEM 授权）**：**`zhangcong1985@gmail.com`** / **`yes999zc@163.com`**
