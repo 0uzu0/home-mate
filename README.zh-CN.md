@@ -211,6 +211,7 @@ done && chmod +x build/lx06/init.sh build/lx06/unxz
        a) 确认 /data 剩余 >= 5500 KB，下载 `hm-bundle.tar.xz`、`hm-bundle.sha256`、`init.sh`、`unxz`。
        b) 执行 `./deploy/lx06/install-lx06.sh --standalone-asr --device-ip <音箱IP>`。
        c) 验证音箱仅运行 `hm-core`（含 `HM_VOICE_EVENTS=0`）与 `hm-gateway`（无 `hm-kws`）、`/tmp` 占用 < 45%、且 `http://<音箱IP>:8930` 返回 200。
+     * 【可选进阶（128 MB 无 KWS 模式下“喊小爱同学打断放歌”）】：默认版本为保 256 MB 稳定会在小瑞放歌时暂停原厂 `pns`；若我希望无 KWS 模式下喊“小爱同学”即可直接打断小瑞播放，可帮我在 `home-mate-gateway-linux` 的 `crates/gateway/src/firmware/lx06_vendor.rs`（`wants_pns` 的 `!local_kws_enabled` 分支及 `instruction.log` 原厂唤醒触发停播）做本地定制并用 `./tools/build_firmware_lx06.sh` 重编。
 4. 严禁将任何真实 IP、Token 或密钥提交到 Git；生成的家庭令牌请保存至 `~/.home-mate/`（权限 0600）。
 ```
 

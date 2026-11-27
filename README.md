@@ -212,6 +212,7 @@ Follow these strict rules:
        a) Confirm `/data` has >= 5500 KB free; download `hm-bundle.tar.xz`, `hm-bundle.sha256`, `init.sh`, and `unxz`.
        b) Run `./deploy/lx06/install-lx06.sh --standalone-asr --device-ip <SPEAKER_IP>`.
        c) Verify ONLY `hm-core` (`HM_VOICE_EVENTS=0`) and `hm-gateway` (no `hm-kws`) run, `/tmp` stays < 45%, and `http://<SPEAKER_IP>:8930` returns HTTP 200.
+     * [Optional DIY (Say "XiaoAi TongXue" to Interrupt Playback in 128 MB Non-KWS Mode)]: Upstream keeps stock `pns` paused during Home Mate playback for 256 MB dual-wake stability. If I want to interrupt playback by waking stock XiaoAi in non-KWS mode, customize `crates/gateway/src/firmware/lx06_vendor.rs` (`wants_pns` under `!local_kws_enabled` + `instruction.log` native-wake playback stop) locally and rebuild via `./tools/build_firmware_lx06.sh`.
 4. Never commit real IPs or tokens to Git. Pair a household admin token and save it to `~/.home-mate/` (chmod 600).
 ```
 
