@@ -564,13 +564,24 @@ fn prune_snapshots(dir: &std::path::Path, keep: usize) {
 
 // --- household memory & reminders ---------------------------------------------
 
-pub(in crate::api) async fn reminders_get(State(state): State<Arc<AppState>>) -> Json<Value> {
+pub(in crate::api) async fn reminders_get(
+    State(state): State<Arc<AppState>>,
+    lan_exempt: Option<axum::Extension<crate::api::LanExemptUnauthenticated>>,
+) -> Json<Value> {
     let svc = crate::reminder::ReminderService::new(state.store.clone());
     match svc.recent(50) {
-        Ok(items) => Json(json!({
-            "now_ms": crate::id::now_ms(),
-            "reminders": items,
-        })),
+        Ok(mut items) => {
+            if lan_exempt.is_some() {
+                let protected = state.hub.loopback_protected_devices();
+                if !protected.is_empty() {
+                    items.retain(|r| !protected.iter().any(|p| p == &r.device));
+                }
+            }
+            Json(json!({
+                "now_ms": crate::id::now_ms(),
+                "reminders": items,
+            }))
+        }
         Err(e) => Json(json!({ "error": e.to_string() })),
     }
 }

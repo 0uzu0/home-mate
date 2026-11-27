@@ -319,8 +319,22 @@ fn apply_mode_put(
     }
 }
 
-pub(super) async fn voice_log(State(state): State<Arc<AppState>>) -> Json<Value> {
-    Json(json!({ "events": state.voice.recent(100) }))
+pub(super) async fn voice_log(
+    State(state): State<Arc<AppState>>,
+    lan_exempt: Option<axum::Extension<super::LanExemptUnauthenticated>>,
+) -> Json<Value> {
+    let mut events = state.voice.recent(100);
+    if lan_exempt.is_some() {
+        let protected = state.hub.loopback_protected_devices();
+        if !protected.is_empty() {
+            events.retain(|e| {
+                e.get("device")
+                    .and_then(|v| v.as_str())
+                    .is_none_or(|d| !protected.iter().any(|p| p == d))
+            });
+        }
+    }
+    Json(json!({ "events": events }))
 }
 
 /// M6b (S3): the EXPORTABLE journal — the console's `/voice/log` stays the

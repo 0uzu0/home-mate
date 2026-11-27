@@ -103,7 +103,7 @@ async fn management_state_exposes_native_field_shapes_and_preserves_apply_limits
             .iter()
             .filter(|field| field["supported"] == true)
             .count(),
-        123
+        127
     );
     for field in fields.iter().filter(|field| field["supported"] == false) {
         assert_eq!(field["purposes"], serde_json::json!([]));

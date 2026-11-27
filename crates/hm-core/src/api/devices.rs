@@ -6,11 +6,25 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-pub(super) async fn devices(State(state): State<Arc<AppState>>) -> Json<Value> {
+pub(super) async fn devices(
+    State(state): State<Arc<AppState>>,
+    lan_exempt: Option<axum::Extension<super::LanExemptUnauthenticated>>,
+) -> Json<Value> {
+    let mut voice_log = state.voice.recent(30);
+    if lan_exempt.is_some() {
+        let protected = state.hub.loopback_protected_devices();
+        if !protected.is_empty() {
+            voice_log.retain(|e| {
+                e.get("device")
+                    .and_then(|v| v.as_str())
+                    .is_none_or(|d| !protected.iter().any(|p| p == d))
+            });
+        }
+    }
     Json(json!({
         "gateway": state.hub.snapshot(),
         "recent": state.hub.recent(30),
-        "voice_log": state.voice.recent(30),
+        "voice_log": voice_log,
     }))
 }
 

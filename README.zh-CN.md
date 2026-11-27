@@ -76,11 +76,11 @@ flowchart TD
     LX06 --> L0["前提：open-xiaoai 开 Root SSH → 查 MemTotal"]
     L0 -->|"≥ 180,000 kB (256 MB)"| L256["本机满血双唤醒（无需 NAS）<br/>👉 轨道 A1 &amp; LX06 AI 提示词"]
     L0 -->|"< 180,000 kB (128 MB)"| L128{"家里有常开 NAS / 电脑吗？"}
-    L128 -->|"有（推荐 · 享 Silero VAD）"| LThin["轨道 C 全量 Docker Core + v0.0.54 免编译 --thin<br/>👉 轨道 A2 &amp; LX06 AI 提示词"]
-    L128 -->|"无（单机尝鲜 · 能量 VAD）"| LAsr["v0.0.54 免编译 --standalone-asr（免本地 KWS）<br/>👉 轨道 A3 &amp; LX06 AI 提示词"]
+    L128 -->|"有（推荐 · 享 Silero VAD）"| LThin["轨道 C 全量 Docker Core + v0.0.55 免编译 --thin<br/>👉 轨道 A2 &amp; LX06 AI 提示词"]
+    L128 -->|"无（单机尝鲜 · 能量 VAD）"| LAsr["v0.0.55 免编译 --standalone-asr（免本地 KWS）<br/>👉 轨道 A3 &amp; LX06 AI 提示词"]
 
     Android --> A1["前提：轨道 C 在 NAS/电脑跑全量 Docker Core（或连已有音箱 Core 做管理）"]
-    A1 --> A2["安装 v2.3.16 签名 APK（64位手机 full-arm64 / 32位86屏·R1 universal / 遥控 slim）"]
+    A1 --> A2["安装 v2.3.17 签名 APK（64位手机 full-arm64 / 32位86屏·R1 universal / 遥控 slim）"]
     A2 --> A3["UDP :8933 一键发现配对 → 立即开口<br/>👉 轨道 C (Docker) + 轨道 D (Android)"]
 ```
 
@@ -92,7 +92,7 @@ flowchart TD
 | **小米小爱 Pro (`LX06`, 256 MB 内存版)** | `open-xiaoai` 开 Root SSH，`MemTotal ≥ 180,000 kB` | 音箱本体 `hm-core --slim` + `hm-gateway` + `hm-kws`（免刷机双系统） | **不需要**（100% 音箱本体运行） | [轨道 A (LX06)](#轨道-a小米小爱音箱-pro-lx06--256-mb--128-mb-自适应免刷机部署) |
 | **小米小爱 Pro (`LX06`, 128 MB · 有 NAS 推荐)** | `open-xiaoai` 开 Root SSH + 局域网 NAS 全量 Docker Core | 音箱装免编译 **瘦网关**（`--thin`，`~4 MiB` RAM）→ **NAS 全量 Docker `hm-core`**（Silero VAD） | **需要** | [轨道 A](#轨道-a小米小爱音箱-pro-lx06--256-mb--128-mb-自适应免刷机部署) + [轨道 C](#轨道-cnas--服务器全量-docker-部署128-mb-lx06-与全屋安卓终端中枢) |
 | **小米小爱 Pro (`LX06`, 128 MB · 无 NAS 尝鲜)** | `open-xiaoai` 开 Root SSH，`/data ≥ 5.5 MiB` | 音箱装免编译 **纯 ASR 模式**（`--standalone-asr`：`hm-core --slim` + `hm-gateway`，免 KWS） | **不需要**（单机独立运行） | [轨道 A (LX06)](#轨道-a小米小爱音箱-pro-lx06--256-mb--128-mb-自适应免刷机部署) |
-| **安卓带屏音箱 / 86 屏 / 平板 / 废旧手机 / 斐讯 R1** | Android 5–16（零硬件刷机！） | **NAS / 电脑全量 Docker `hm-core`** + **Android 通用 APK**（`v2.3.16`） | **需要** *(或仅管理模式连音箱 Core)* | [轨道 C](#轨道-cnas--服务器全量-docker-部署128-mb-lx06-与全屋安卓终端中枢) + [轨道 D](#轨道-dandroid-通用终端带屏音箱--86-墙面屏--平板--废旧安卓手机) |
+| **安卓带屏音箱 / 86 屏 / 平板 / 废旧手机 / 斐讯 R1** | Android 5–16（零硬件刷机！） | **NAS / 电脑全量 Docker `hm-core`** + **Android 通用 APK**（`v2.3.17`） | **需要** *(或仅管理模式连音箱 Core)* | [轨道 C](#轨道-cnas--服务器全量-docker-部署128-mb-lx06-与全屋安卓终端中枢) + [轨道 D](#轨道-dandroid-通用终端带屏音箱--86-墙面屏--平板--废旧安卓手机) |
 
 ---
 
@@ -203,13 +203,13 @@ python3 -m http.server 18089 --directory build/lx06 &
 
 # 情况 A2：128 MB 小内存批次 + 有 NAS（推荐，免编译下载瘦网关包直连 NAS 全量 Docker Core）
 mkdir -p build/lx06 && for f in hm-lx06-thin.tar.xz hm-lx06-thin.sha256 init.sh unxz SHA256SUMS.txt; do
-  curl -fL "https://github.com/yes999zc/home-mate-gateway-linux/releases/download/v0.0.54/$f" -o "build/lx06/$f"
+  curl -fL "https://github.com/yes999zc/home-mate-gateway-linux/releases/download/v0.0.55/$f" -o "build/lx06/$f"
 done && chmod +x build/lx06/init.sh build/lx06/unxz
 ./deploy/lx06/install-lx06.sh --thin --device-ip 192.168.1.50 --core-addr 192.168.1.10:8932 --device-id lx06-living --core-token "<TOKEN>"
 
 # 情况 A3：128 MB 小内存批次 + 无 NAS（单机纯 ASR 尝鲜，免编译下载主包，不跑本地 KWS）
 mkdir -p build/lx06 && for f in hm-bundle.tar.xz hm-bundle.sha256 init.sh unxz SHA256SUMS.txt; do
-  curl -fL "https://github.com/yes999zc/home-mate-gateway-linux/releases/download/v0.0.54/$f" -o "build/lx06/$f"
+  curl -fL "https://github.com/yes999zc/home-mate-gateway-linux/releases/download/v0.0.55/$f" -o "build/lx06/$f"
 done && chmod +x build/lx06/init.sh build/lx06/unxz
 ./deploy/lx06/install-lx06.sh --standalone-asr --device-ip 192.168.1.50 --device-id lx06-standalone
 ```

@@ -1269,6 +1269,17 @@ impl Tool for OpenApiCallTool {
         };
         let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
         match self.rt.prepare_operation(operation, &arguments) {
+            Ok(prepared)
+                if ctx.is_lan_exempt()
+                    && (prepared.op.effect_level != EffectLevel::Query
+                        || prepared.token.is_some()) =>
+            {
+                ToolResult::failed(
+                    "PAIRING_REQUIRED",
+                    "未认证的局域网访问不允许执行变更、破坏性或带密钥凭据的 OpenAPI 操作，请使用配对令牌认证",
+                    false,
+                )
+            }
             Ok(prepared) if prepared.op.effect_level == EffectLevel::Destructive => {
                 let service =
                     crate::lock_or_recover(&self.rt.confirmations, "openapi.confirmations")
@@ -1281,15 +1292,6 @@ impl Tool for OpenApiCallTool {
                         false,
                     ),
                 }
-            }
-            Ok(prepared)
-                if prepared.op.effect_level == EffectLevel::Mutate && ctx.is_lan_exempt() =>
-            {
-                ToolResult::failed(
-                    "PAIRING_REQUIRED",
-                    "未认证的局域网访问不允许执行变更类 OpenAPI 操作，请使用配对令牌认证",
-                    false,
-                )
             }
             Ok(prepared) => {
                 self.rt

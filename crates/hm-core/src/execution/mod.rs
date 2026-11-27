@@ -129,6 +129,9 @@ impl Authority {
         }
     }
     pub(crate) fn confirmation_requester(&self) -> Option<Option<String>> {
+        if self.lan_exempt {
+            return None;
+        }
         if let Some(lease) = &self.lease {
             Some(Some(lease.principal.clone()))
         } else if let Some(principal) = self.principal.strip_prefix("management:") {
@@ -337,5 +340,19 @@ impl Authority {
                 Ok(())
             })
             .map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lan_exempt_authority_never_exposes_confirmation_requester() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let normal = Authority::anonymous(store.clone(), Some("admin".into())).unwrap();
+        assert_eq!(normal.confirmation_requester(), Some(Some("admin".into())));
+        let lan_exempt = normal.with_lan_exempt(true);
+        assert_eq!(lan_exempt.confirmation_requester(), None);
     }
 }

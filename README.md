@@ -76,11 +76,11 @@ flowchart TD
     LX06 --> L0["Prereq: Root SSH via open-xiaoai -> check MemTotal"]
     L0 -->|"≥ 180,000 kB (256 MB)"| L256["On-Speaker Dual-Wake (No NAS)<br/>👉 Track A1 &amp; LX06 AI Prompt"]
     L0 -->|"< 180,000 kB (128 MB)"| L128{"Have a LAN NAS / PC?"}
-    L128 -->|"Yes (Recommended)"| LThin["Track C NAS Full Docker Core + v0.0.54 Prebuilt --thin<br/>👉 Track A2 &amp; LX06 AI Prompt"]
-    L128 -->|"No (Trial)"| LAsr["v0.0.54 Prebuilt --standalone-asr (Energy VAD, No KWS)<br/>👉 Track A3 &amp; LX06 AI Prompt"]
+    L128 -->|"Yes (Recommended)"| LThin["Track C NAS Full Docker Core + v0.0.55 Prebuilt --thin<br/>👉 Track A2 &amp; LX06 AI Prompt"]
+    L128 -->|"No (Trial)"| LAsr["v0.0.55 Prebuilt --standalone-asr (Energy VAD, No KWS)<br/>👉 Track A3 &amp; LX06 AI Prompt"]
 
     Android --> A1["Prereq: Track C Full Docker Core on NAS/Mac/PC (or existing speaker Core)"]
-    A1 --> A2["Install v2.3.16 Signed APK (full-arm64 / universal / slim)"]
+    A1 --> A2["Install v2.3.17 Signed APK (full-arm64 / universal / slim)"]
     A2 --> A3["UDP :8933 Auto-Discover -> Pair Token -> Start Talking<br/>👉 Track C (Docker) + Track D (Android)"]
 ```
 
@@ -92,7 +92,7 @@ flowchart TD
 | **Xiaomi LX06 (256 MB RAM)** | `open-xiaoai` Root SSH, `MemTotal ≥ 180,000 kB` | On-speaker `hm-core --slim` + `hm-gateway` + `hm-kws` (Scheme A dual-wake) | **No** (100% on-speaker) | [Track A (LX06)](#track-a-xiaomi-ai-speaker-pro-lx06--adaptive-256-mb--128-mb-deploy) |
 | **Xiaomi LX06 (128 MB · w/ NAS Recommended)** | `open-xiaoai` Root SSH + LAN NAS Full Docker Core | Prebuilt **Thin Gateway** (`--thin`, `~4 MiB` RAM) → **Full Docker `hm-core`** (Silero VAD) | **Yes** | [Track A](#track-a-xiaomi-ai-speaker-pro-lx06--adaptive-256-mb--128-mb-deploy) + [Track C](#track-c-nas--docker-full-core-multi-gateway-hub-for-128-mb-lx06--android) |
 | **Xiaomi LX06 (128 MB · No-NAS Trial)** | `open-xiaoai` Root SSH, `/data ≥ 5.5 MiB` | Prebuilt **Standalone Pure-ASR** (`--standalone-asr`: `hm-core --slim` + `hm-gateway`, no KWS) | **No** (100% on-speaker) | [Track A (LX06)](#track-a-xiaomi-ai-speaker-pro-lx06--adaptive-256-mb--128-mb-deploy) |
-| **Android Display / 86 Panel / Tablet / Phone / R1** | Android 5–16 (Zero hardware flashing!) | **Full Docker `hm-core`** on NAS/PC + **Android Universal APK** (`v2.3.16`) | **Yes** *(or Manage-Only on speaker Core)* | [Track C](#track-c-nas--docker-full-core-multi-gateway-hub-for-128-mb-lx06--android) + [Track D](#track-d-android-universal-terminal-smart-displays-86-panels-tablets--old-phones) |
+| **Android Display / 86 Panel / Tablet / Phone / R1** | Android 5–16 (Zero hardware flashing!) | **Full Docker `hm-core`** on NAS/PC + **Android Universal APK** (`v2.3.17`) | **Yes** *(or Manage-Only on speaker Core)* | [Track C](#track-c-nas--docker-full-core-multi-gateway-hub-for-128-mb-lx06--android) + [Track D](#track-d-android-universal-terminal-smart-displays-86-panels-tablets--old-phones) |
 
 ---
 
@@ -204,13 +204,13 @@ python3 -m http.server 18089 --directory build/lx06 &
 
 # Option A2 — 128 MB LX06 + NAS (Recommended; zero-compile prebuilt Thin Gateway -> NAS Full Docker Core):
 mkdir -p build/lx06 && for f in hm-lx06-thin.tar.xz hm-lx06-thin.sha256 init.sh unxz SHA256SUMS.txt; do
-  curl -fL "https://github.com/yes999zc/home-mate-gateway-linux/releases/download/v0.0.54/$f" -o "build/lx06/$f"
+  curl -fL "https://github.com/yes999zc/home-mate-gateway-linux/releases/download/v0.0.55/$f" -o "build/lx06/$f"
 done && chmod +x build/lx06/init.sh build/lx06/unxz
 ./deploy/lx06/install-lx06.sh --thin --device-ip 192.168.1.50 --core-addr 192.168.1.10:8932 --device-id lx06-living --core-token "<TOKEN>"
 
 # Option A3 — 128 MB LX06 without NAS (Standalone Pure-ASR trial; zero-compile main bundle, no local KWS):
 mkdir -p build/lx06 && for f in hm-bundle.tar.xz hm-bundle.sha256 init.sh unxz SHA256SUMS.txt; do
-  curl -fL "https://github.com/yes999zc/home-mate-gateway-linux/releases/download/v0.0.54/$f" -o "build/lx06/$f"
+  curl -fL "https://github.com/yes999zc/home-mate-gateway-linux/releases/download/v0.0.55/$f" -o "build/lx06/$f"
 done && chmod +x build/lx06/init.sh build/lx06/unxz
 ./deploy/lx06/install-lx06.sh --standalone-asr --device-ip 192.168.1.50 --device-id lx06-standalone
 ```

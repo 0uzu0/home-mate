@@ -702,11 +702,11 @@ async fn execute_contract(
     if ctx.is_cancelled() {
         return ToolResult::cancelled();
     }
-    if ctx.is_lan_exempt() && contract.effect == SideEffect::Mutate {
+    if ctx.is_lan_exempt() && (contract.effect == SideEffect::Mutate || token.is_some()) {
         return ToolResult::failed(
             "PAIRING_REQUIRED",
             format!(
-                "未认证的局域网访问不允许执行写操作开放插座「{}」，请使用配对令牌认证",
+                "未认证的局域网访问不允许执行写操作或带密钥凭据的开放插座「{}」，请使用配对令牌认证",
                 contract.name
             ),
             false,

@@ -90,6 +90,7 @@ struct DeviceQueueSlot {
     tx: mpsc::Sender<QueuedDeviceEvent>,
     dropped: Arc<AtomicU64>,
     sync: Arc<DeviceAudioSync>,
+    protected: bool,
 }
 
 pub(super) struct AudioPumpRouter {
@@ -132,15 +133,25 @@ impl AudioPumpRouter {
     }
 
     /// Ensure a bounded queue exists for `device` (idempotent).
-    pub(super) fn ensure_device(&self, device: &str) {
+    /// `protected = true` (loopback speakers) pins the queue so unauthenticated
+    /// LAN peers can never evict the local speaker's live audio pump.
+    pub(super) fn ensure_device(&self, device: &str, protected: bool) {
         let mut queues = crate::lock_or_recover(&self.queues, "hub.audio_queues");
-        if queues.get(device).is_some_and(|s| !s.tx.is_closed()) {
-            return;
+        if let Some(slot) = queues.get_mut(device) {
+            if !slot.tx.is_closed() {
+                slot.protected |= protected;
+                return;
+            }
         }
-        self.create_queue_locked(&mut queues, device);
+        self.create_queue_locked(&mut queues, device, protected);
     }
 
-    fn create_queue_locked(&self, queues: &mut HashMap<String, DeviceQueueSlot>, device: &str) {
+    fn create_queue_locked(
+        &self,
+        queues: &mut HashMap<String, DeviceQueueSlot>,
+        device: &str,
+        protected: bool,
+    ) {
         if queues.len() >= MAX_TRACKED_AUDIO_DEVICES && !queues.contains_key(device) {
             queues.retain(|_, slot| {
                 if slot.tx.is_closed() {
@@ -151,10 +162,17 @@ impl AudioPumpRouter {
                 }
             });
             if queues.len() >= MAX_TRACKED_AUDIO_DEVICES {
-                if let Some(evict) = queues.keys().next().cloned() {
+                // Never evict a protected (loopback) audio queue.
+                let evict_key = queues
+                    .iter()
+                    .find(|(_, slot)| !slot.protected)
+                    .map(|(k, _)| k.clone());
+                if let Some(evict) = evict_key {
                     if let Some(old) = queues.remove(&evict) {
                         old.sync.mark_closed();
                     }
+                } else if !protected {
+                    return;
                 }
             }
         }
@@ -167,6 +185,7 @@ impl AudioPumpRouter {
                 tx,
                 dropped,
                 sync: sync.clone(),
+                protected,
             },
         ) {
             old.sync.mark_closed();
@@ -183,7 +202,7 @@ impl AudioPumpRouter {
         let seq = queued.seq;
         let mut queues = crate::lock_or_recover(&self.queues, "hub.audio_queues");
         if !queues.get(device).is_some_and(|s| !s.tx.is_closed()) {
-            self.create_queue_locked(&mut queues, device);
+            self.create_queue_locked(&mut queues, device, false);
         }
         if let Some(slot) = queues.get(device) {
             match slot.tx.try_send(queued) {
@@ -243,5 +262,36 @@ impl AudioPumpRouter {
             .iter()
             .map(|(k, v)| (k.clone(), v.load(Ordering::Relaxed)))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protected_loopback_queue_is_never_evicted_at_cap() {
+        let router = AudioPumpRouter::new();
+        let mut handles = router.take_queue_stream().unwrap();
+        router.ensure_device("dot2-local", true);
+        // Saturate beyond MAX_TRACKED_AUDIO_DEVICES (64) with unprotected LAN devices.
+        for i in 0..(MAX_TRACKED_AUDIO_DEVICES + 16) {
+            router.ensure_device(&format!("lan-spam-{i}"), false);
+        }
+        let mut kept = Vec::new();
+        while let Ok(h) = handles.try_recv() {
+            kept.push(h);
+        }
+        let queues = crate::lock_or_recover(&router.queues, "test.queues");
+        assert!(
+            queues.contains_key("dot2-local"),
+            "protected loopback queue must never be evicted under LAN saturation"
+        );
+        assert!(
+            queues.len() <= MAX_TRACKED_AUDIO_DEVICES,
+            "queue map must stay bounded at MAX_TRACKED_AUDIO_DEVICES ({MAX_TRACKED_AUDIO_DEVICES}), got {}",
+            queues.len()
+        );
+        drop(kept);
     }
 }

@@ -65,6 +65,13 @@ impl Tool for MemoryTool {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolCtx) -> ToolResult {
+        if ctx.is_lan_exempt() {
+            return ToolResult::failed(
+                "PAIRING_REQUIRED",
+                "未认证的局域网访问不允许写入家庭记忆，请使用配对令牌认证",
+                false,
+            );
+        }
         let Some(authority) = ctx.authority() else {
             return ToolResult::failed("MEMORY_REJECTED", "memory destination unavailable", false);
         };
@@ -174,6 +181,13 @@ impl Tool for WorkingMemorySetTool {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolCtx) -> ToolResult {
+        if ctx.is_lan_exempt() {
+            return ToolResult::failed(
+                "PAIRING_REQUIRED",
+                "未认证的局域网访问不允许写入家庭记忆，请使用配对令牌认证",
+                false,
+            );
+        }
         let Some(authority) = ctx.authority() else {
             return ToolResult::failed(
                 "WORKING_MEMORY_REJECTED",
@@ -277,6 +291,13 @@ impl Tool for WorkingMemoryGetTool {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolCtx) -> ToolResult {
+        if ctx.is_lan_exempt() {
+            return ToolResult::failed(
+                "PAIRING_REQUIRED",
+                "未认证的局域网访问不允许读取工作记忆，请使用配对令牌认证",
+                false,
+            );
+        }
         let Some(authority) = ctx.authority() else {
             return ToolResult::observed_ok(json!({"items":[],"count":0,"item":null}));
         };
@@ -340,6 +361,13 @@ impl Tool for WorkingMemoryDeleteTool {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolCtx) -> ToolResult {
+        if ctx.is_lan_exempt() {
+            return ToolResult::failed(
+                "PAIRING_REQUIRED",
+                "未认证的局域网访问不允许删除工作记忆，请使用配对令牌认证",
+                false,
+            );
+        }
         let key = args
             .get("key_or_topic")
             .and_then(Value::as_str)
@@ -427,6 +455,13 @@ impl Tool for UserProfileProposeTool {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolCtx) -> ToolResult {
+        if ctx.is_lan_exempt() {
+            return ToolResult::failed(
+                "PAIRING_REQUIRED",
+                "未认证的局域网访问不允许写入家庭记忆，请使用配对令牌认证",
+                false,
+            );
+        }
         let Some(authority) = ctx.authority() else {
             return ToolResult::failed(
                 "USER_MD_REJECTED",

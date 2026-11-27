@@ -684,15 +684,25 @@ impl DeviceHub {
     /// Accept loop (#271: concurrent multi-gateway connections). Each incoming
     /// gateway connection runs independently; supersession is strictly
     /// per-device so a phone/display gateway never disconnects a local speaker.
+    /// Hard-capped at 32 concurrent connections so a LAN peer cannot exhaust
+    /// sockets or 8 MiB line buffers.
     pub async fn listen(self: &Arc<Self>, addr: std::net::SocketAddr) -> std::io::Result<()> {
+        const MAX_CONCURRENT_GATEWAY_CONNS: usize = 32;
         let listener = TcpListener::bind(addr).await?;
+        let conn_sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_GATEWAY_CONNS));
         *crate::lock_or_recover(&self.bind_addr, "hub.bind_addr") = addr.to_string();
         self.set_voice_gateway_open(!addr.ip().is_loopback());
         tracing::info!(%addr, voice_gateway_open = !addr.ip().is_loopback(), "gateway listener up");
         loop {
             let (stream, peer) = listener.accept().await?;
+            let Ok(permit) = conn_sem.clone().try_acquire_owned() else {
+                tracing::warn!(%peer, max = MAX_CONCURRENT_GATEWAY_CONNS, "rejected gateway connection: max concurrent connections reached");
+                drop(stream);
+                continue;
+            };
             let hub = self.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 if let Err(e) = hub.serve_connection_with_peer(stream, Some(peer)).await {
                     tracing::warn!(%peer, error = %e, "gateway connection ended with error");
                 }
@@ -998,6 +1008,20 @@ impl DeviceHub {
                     }
                     tracing::warn!(%gateway, reason, "refused gateway hello");
                     Self::send_hello_reject(&mut wr, &reason).await?;
+                    return Err(format!("protocol rejected: {reason}").into());
+                }
+                const MAX_DEVICES_PER_HELLO: usize = 8;
+                if devices.len() > MAX_DEVICES_PER_HELLO {
+                    let reason = "too_many_devices";
+                    {
+                        let mut st = self.lock_state();
+                        st.record(
+                            "handshake_rejected",
+                            json!({ "reason": reason, "count": devices.len() }),
+                        );
+                    }
+                    tracing::warn!(%gateway, count = devices.len(), "refused gateway hello with too many devices");
+                    Self::send_hello_reject(&mut wr, reason).await?;
                     return Err(format!("protocol rejected: {reason}").into());
                 }
                 gateway_name = gateway;
@@ -1333,7 +1357,7 @@ impl DeviceHub {
             generation,
         });
         for d in &announced {
-            self.audio_pump.ensure_device(&d.stable_id);
+            self.audio_pump.ensure_device(&d.stable_id, is_loopback);
             self.emit_control(DeviceEvent::DeviceJoined {
                 device: d.clone(),
                 generation,
@@ -1435,10 +1459,18 @@ impl DeviceHub {
             .collect();
         for id in &left {
             st.device_to_conn.remove(id);
-            if let Some(dev) = st.devices.get_mut(id) {
+            let prune_slot = if let Some(dev) = st.devices.get_mut(id) {
                 if dev.generation == generation {
                     dev.online = false;
+                    !dev.reserved_loopback && !dev.reserved_authenticated
+                } else {
+                    false
                 }
+            } else {
+                false
+            };
+            if prune_slot {
+                st.devices.remove(id);
             }
             st.record(
                 "device_left",

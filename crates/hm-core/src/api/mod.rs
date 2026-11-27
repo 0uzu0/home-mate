@@ -1206,6 +1206,12 @@ pub(super) fn reject_lan_exempt_loopback_session(
             })),
         ))
     };
+    // Under unauthenticated `lan_gateway_exempt`, ONLY non-loopback `dev:`
+    // device sessions are reachable; authenticated admin Web Console sessions
+    // (non-`dev:` IDs) and loopback-protected speaker sessions are ALWAYS denied.
+    if !session_id.starts_with("dev:") {
+        return deny();
+    }
     if let Some(dev) = extract_physical_session_device(session_id) {
         if state.hub.device_is_loopback_protected(dev) {
             return deny();
@@ -1240,7 +1246,9 @@ pub(crate) fn is_lan_exempt_everyday_route(method: &axum::http::Method, path: &s
     let clean_seg = |s: &str| !s.is_empty() && s != "." && s != ".." && !s.contains('/');
     let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     match (method.as_str(), segs.as_slice()) {
-        // Everyday read endpoints
+        // Everyday read endpoints (high-sensitivity household journals/tasks/memories
+        // — `/api/v0/voice/events`, `/api/v0/tasks`, `/api/v0/memories` — are
+        // strictly excluded and ALWAYS require an admin Bearer token).
         (
             "GET",
             ["api", "v0", "status"]
@@ -1248,11 +1256,8 @@ pub(crate) fn is_lan_exempt_everyday_route(method: &axum::http::Method, path: &s
             | ["api", "v0", "devices"]
             | ["api", "v0", "device-meta"]
             | ["api", "v0", "fleet"]
-            | ["api", "v0", "tasks"]
             | ["api", "v0", "reminders"]
-            | ["api", "v0", "memories"]
-            | ["api", "v0", "voice", "log"]
-            | ["api", "v0", "voice", "events"],
+            | ["api", "v0", "voice", "log"],
         ) => true,
         ("GET", ["api", "v0", "devices", id, "conversation"]) if clean_seg(id) => true,
         ("GET", ["api", "v0", "session", id, "messages"]) if clean_seg(id) => true,
