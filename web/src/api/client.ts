@@ -164,6 +164,7 @@ export interface ServiceStatus {
   configured: boolean
   voice?: string
   thinking?: string
+  language?: string
 }
 
 export type ServiceName = 'llm' | 'llm_fallback' | 'asr' | 'tts'

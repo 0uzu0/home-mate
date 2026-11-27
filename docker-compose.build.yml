@@ -1,0 +1,8 @@
+# Override file for building hm-core from local source:
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+services:
+  hm-core:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: home-mate/hm-core:local

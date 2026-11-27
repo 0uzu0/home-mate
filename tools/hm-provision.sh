@@ -59,6 +59,7 @@ SEED=""
 RELEASE=""
 SERIAL=""
 IP=""
+HOST_IP=""
 EMOS_DIR=""
 P10_BACKUP=""
 REF_NODE=""
@@ -80,6 +81,7 @@ while [ $# -gt 0 ]; do
         --release) RELEASE=$2; shift 2 ;;
         --serial) SERIAL=$2; shift 2 ;;
         --ip) IP=$2; shift 2 ;;
+        --host-ip) HOST_IP=$2; shift 2 ;;
         --emos-dir) EMOS_DIR=$2; shift 2 ;;
         --p10-backup) P10_BACKUP=$2; shift 2 ;;
         --token-file) TOKEN_FILE=$2; shift 2 ;;
@@ -214,9 +216,51 @@ wait_http() {
 # before the serial gadget is readable again, and the port NAME can change
 # (codex review 2026-11-15, Q1b). Never assume the original `$SERIAL` is still
 # the console — probe it, then fall back to the other usbmodem ports.
+# Detect the local host's LAN IPv4 address for serving seed/release packages.
+# Cross-platform: works on macOS (Wi-Fi & Ethernet) and Linux without relying
+# on macOS-only `ipconfig getifaddr en0`.
+detect_host_ip() {
+    if [ -n "${HOST_IP:-}" ]; then
+        printf '%s\n' "$HOST_IP"
+        return 0
+    fi
+    _target="${1:-192.168.1.1}"
+    _detected=$(python3 - "$_target" <<'PY' 2>/dev/null || true
+import socket, sys
+target = sys.argv[1] or "192.168.1.1"
+for dst in (target, "192.168.1.1", "10.255.255.255", "1.1.1.1"):
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect((dst, 80))
+        ip = s.getsockname()[0]
+        s.close()
+        if ip and not ip.startswith("127."):
+            print(ip)
+            raise SystemExit(0)
+    except Exception:
+        pass
+PY
+)
+    if [ -n "$_detected" ]; then
+        printf '%s\n' "$_detected"
+        return 0
+    fi
+    if command -v ipconfig >/dev/null 2>&1; then
+        for _iface in en0 en1 en2 en3 en4; do
+            _ip=$(ipconfig getifaddr "$_iface" 2>/dev/null || true)
+            if [ -n "$_ip" ]; then
+                printf '%s\n' "$_ip"
+                return 0
+            fi
+        done
+    fi
+    return 1
+}
+
 pick_serial_port() {
     if dev "echo __CONSOLE_OK__" 4 2>/dev/null | grep -q '__CONSOLE_OK__'; then return 0; fi
-    for _p in $(ls /dev/cu.usbmodem* 2>/dev/null); do
+    for _p in /dev/cu.usbmodem* /dev/ttyACM*; do
+        [ -e "$_p" ] || continue
         [ "$_p" = "$SERIAL" ] && continue
         if python3 "$SERIAL_TOOL" "echo __CONSOLE_OK__" 4 "$_p" 2>/dev/null | grep -q '__CONSOLE_OK__'; then
             log "  console moved: $SERIAL -> $_p"
@@ -493,8 +537,8 @@ else
     SEED_NAME=$(basename "$SEED")
     SEED_SHA=$(shasum -a 256 "$SEED" | awk '{print $1}')
     log "  seed $SEED_NAME sha256 $SEED_SHA"
-    MAC_IP=$(ipconfig getifaddr en0 2>/dev/null || echo "")
-    [ -n "$MAC_IP" ] || fail "cannot determine the Mac's LAN address (en0)"
+    MAC_IP=$(detect_host_ip "$IP" || echo "")
+    [ -n "$MAC_IP" ] || fail "cannot determine host LAN address (pass --host-ip <lan-ipv4>)"
     if mutate "serve $SEED_NAME on a verified port and wget it to /data/bootstrap.tgz (sha256 $SEED_SHA)"; then
         serve_dir /tmp/hm-provision-http.pid "$(dirname "$SEED")" "$SERVE_PORT" "$SEED_NAME" \
             || fail "could not serve $SEED_NAME on any port from $(( SERVE_PORT )) to $(( SERVE_PORT + 20 ))"
@@ -592,8 +636,8 @@ step "release install --activate (design §2.2 step 7)"
 if [ "$ALREADY_ACTIVE" = "1" ]; then
     log "  already active: $ACTIVE_VER — no install, no activation (a re-run must not re-serialize the node)"
 else
-    MAC_IP=${MAC_IP:-$(ipconfig getifaddr en0 2>/dev/null || echo "")}
-    [ -n "$MAC_IP" ] || fail "cannot determine the Mac's LAN address (en0)"
+    MAC_IP=${MAC_IP:-$(detect_host_ip "$IP" || echo "")}
+    [ -n "$MAC_IP" ] || fail "cannot determine host LAN address (pass --host-ip <lan-ipv4>)"
     if mutate "serve $REL_NAME and run hm-release install --package … --activate"; then
         serve_dir /tmp/hm-provision-http2.pid "$(dirname "$RELEASE")" "$(( SERVE_PORT + 1 ))" "$REL_NAME" \
             || fail "could not serve $REL_NAME on any port from $(( SERVE_PORT + 1 ))"
@@ -791,23 +835,26 @@ else
         _enc=$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$WAKE_WORD")
         TOK=$(curl -sf -m 8 -H "$(auth_hdr)" "http://$IP:8930/api/v0/reflex/tokens?text=$_enc" \
             | python3 -c 'import json,sys; print(json.load(sys.stdin).get("tokens") or "")' 2>/dev/null || true)
-        [ -n "$TOK" ] || fail "the node could not spell '$WAKE_WORD' into device tokens — pick a word it can pronounce (see /api/v0/reflex/tokens)"
-        # Keep every non-wake word, replace the wake entry (or add one).
-        WORDS=$(curl -sf -m 8 -H "$(auth_hdr)" "http://$IP:8930/api/v0/reflex" \
-            | python3 -c 'import json,sys
+        if [ -n "$TOK" ]; then
+            # Keep every non-wake word, replace the wake entry (or add one).
+            WORDS=$(curl -sf -m 8 -H "$(auth_hdr)" "http://$IP:8930/api/v0/reflex" \
+                | python3 -c 'import json,sys
 new_text, new_tok = sys.argv[1], sys.argv[2]
 d = json.load(sys.stdin)
 words = [w for w in (d.get("words") or []) if w.get("intent") != "wake"]
 words.insert(0, {"text": new_text, "tokens": new_tok, "intent": "wake", "enabled": True})
 print(json.dumps({"words": words, "deploy": True, "device": sys.argv[3]}))' "$WAKE_WORD" "$TOK" "$NODE_DEV" 2>/dev/null || true)
-        [ -n "$WORDS" ] || fail "could not read the node's reflex table"
-        DEPLOYED=$(curl -s -m 30 -X PUT -H "$(auth_hdr)" -H 'content-type: application/json' --data-binary "$WORDS" \
-            "http://$IP:8930/api/v0/reflex" 2>/dev/null || true)
-        printf '%s' "$DEPLOYED" | python3 -c 'import json,sys
+            [ -n "$WORDS" ] || fail "could not read the node's reflex table"
+            DEPLOYED=$(curl -s -m 30 -X PUT -H "$(auth_hdr)" -H 'content-type: application/json' --data-binary "$WORDS" \
+                "http://$IP:8930/api/v0/reflex" 2>/dev/null || true)
+            printf '%s' "$DEPLOYED" | python3 -c 'import json,sys
 d=json.load(sys.stdin)
 print("  reflex:", [w.get("text") for w in (d.get("words") or [])])
 dep=d.get("deploy") or {}
 print("  deploy:", dep.get("state") or dep.get("detail") or "no deploy receipt")' 2>/dev/null || log "  reflex: no readable answer ($DEPLOYED)"
+        else
+            log "  note: '$WAKE_WORD' has no auto-generated offline KWS tokens; applying it to Core ASR wake_words only (you can add manual tokens in /interaction later)"
+        fi
         MODE_PUT=$(curl -s -m 10 -X PUT -H "$(auth_hdr)" -H 'content-type: application/json' \
             --data-binary "$(python3 -c 'import json,sys; print(json.dumps({"wake_words": [sys.argv[1]]}))' "$WAKE_WORD")" \
             "http://$IP:8930/api/v0/mode/$NODE_DEV" 2>/dev/null || true)

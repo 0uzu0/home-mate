@@ -412,7 +412,7 @@ async fn config_backup_roundtrips_services_music_and_mode() {
         .put(format!("{base}/api/v0/config/services/llm"))
         .json(&json!({
             "provider": "deepseek", "base_url": "https://api.deepseek.com",
-            "model": "deepseek-flash", "api_key_env": "DEEPSEEK_API_KEY",
+            "model": "deepseek-chat", "api_key_env": "DEEPSEEK_API_KEY",
             "thinking": "disabled", "api_key": "sk-backup-1"
         }))
         .send()
@@ -563,7 +563,7 @@ async fn config_backup_roundtrips_services_music_and_mode() {
         .json()
         .await
         .unwrap();
-    assert_eq!(services["llm"]["model"], "deepseek-flash");
+    assert_eq!(services["llm"]["model"], "deepseek-chat");
     assert_eq!(services["llm"]["api_key_set"], true);
     let music: Value = client
         .get(format!("{base}/api/v0/config/services/music"))
@@ -1003,11 +1003,17 @@ async fn reflex_tokens_are_generated_from_hanzi() {
     assert!(r["error"].is_null());
 
     let mut url = reqwest::Url::parse(&format!("{base}/api/v0/reflex/tokens")).unwrap();
-    url.query_pairs_mut().append_pair("text", "he");
+    url.query_pairs_mut().append_pair("text", "Hey Mate");
+    let r: Value = client.get(url).send().await.unwrap().json().await.unwrap();
+    assert_eq!(r["tokens"], "HH EY1 M EY1 T");
+    assert!(r["error"].is_null());
+
+    let mut url = reqwest::Url::parse(&format!("{base}/api/v0/reflex/tokens")).unwrap();
+    url.query_pairs_mut().append_pair("text", "暂停。");
     let r: Value = client.get(url).send().await.unwrap().json().await.unwrap();
     assert!(
         r["error"].as_str().unwrap_or("").contains("不是汉字"),
-        "a non-Hanzi word is named: {r}"
+        "an unsupported character is named: {r}"
     );
 
     // Saving a word with no tokens generates them (a word is typed once).

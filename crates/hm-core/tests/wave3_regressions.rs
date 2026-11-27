@@ -1340,6 +1340,7 @@ async fn p2_8_p2_9_export_import_personal_agent_md_llm_fallback_restore_and_auth
                 api_key_env: "FB_KEY".into(),
                 voice: String::new(),
                 thinking: "disabled".into(),
+                language: String::new(),
             },
             None,
             "test",

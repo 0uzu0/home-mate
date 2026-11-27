@@ -295,7 +295,7 @@ fn concrete_wildcards_stay_protected_and_catalog_never_grants_new_apply_authorit
     assert_eq!(names.len(), catalog.len(), "duplicate descriptors");
     assert_eq!(
         catalog.iter().filter(|field| field.supported).count(),
-        123,
+        127,
         "descriptive coverage must not enable unexpected fields"
     );
     for path in [
@@ -377,7 +377,7 @@ fn concrete_wildcards_stay_protected_and_catalog_never_grants_new_apply_authorit
 #[test]
 fn all_descriptors_have_typed_metadata_bounds_and_unit_isolation() {
     let catalog = fields();
-    assert_eq!(catalog.len(), 264);
+    assert_eq!(catalog.len(), 268);
     for field in &catalog {
         assert!(!field.unit.is_empty(), "{} missing unit", field.path);
         assert!(

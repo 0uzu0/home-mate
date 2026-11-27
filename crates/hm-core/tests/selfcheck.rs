@@ -122,6 +122,7 @@ async fn app(llm: &FakeHttp, weather: &FakeHttp) -> (String, Arc<AppState>) {
                 api_key_env: String::new(),
                 voice: String::new(),
                 thinking: String::new(),
+                language: String::new(),
             },
             Some("llm-test-key"),
             "test",

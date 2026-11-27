@@ -1167,7 +1167,7 @@ async fn production_binary_automatically_publishes_reviewed_persona() {
             .unwrap()
             .llm
             .model,
-        "deepseek-flash"
+        "deepseek-chat"
     );
     drop(delivery);
     drop(auth);

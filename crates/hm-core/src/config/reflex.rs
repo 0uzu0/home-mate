@@ -161,6 +161,40 @@ pub fn default_reflex_words() -> Vec<ReflexWord> {
 /// a different meaning — the 2026-11-15「停止播放」stop→retreat move — is a
 /// different version. The deploy receipt echoes it next to the file hash: the
 /// vocabulary and its meaning are two different facts.
+/// Normalize a reflex word label into the single-token `@label` form written to
+/// Sherpa-ONNX `kw.txt`. ASCII phrases (e.g. `"Hey Mate"`) replace internal
+/// spaces with `_` (`"Hey_Mate"`) because Sherpa-ONNX splits lines on whitespace.
+pub fn reflex_wire_label(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_ascii() {
+        trimmed.split_whitespace().collect::<Vec<_>>().join("_")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Match a configured reflex/wake phrase against a device-spotted keyword label.
+/// Accepts exact match or case-insensitive match with ASCII spaces/underscores
+/// normalized (`"Hey Mate"` matches `"Hey_Mate"` and `"hey mate"`).
+pub fn reflex_label_matches(configured: &str, spotted: &str) -> bool {
+    let a = configured.trim();
+    let b = spotted.trim();
+    if a == b {
+        return true;
+    }
+    if a.is_ascii() && b.is_ascii() {
+        let norm = |s: &str| {
+            s.replace('_', " ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_lowercase()
+        };
+        return norm(a) == norm(b);
+    }
+    false
+}
+
 pub fn reflex_intent_map(cfg: &ReflexConfig) -> (Vec<String>, String) {
     let enabled: Vec<&ReflexWord> = cfg.words.iter().filter(|w| w.enabled).collect();
     let mut lines = String::new();
@@ -170,7 +204,7 @@ pub fn reflex_intent_map(cfg: &ReflexConfig) -> (Vec<String>, String) {
     let retreat = enabled
         .iter()
         .filter(|w| w.intent == ReflexIntent::Retreat)
-        .map(|w| w.text.trim().to_string())
+        .map(|w| reflex_wire_label(&w.text))
         .collect();
     (retreat, fnv1a_hex(lines.as_bytes()))
 }
@@ -187,16 +221,26 @@ pub fn compile_keywords(cfg: &ReflexConfig) -> std::result::Result<String, Strin
     let mut seen: Vec<String> = Vec::new();
     for w in &enabled {
         let text = w.text.trim();
-        if text.is_empty() || text.chars().count() > 12 {
-            return Err(format!("词「{text}」长度不合法（1–12 字）"));
+        let max_len = if text.is_ascii() { 24 } else { 12 };
+        if text.is_empty() || text.chars().count() > max_len {
+            return Err(format!("词「{text}」长度不合法（1–{max_len} 字）"));
         }
-        if text.contains('@') || text.chars().any(char::is_whitespace) {
+        if text.contains('@')
+            || text.chars().any(|c| matches!(c, '\n' | '\r' | '\t'))
+            || (!text.is_ascii() && text.chars().any(char::is_whitespace))
+        {
             return Err(format!("词「{text}」不能含 @ 或空白"));
         }
-        if seen.iter().any(|s| s == text) {
+        let wire_label = reflex_wire_label(text);
+        let dedup_key = if wire_label.is_ascii() {
+            wire_label.to_ascii_lowercase()
+        } else {
+            wire_label.clone()
+        };
+        if seen.iter().any(|s| s == &dedup_key) {
             return Err(format!("词「{text}」重复"));
         }
-        seen.push(text.to_string());
+        seen.push(dedup_key);
         let tokens: Vec<&str> = w.tokens.split_whitespace().collect();
         // Short words are allowed: the spotter will most likely miss them
         // (measured: 4-token phrases 0/5 at every threshold), but the SAME
@@ -208,7 +252,7 @@ pub fn compile_keywords(cfg: &ReflexConfig) -> std::result::Result<String, Strin
         if tokens.iter().any(|t| t.contains('@') || t.contains('\n')) {
             return Err(format!("词「{text}」的 token 拼写不合法"));
         }
-        out.push_str(&format!("{} @{}\n", tokens.join(" "), text));
+        out.push_str(&format!("{} @{}\n", tokens.join(" "), wire_label));
     }
     Ok(out)
 }
@@ -228,9 +272,183 @@ pub fn compile_keywords(cfg: &ReflexConfig) -> std::result::Result<String, Strin
 ///   shipped wake line);
 /// - neutral tone loses the mark (`吧` → `b a`), which is how the table
 ///   spells it.
+/// Built-in ARPAbet lexicon matching the bilingual Zipformer KWS `tokens.txt`
+/// inventory (`AA0..ZH`), enabling zero-friction English wake words like
+/// `"Hey Mate"`, `"Home Mate"`, `"Hey Home"`, `"Hello Mate"`, `"Hey Jarvis"`.
+fn english_word_arpabet(word: &str) -> Option<&'static [&'static str]> {
+    match word {
+        "hey" => Some(&["HH", "EY1"]),
+        "hi" => Some(&["HH", "AY1"]),
+        "hello" => Some(&["HH", "AH0", "L", "OW1"]),
+        "mate" => Some(&["M", "EY1", "T"]),
+        "home" => Some(&["HH", "OW1", "M"]),
+        "homemate" => Some(&["HH", "OW1", "M", "M", "EY1", "T"]),
+        "ok" | "okay" => Some(&["OW2", "K", "EY1"]),
+        "jarvis" => Some(&["JH", "AA1", "R", "V", "IH0", "S"]),
+        "echo" => Some(&["EH1", "K", "OW0"]),
+        "alexa" => Some(&["AH0", "L", "EH1", "K", "S", "AH0"]),
+        "luna" => Some(&["L", "UW1", "N", "AH0"]),
+        "aria" => Some(&["AA1", "R", "IY0", "AH0"]),
+        "nova" => Some(&["N", "OW1", "V", "AH0"]),
+        "buddy" => Some(&["B", "AH1", "D", "IY0"]),
+        "friday" => Some(&["F", "R", "AY1", "D", "EY2"]),
+        "computer" => Some(&["K", "AH0", "M", "P", "Y", "UW1", "T", "ER0"]),
+        "assistant" => Some(&["AH0", "S", "IH1", "S", "T", "AH0", "N", "T"]),
+        "smart" => Some(&["S", "M", "AA1", "R", "T"]),
+        "speaker" => Some(&["S", "P", "IY1", "K", "ER0"]),
+        "stop" => Some(&["S", "T", "AA1", "P"]),
+        "playing" => Some(&["P", "L", "EY1", "IH0", "NG"]),
+        "play" => Some(&["P", "L", "EY1"]),
+        "pause" => Some(&["P", "AO1", "Z"]),
+        "resume" => Some(&["R", "IH0", "Z", "UW1", "M"]),
+        "continue" => Some(&["K", "AH0", "N", "T", "IH1", "N", "Y", "UW0"]),
+        "next" => Some(&["N", "EH1", "K", "S", "T"]),
+        "track" => Some(&["T", "R", "AE1", "K"]),
+        "song" => Some(&["S", "AO1", "NG"]),
+        "music" => Some(&["M", "Y", "UW1", "Z", "IH0", "K"]),
+        "quiet" => Some(&["K", "W", "AY1", "AH0", "T"]),
+        "bye" => Some(&["B", "AY1"]),
+        "goodbye" => Some(&["G", "UH2", "D", "B", "AY1"]),
+        "wake" => Some(&["W", "EY1", "K"]),
+        "up" => Some(&["AH1", "P"]),
+        "good" => Some(&["G", "UH1", "D"]),
+        "morning" => Some(&["M", "AO1", "R", "N", "IH0", "NG"]),
+        "night" => Some(&["N", "AY1", "T"]),
+        "gundam" => Some(&["G", "AH1", "N", "D", "AH0", "M"]),
+        _ => None,
+    }
+}
+
+/// Lightweight rule-based English G2P producing valid ARPAbet tokens from
+/// `tokens.txt` (`AA0..ZH`) for ASCII words outside the built-in lexicon.
+fn english_word_fallback_arpabet(word: &str) -> Vec<&'static str> {
+    let bytes = word.as_bytes();
+    let mut out: Vec<&'static str> = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let rem = &bytes[i..];
+        if rem.starts_with(b"sh") {
+            out.push("SH");
+            i += 2;
+        } else if rem.starts_with(b"ch") {
+            out.push("CH");
+            i += 2;
+        } else if rem.starts_with(b"th") {
+            out.push("TH");
+            i += 2;
+        } else if rem.starts_with(b"ph") {
+            out.push("F");
+            i += 2;
+        } else if rem.starts_with(b"ng") {
+            out.push("NG");
+            i += 2;
+        } else if rem.starts_with(b"ee") || rem.starts_with(b"ea") {
+            out.push("IY1");
+            i += 2;
+        } else if rem.starts_with(b"oo") {
+            out.push("UW1");
+            i += 2;
+        } else if rem.starts_with(b"ai") || rem.starts_with(b"ay") || rem.starts_with(b"ey") {
+            out.push("EY1");
+            i += 2;
+        } else if rem.starts_with(b"ou") || rem.starts_with(b"ow") {
+            out.push("OW1");
+            i += 2;
+        } else if rem.starts_with(b"er") || rem.starts_with(b"ir") || rem.starts_with(b"ur") {
+            out.push("ER1");
+            i += 2;
+        } else if rem.starts_with(b"ar") {
+            out.push("AA1");
+            out.push("R");
+            i += 2;
+        } else if rem.starts_with(b"or") {
+            out.push("AO1");
+            out.push("R");
+            i += 2;
+        } else {
+            let b = bytes[i];
+            // Silent trailing 'e' on multi-letter words (e.g. "mate", "home")
+            if b == b'e' && i + 1 == bytes.len() && bytes.len() > 2 {
+                i += 1;
+                continue;
+            }
+            match b {
+                b'a' => out.push("AE1"),
+                b'b' => out.push("B"),
+                b'c' => out.push("K"),
+                b'd' => out.push("D"),
+                b'e' => out.push("EH1"),
+                b'f' => out.push("F"),
+                b'g' => out.push("G"),
+                b'h' => out.push("HH"),
+                b'i' => out.push("IH1"),
+                b'j' => out.push("JH"),
+                b'k' => out.push("K"),
+                b'l' => out.push("L"),
+                b'm' => out.push("M"),
+                b'n' => out.push("N"),
+                b'o' => out.push("OW1"),
+                b'p' => out.push("P"),
+                b'q' => {
+                    out.push("K");
+                    out.push("W");
+                }
+                b'r' => out.push("R"),
+                b's' => out.push("S"),
+                b't' => out.push("T"),
+                b'u' => out.push("AH1"),
+                b'v' => out.push("V"),
+                b'w' => out.push("W"),
+                b'x' => {
+                    out.push("K");
+                    out.push("S");
+                }
+                b'y' => out.push("Y"),
+                b'z' => out.push("Z"),
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
 pub fn reflex_tokens(text: &str) -> std::result::Result<String, String> {
     use pinyin::ToPinyin;
-    let chars: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("词是空的".into());
+    }
+    // Pure ASCII English phrase → ARPAbet tokens from the bilingual KWS tokens.txt table.
+    if trimmed.is_ascii() {
+        let words: Vec<String> = trimmed
+            .split(|c: char| c.is_whitespace() || c == '_' || c == '-')
+            .filter(|w| !w.is_empty())
+            .map(|w| {
+                w.chars()
+                    .filter(|c| c.is_ascii_alphabetic())
+                    .map(|c| c.to_ascii_lowercase())
+                    .collect::<String>()
+            })
+            .filter(|w| !w.is_empty())
+            .collect();
+        if words.is_empty() {
+            return Err(format!("「{trimmed}」不包含可拼写的字母或汉字"));
+        }
+        let mut phones: Vec<&'static str> = Vec::new();
+        for w in &words {
+            if let Some(lex) = english_word_arpabet(w) {
+                phones.extend_from_slice(lex);
+            } else {
+                phones.extend(english_word_fallback_arpabet(w));
+            }
+        }
+        if phones.is_empty() {
+            return Err(format!("「{trimmed}」无法自动生成英文音素拼写"));
+        }
+        return Ok(phones.join(" "));
+    }
+    let chars: Vec<char> = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
     if chars.is_empty() {
         return Err("词是空的".into());
     }

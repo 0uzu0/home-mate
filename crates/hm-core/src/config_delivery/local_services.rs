@@ -53,7 +53,7 @@ impl ConfigDelivery {
             let payload = json!({
                 "provider": cfg.provider, "base_url": cfg.base_url, "model": cfg.model,
                 "api_key_env": cfg.api_key_env, "voice": cfg.voice, "key_set": key_set,
-                "thinking": cfg.thinking,
+                "thinking": cfg.thinking, "language": cfg.language,
             });
             tx.execute(
                 "INSERT INTO config_history(ts_ms,actor,scope,summary,payload) VALUES (?1,?2,?3,?4,?5)",
@@ -71,6 +71,7 @@ impl ConfigDelivery {
             api_key_set: key_set,
             voice: cfg.voice,
             thinking: cfg.thinking,
+            language: cfg.language,
         })
     }
 }

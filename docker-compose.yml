@@ -1,9 +1,10 @@
 services:
   hm-core:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: home-mate/hm-core:latest
+    # Pull the official prebuilt multi-arch image (linux/amd64 + linux/arm64)
+    # with in-process Silero VAD v4 and the Vue 3 Web Console pre-bundled.
+    # To build from local source instead, run:
+    #   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+    image: ghcr.io/yes999zc/home-mate:latest
     container_name: home-mate-core
     restart: unless-stopped
     # Host networking is required on Linux NAS deployments so LAN UDP broadcast
@@ -26,5 +27,8 @@ services:
       HM_GATEWAY_ALLOW_LAN: "1"
       RUST_LOG: hm_core=info
     volumes:
-      # Place optional silero_vad.onnx at ./data/models/silero_vad.onnx for neural VAD.
+      # Before first start on Linux NAS, create and grant container UID 1000:1001 access:
+      #   mkdir -p ./data && sudo chown -R 1000:1001 ./data
+      # Silero VAD v4 is pre-bundled inside the image at /app/models/silero_vad.onnx
+      # (place a custom model at ./data/models/silero_vad.onnx to override it).
       - ./data:/data

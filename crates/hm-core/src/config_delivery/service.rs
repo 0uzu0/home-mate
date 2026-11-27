@@ -92,7 +92,7 @@ fn defaults() -> Fields {
         llm: ServiceConfig {
             provider: "deepseek".into(),
             base_url: crate::config::default_llm_base_url(),
-            model: "deepseek-flash".into(),
+            model: "deepseek-chat".into(),
             api_key_env: "DEEPSEEK_API_KEY".into(),
             thinking: "disabled".into(),
             ..Default::default()
@@ -1140,6 +1140,7 @@ fn validate_values(fields: &Fields, allow_loopback: bool) -> Result<()> {
             &service.model,
             &service.thinking,
             &service.voice,
+            &service.language,
             &service.api_key_env,
         ]
         .iter()

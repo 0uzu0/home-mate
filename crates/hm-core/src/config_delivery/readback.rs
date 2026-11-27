@@ -184,11 +184,15 @@ pub(super) fn capture(
             "api_key_env",
             "thinking",
             "voice",
+            "language",
         ] {
             let consumed = match name {
-                "llm" | "llm_fallback" => field != "voice",
+                "llm" | "llm_fallback" => !["voice", "language"].contains(&field),
                 "asr" => !["voice", "thinking"].contains(&field),
-                _ => field != "thinking" && (service.provider != "mock" || field == "provider"),
+                _ => {
+                    !["thinking", "language"].contains(&field)
+                        && (service.provider != "mock" || field == "provider")
+                }
             };
             let state = if !service.is_configured() || (name == "asr" && service.provider == "mock")
             {

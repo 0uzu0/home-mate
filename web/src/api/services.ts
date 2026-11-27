@@ -7,6 +7,7 @@ export interface ServicePatch {
   api_key_env?: string
   voice?: string
   thinking?: string
+  language?: string
   api_key?: string
 }
 

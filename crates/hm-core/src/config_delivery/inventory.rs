@@ -109,7 +109,7 @@ pub fn fields() -> Vec<FieldDescriptor> {
     for service in ["llm", "llm_fallback", "asr", "tts"] {
         let prefix = format!("services.{service}");
         add(
-            paths(&prefix, "provider base_url model thinking voice"),
+            paths(&prefix, "provider base_url model thinking voice language"),
             "string",
             "family_or_node",
             true,

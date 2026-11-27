@@ -83,6 +83,7 @@ async function rotate(): Promise<void> {
 
 async function forget(): Promise<void> {
   await run(async () => {
+    fresh.value = null
     clearAuthToken()
     markUnauthorized()
     return t('authClearDone')

@@ -520,7 +520,7 @@ fn all_three_supported_blocks_rollback_at_every_persistence_boundary() {
     }
     service.commit_at("actor-a", &request, 1001, None).unwrap();
     let state = service.state("actor-a").unwrap();
-    assert_eq!(state["stored"]["services.llm.model"], "deepseek-flash");
+    assert_eq!(state["stored"]["services.llm.model"], "deepseek-chat");
     assert_eq!(state["resolved"]["services.llm.model"], "new-model");
     assert_eq!(
         state["stored"]["shared_memory.nas_base_url"],
@@ -1443,7 +1443,7 @@ fn independent_block_terminal_metadata_survives_later_failure_and_reopen() {
         "SERVICES_PUBLICATION_FAILED"
     );
     assert_eq!(proof["fields"][0]["value"], "published-persona");
-    assert_eq!(proof["fields"][1]["value"], "deepseek-flash");
+    assert_eq!(proof["fields"][1]["value"], "deepseek-chat");
     drop(store);
     std::fs::remove_dir_all(dir).unwrap();
 }

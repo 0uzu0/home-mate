@@ -535,15 +535,28 @@ pub struct OpenaiAsr {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    /// Optional ISO-639-1 language hint (e.g. "zh", "en"). Empty omits the
+    /// `language` field so Whisper / Groq / SenseVoice auto-detect language.
+    pub language: String,
     pub client: reqwest::Client,
 }
 
 impl OpenaiAsr {
     pub fn new(base_url: String, api_key: String, model: String) -> Self {
+        Self::with_language(base_url, api_key, model, String::new())
+    }
+
+    pub fn with_language(
+        base_url: String,
+        api_key: String,
+        model: String,
+        language: String,
+    ) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
             model,
+            language: language.trim().to_string(),
             client: shared_client(&ASR_CLIENT, 12),
         }
     }
@@ -552,7 +565,7 @@ impl OpenaiAsr {
 #[async_trait::async_trait]
 impl AsrClient for OpenaiAsr {
     async fn transcribe(&self, wav: &[u8]) -> Result<String, SpeechError> {
-        let form = reqwest::multipart::Form::new()
+        let mut form = reqwest::multipart::Form::new()
             .part(
                 "file",
                 reqwest::multipart::Part::bytes(wav.to_vec())
@@ -560,8 +573,10 @@ impl AsrClient for OpenaiAsr {
                     .mime_str("audio/wav")
                     .map_err(|e| SpeechError::Protocol(e.to_string()))?,
             )
-            .text("model", self.model.clone())
-            .text("language", "zh");
+            .text("model", self.model.clone());
+        if !self.language.is_empty() {
+            form = form.text("language", self.language.clone());
+        }
         let mut req = self
             .client
             .post(format!("{}/audio/transcriptions", self.base_url))
@@ -656,10 +671,11 @@ pub fn asr_from_config(
             if cfg.model.is_empty() {
                 return Err(SpeechError::Missing("model for openai-asr".into()));
             }
-            Ok(Arc::new(OpenaiAsr::new(
+            Ok(Arc::new(OpenaiAsr::with_language(
                 cfg.base_url.clone(),
                 key.unwrap_or_default().to_string(),
                 cfg.model.clone(),
+                cfg.language.clone(),
             )))
         }
         other => Err(SpeechError::Protocol(format!(
@@ -869,6 +885,72 @@ mod tests {
         assert!(
             fields.iter().any(|f| f.starts_with("model=")),
             "fields: {fields:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_asr_omits_language_by_default_and_sends_explicit_language() {
+        use axum::extract::Multipart;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+
+        let captured: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = captured.clone();
+
+        let app = axum::Router::new().route(
+            "/v1/audio/transcriptions",
+            post(move |mut mp: Multipart| {
+                let captured = captured_clone.clone();
+                async move {
+                    let mut fields = Vec::new();
+                    while let Some(field) = mp.next_field().await.unwrap() {
+                        let name = field.name().unwrap_or("").to_string();
+                        if name == "file" {
+                            let _ = field.bytes().await.unwrap();
+                        } else {
+                            let val = field.text().await.unwrap();
+                            fields.push(format!("{name}={val}"));
+                        }
+                    }
+                    captured.lock().unwrap().push(fields);
+                    axum::Json(serde_json::json!({ "text": "hello world" }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let sample = pcm_to_wav(&vec![0u8; 1600], 16000, 1);
+
+        // 1. Default empty language -> omits `language` so Whisper/Groq auto-detects EN/ZH.
+        let auto_asr = OpenaiAsr::new(
+            format!("http://{addr}/v1"),
+            "key".into(),
+            "whisper-1".into(),
+        );
+        assert_eq!(auto_asr.transcribe(&sample).await.unwrap(), "hello world");
+
+        // 2. Explicit language ("en") -> sends `language=en`.
+        let en_asr = OpenaiAsr::with_language(
+            format!("http://{addr}/v1"),
+            "key".into(),
+            "whisper-1".into(),
+            "en".into(),
+        );
+        assert_eq!(en_asr.transcribe(&sample).await.unwrap(), "hello world");
+
+        let seen = captured.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(
+            !seen[0].iter().any(|f| f.starts_with("language=")),
+            "default empty language must omit multipart language field: {:?}",
+            seen[0]
+        );
+        assert!(
+            seen[1].iter().any(|f| f == "language=en"),
+            "explicit language must be forwarded: {:?}",
+            seen[1]
         );
     }
 }

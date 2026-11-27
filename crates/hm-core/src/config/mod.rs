@@ -63,8 +63,8 @@ pub use profile::{
     DeviceLedConfig, UnitAcousticProfile, DEVICE_LED_CONFIGS_KEY, UNIT_ACOUSTIC_PROFILES_KEY,
 };
 pub use reflex::{
-    compile_keywords, default_reflex_words, reflex_intent_map, reflex_tokens, reflex_warnings,
-    ReflexConfig, ReflexIntent, ReflexWord, REFLEX_KEY,
+    compile_keywords, default_reflex_words, reflex_intent_map, reflex_label_matches, reflex_tokens,
+    reflex_warnings, ReflexConfig, ReflexIntent, ReflexWord, REFLEX_KEY,
 };
 pub use runtime::RuntimeServices;
 pub use search::{
@@ -137,10 +137,11 @@ pub(crate) fn decode_services(raw: Option<&str>) -> Result<ServicesConfig> {
         llm: ServiceConfig {
             provider: "deepseek".into(),
             base_url: default_llm_base_url(),
-            model: "deepseek-flash".into(),
+            model: "deepseek-chat".into(),
             api_key_env: "DEEPSEEK_API_KEY".into(),
             voice: String::new(),
             thinking: default_thinking(),
+            language: String::new(),
         },
         ..Default::default()
     })
@@ -253,6 +254,7 @@ impl ConfigService {
             api_key_set: set,
             voice: cfg.voice,
             thinking: cfg.thinking,
+            language: cfg.language,
         })
     }
 
@@ -262,7 +264,7 @@ impl ConfigService {
             serde_json::json!({
                 "provider": c.provider, "base_url": c.base_url, "model": c.model,
                 "api_key_env": c.api_key_env, "api_key_set": set, "configured": c.is_configured(),
-                "voice": c.voice, "thinking": c.thinking,
+                "voice": c.voice, "thinking": c.thinking, "language": c.language,
             })
         };
         Ok(serde_json::json!({
@@ -1082,7 +1084,7 @@ mod tests {
         // deepseek-chat was removed from the provider's catalog (2026-11-07
         // incident report); the alias still routes, but the catalog name is
         // the honest default.
-        assert_eq!(cfg.llm.model, "deepseek-flash");
+        assert_eq!(cfg.llm.model, "deepseek-chat");
         assert_eq!(cfg.llm.api_key_env, "DEEPSEEK_API_KEY");
     }
 
@@ -1177,6 +1179,7 @@ mod tests {
                 api_key_env: "TTS_KEY".into(),
                 voice: String::new(),
                 thinking: String::new(),
+                language: String::new(),
             },
             Some("secret-value"),
             "console",
@@ -1203,6 +1206,7 @@ mod tests {
             api_key_env: "DEEPSEEK_API_KEY".into(),
             voice: String::new(),
             thinking: String::new(),
+            language: String::new(),
         };
         s.save_service("llm", cfg.clone(), Some("stored-key"), "console")
             .unwrap();
@@ -1328,6 +1332,21 @@ mod reflex_tests {
             )],
         };
         assert!(compile_keywords(&bad).is_err());
+
+        // English wake words (e.g. "Hey Mate") spell to ARPAbet tokens and
+        // compile with underscore-joined `@Hey_Mate` so Sherpa-ONNX never
+        // splits the label on whitespace, while `reflex_label_matches` matches
+        // both `"Hey Mate"` and `"Hey_Mate"`.
+        let en_tok = reflex_tokens("Hey Mate").unwrap();
+        assert_eq!(en_tok, "HH EY1 M EY1 T");
+        let en_cfg = ReflexConfig {
+            words: vec![word("Hey Mate", &en_tok, ReflexIntent::Wake)],
+        };
+        let compiled_en = compile_keywords(&en_cfg).unwrap();
+        assert_eq!(compiled_en, "HH EY1 M EY1 T @Hey_Mate\n");
+        assert!(reflex_label_matches("Hey Mate", "Hey_Mate"));
+        assert!(reflex_label_matches("Hey Mate", "hey mate"));
+        assert!(!reflex_label_matches("Hey Mate", "Hey Home"));
     }
 
     /// The hash is what the device reports back: one comparison proves the
@@ -1405,10 +1424,12 @@ mod token_tests {
         assert_eq!(reflex_tokens("爱").unwrap(), "ài");
     }
 
-    /// Non-Hanzi input is refused by name (a Latin word has no device token).
+    /// Unsupported punctuation, digits-only, or empty input is refused by name;
+    /// valid English words map to ARPAbet tokens from the bilingual KWS table.
     #[test]
     fn non_hanzi_has_no_spelling() {
-        assert!(reflex_tokens("ok").is_err());
+        assert_eq!(reflex_tokens("ok").unwrap(), "OW2 K EY1");
+        assert!(reflex_tokens("12345").is_err());
         assert!(reflex_tokens("暂停。").unwrap_err().contains("。"));
         assert!(reflex_tokens("").is_err());
     }

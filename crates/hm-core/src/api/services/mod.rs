@@ -404,6 +404,8 @@ pub(super) struct ServicePut {
     #[serde(default)]
     thinking: Option<String>,
     #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
     api_key: Option<String>,
 }
 
@@ -449,6 +451,7 @@ pub(super) async fn config_service_put(
         api_key_env: body.api_key_env.unwrap_or(stored_env),
         voice: body.voice,
         thinking: body.thinking.unwrap_or_else(|| "disabled".into()),
+        language: body.language.unwrap_or_default().trim().to_string(),
     };
     match state
         .config

@@ -1652,19 +1652,29 @@ impl VoicePipeline {
             )
         };
         if let Some(words) = &wake_ov {
-            if words.iter().any(|w| w.trim() == keyword) {
+            if words
+                .iter()
+                .any(|w| crate::config::reflex_label_matches(w, keyword))
+            {
                 return Some(interaction::KeywordIntent::Wake);
             }
         }
         if let Some(words) = &retreat_ov {
-            if words.iter().any(|w| w.trim() == keyword) {
+            if words
+                .iter()
+                .any(|w| crate::config::reflex_label_matches(w, keyword))
+            {
                 return Some(interaction::KeywordIntent::Retreat);
             }
         }
         let cfg = crate::config::ConfigService::new(self.store.clone())
             .reflex()
             .ok()?;
-        if let Some(w) = cfg.words.iter().find(|w| w.enabled && w.text == keyword) {
+        if let Some(w) = cfg
+            .words
+            .iter()
+            .find(|w| w.enabled && crate::config::reflex_label_matches(&w.text, keyword))
+        {
             return match w.intent {
                 crate::config::ReflexIntent::Wake => {
                     if wake_ov.is_some() {
@@ -1691,7 +1701,7 @@ impl VoicePipeline {
         }
         self.effective_wake_words_for(device)
             .iter()
-            .any(|w| w == keyword)
+            .any(|w| crate::config::reflex_label_matches(w, keyword))
             .then_some(interaction::KeywordIntent::Wake)
     }
 

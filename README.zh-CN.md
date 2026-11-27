@@ -254,11 +254,13 @@ Home Mate 在 Echo Dot 2 上 **100% 本机独立运行**，底层依托的是上
    - **切记：原厂未解锁的 Echo Dot 2 解锁前切勿在 Alexa App 里联网升级高版本固件！**
    - 用 Micro-USB 数据线连接电脑，按 **[`yes999zc/firebreak`](https://github.com/yes999zc/firebreak)** 执行 `uvx firebreak@latest` 完成一次性 Bootrom 解锁，并**妥善留存备份下来的原厂 `p10` 分区镜像**。
 2. **步骤 1 — 从上游 `wilbowes/EchoMuse` 刷入 `emOS` 音频底座**：
-   - 克隆上游 **[`wilbowes/EchoMuse`](https://github.com/wilbowes/EchoMuse)**，按照仓库里 **[`emos/`](https://github.com/wilbowes/EchoMuse/tree/main/emos)** 目录及 `SETUP.md` 的向导（`emos-v0.10+`），用你这台音箱自己的原厂内核/DTB 打包并刷入 **`emOS`**。*（`emOS` 并非单行道，在串口执行 `/init recovery` 随时可退回 TWRP。）*
+   - 克隆上游 **[`wilbowes/EchoMuse`](https://github.com/wilbowes/EchoMuse)**，按照仓库根目录 **[`SETUP.md`](https://github.com/wilbowes/EchoMuse/blob/main/SETUP.md)** 与 **[`emos/`](https://github.com/wilbowes/EchoMuse/tree/main/emos)** 的向导（`emos-v0.10+`），用你这台音箱自己的原厂内核/DTB 打包并刷入 **`emOS`**。*（`emOS` 并非单行道，在串口执行 `/init recovery` 随时可退回 TWRP。）*
 3. **步骤 2 — USB 串口执行 `em-wifi` 连上家庭 Wi-Fi**：
    - 用 Micro-USB 线连上电脑，打开串口控制台（macOS 为 `/dev/cu.usbmodem*`，Linux 为 `/dev/ttyACM*`），确认 `cat /etc/os-release` 返回 `ID=emos`，执行 **`em-wifi`** 选好家里 Wi-Fi 并记下分配到的局域网 IP。
 
 #### 步骤 3 — 首次构建、生成自签名 Release 包与 Bootstrap 种子包
+> **宿主机交叉编译前置依赖（macOS / Linux 均支持）**：Rust（`rustup target add aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf` 与 `rustup component add llvm-tools` / `rust-lld`）、`zig` + `cargo-zigbuild`、Node.js 20+、Python 3 + `pyserial`，以及通过 `home-mate-gateway-linux/kws/build.sh` + `kws/assemble.sh` 准备好的 Sherpa-ONNX aarch64 KWS 侧车包（`~/.home-mate/kws-build/bundle`）。
+
 将两个仓库克隆到**平级目录**（`hm-provision.sh` 与 `build_bootstrap.py` 会自动探测同级的 `../home-mate-gateway-linux`）：
 ```bash
 git clone https://github.com/yes999zc/home-mate.git
@@ -284,8 +286,9 @@ mkdir -p "$REL/components/model"
 cp target/aarch64-unknown-linux-musl/release/hm-core "$REL/components/core-aarch64"
 cp ../home-mate-gateway-linux/target/armv7-unknown-linux-musleabihf/release/home-mate-device-gateway "$REL/components/firmware-armv7"
 cp -a web/dist "$REL/components/web"
-# 先从 https://github.com/snakers4/silero-vad 下载 Silero VAD v4 16 kHz ONNX：
-cp /path/to/silero_vad.onnx "$REL/components/model/silero_vad.onnx"
+# 下载经过 SHA-256 锁定审计的 Silero VAD v4 16 kHz 模型（643,854 B）：
+curl -fL https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx \
+  -o "$REL/components/model/silero_vad.onnx"
 ./target/debug/hm-release pack --dir "$REL" --out "build/release/home-mate-release-$VER" \
   --serial 1 --version "$VER" --key ~/.home-mate/signing/release-signing-key.hex \
   --model AEOBC --profile dot2d-emos --firmware-min 0.0.44 --firmware-max 0.0.99
@@ -345,21 +348,22 @@ python3 tools/build_bootstrap.py \
 
 ### 轨道 C：NAS / 服务器全量 Docker 部署（128 MB LX06 与全屋安卓终端中枢）
 
-支持群晖、飞牛 fnOS、绿联、Unraid、树莓派与 Linux/macOS 服务器（`linux/amd64` + `linux/arm64` 多架构镜像），**务必部署标准全量版 `hm-core`**（内置 Silero VAD，切勿使用 LX06 专用 `--slim`）：
+支持群晖、飞牛 fnOS、绿联、Unraid、树莓派与 Linux/macOS 服务器（`linux/amd64` + `linux/arm64` 多架构镜像），**镜像已开箱内置 Silero VAD v4 神经端点检测**，务必部署标准全量版（切勿在 NAS 使用 LX06 专用 `--slim`）：
 
 ```bash
+# Linux NAS / 服务器请先赋予 ./data 容器 UID 1000:1001 权限，并使用 --network host
+# 确保局域网 UDP :8933 一键发现与真实内网来源 IP 透传正常工作：
+mkdir -p ./data && sudo chown -R 1000:1001 ./data
 docker run -d \
   --name home-mate-core \
   --restart unless-stopped \
-  -p 8930:8930 \
-  -p 8932:8932 \
-  -p 8933:8933/udp \
+  --network host \
   -e TZ=Asia/Shanghai \
   -e HM_GATEWAY_ALLOW_LAN=1 \
   -v "$(pwd)/data:/data" \
   ghcr.io/yes999zc/home-mate:latest
 ```
-*（或直接用仓内 `docker-compose.yml` 执行 `docker compose up -d`；首次启动后请立即访问 `http://<NAS_IP>:8930` 配对家庭管理员令牌，避免局域网无鉴权暴露。）*
+*（macOS Docker Desktop 用户可将 `--network host` 替换为 `-p 8930:8930 -p 8932:8932 -p 8933:8933/udp`；也可直接下载 Release 附件 `docker-compose.yml` 执行 `docker compose up -d`，默认直拉 GHCR 镜像零编译。首次启动后请立即访问 `http://<NAS_IP>:8930` 配对家庭管理员令牌。）*
 
 #### 让 AI 编程助手一键部署 NAS 全量 Core 与家庭主脑
 ```text

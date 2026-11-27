@@ -24,10 +24,18 @@ const DICTS: Record<Locale, Record<Key, string>> = { zh, en }
 
 function readLocale(): Locale {
   try {
-    return localStorage.getItem(STORAGE_KEY) === 'en' ? 'en' : 'zh'
+    const saved = localStorage.getItem(STORAGE_KEY)
+    if (saved === 'en' || saved === 'zh') return saved
   } catch {
-    return 'zh'
+    /* private mode */
   }
+  try {
+    const nav = typeof navigator !== 'undefined' ? navigator.language || '' : ''
+    if (nav && !nav.toLowerCase().startsWith('zh')) return 'en'
+  } catch {
+    /* non-browser env */
+  }
+  return 'zh'
 }
 
 export const locale = ref<Locale>(readLocale())

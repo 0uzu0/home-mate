@@ -1284,14 +1284,20 @@ impl SileroSetup {
                 detail: "disabled by HM_SILERO_VAD=off".into(),
             };
         }
-        let path = override_.unwrap_or_else(|| {
-            data_dir
-                .join("models")
-                .join("silero_vad.onnx")
-                .to_string_lossy()
-                .into_owned()
-        });
-        let p = std::path::Path::new(&path);
+        let (path, p) = if let Some(explicit) = override_ {
+            let pb = std::path::PathBuf::from(&explicit);
+            (explicit, pb)
+        } else {
+            let data_model = data_dir.join("models").join("silero_vad.onnx");
+            let bundled_model = std::path::PathBuf::from("/app/models/silero_vad.onnx");
+            if data_model.exists() {
+                (data_model.to_string_lossy().into_owned(), data_model)
+            } else if bundled_model.exists() {
+                (bundled_model.to_string_lossy().into_owned(), bundled_model)
+            } else {
+                (data_model.to_string_lossy().into_owned(), data_model)
+            }
+        };
         if !p.exists() {
             return Self {
                 model: None,
@@ -1300,7 +1306,7 @@ impl SileroSetup {
             };
         }
         let t0 = std::time::Instant::now();
-        match crate::silero::SileroModel::from_path(p) {
+        match crate::silero::SileroModel::from_path(&p) {
             Ok(m) => Self {
                 model: Some(Arc::new(m)),
                 detail: format!("loaded in {} ms", t0.elapsed().as_millis()),

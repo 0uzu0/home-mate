@@ -36,6 +36,7 @@ interface Draft {
   api_key_env: string
   voice: string
   thinking: string
+  language: string
   api_key: string
 }
 
@@ -53,6 +54,7 @@ function fromStatus(status: ServiceStatus): Draft {
     api_key_env: status.api_key_env ?? '',
     voice: status.voice ?? '',
     thinking: status.thinking ?? '',
+    language: status.language ?? '',
     api_key: '',
   }
 }
@@ -90,6 +92,7 @@ async function save(): Promise<void> {
         voice: props.service === 'tts' ? current.voice.trim() : undefined,
         thinking:
           props.service === 'llm' || props.service === 'llm_fallback' ? current.thinking : undefined,
+        language: props.service === 'asr' ? current.language.trim() : undefined,
         api_key: current.api_key ? current.api_key : undefined,
       },
       { timeoutMs: 10000 },
@@ -117,6 +120,17 @@ const thinkingOptions = computed(() => [
   { value: '', label: t('thinkingDefault') },
   { value: 'disabled', label: t('thinkingDisabled') },
 ])
+
+const asrLanguageOptions = computed(() => {
+  const cur = draft.value?.language ?? ''
+  const opts = [
+    { value: '', label: t('asrLanguageAuto') },
+    { value: 'zh', label: t('asrLanguageZh') },
+    { value: 'en', label: t('asrLanguageEn') },
+  ]
+  if (cur && !opts.some((o) => o.value === cur)) opts.push({ value: cur, label: cur })
+  return opts
+})
 
 /** Fixed provider options for ASR and TTS so users cannot hit unknown-provider errors. */
 const providerSelectOptions = computed(() => {
@@ -230,6 +244,12 @@ const apiKeyEnvPlaceholder = computed(() => {
         v-model="draft.thinking"
         :label="t('thinkingMode')"
         :options="thinkingOptions"
+      />
+      <Select
+        v-if="service === 'asr'"
+        v-model="draft.language"
+        :label="t('asrLanguage')"
+        :options="asrLanguageOptions"
       />
       <PasswordField
         v-model="draft.api_key"

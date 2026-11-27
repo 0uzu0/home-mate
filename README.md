@@ -255,11 +255,13 @@ Home Mate runs **100% on-device** on top of **`emOS`** — a minimal Linux users
    - **Do NOT update a brand-new/stock Dot 2 via the Alexa App before unlocking.**
    - Connect your 2nd-Gen Echo Dot (`RS03QR` / `AEOBC`) over Micro-USB and unlock it using **[`yes999zc/firebreak`](https://github.com/yes999zc/firebreak)** (`uvx firebreak@latest`). **Save your stock `p10` partition backup safely.**
 2. **Step 1 — Flash Upstream `emOS` from `wilbowes/EchoMuse`**:
-   - Clone **[`wilbowes/EchoMuse`](https://github.com/wilbowes/EchoMuse)** and follow its **[`emos/`](https://github.com/wilbowes/EchoMuse/tree/main/emos)** + `SETUP.md` wizard (`emos-v0.10+`) to build and flash `emOS` around **your own speaker's kernel/DTB**. *(We intentionally delegate `emOS` flashing to upstream EchoMuse — `emOS` is not a one-way door; `/init recovery` returns to TWRP anytime.)*
+   - Clone **[`wilbowes/EchoMuse`](https://github.com/wilbowes/EchoMuse)** and follow its root **[`SETUP.md`](https://github.com/wilbowes/EchoMuse/blob/main/SETUP.md)** and **[`emos/`](https://github.com/wilbowes/EchoMuse/tree/main/emos)** wizard (`emos-v0.10+`) to build and flash `emOS` around **your own speaker's kernel/DTB**. *(We intentionally delegate `emOS` flashing to upstream EchoMuse — `emOS` is not a one-way door; `/init recovery` returns to TWRP anytime.)*
 3. **Step 2 — Connect Wi-Fi Over USB Serial**:
    - Plug the Dot 2 into your Mac/Linux host via Micro-USB, open the USB serial console (`/dev/cu.usbmodem*` on macOS or `/dev/ttyACM*` on Linux), verify `cat /etc/os-release` reports `ID=emos`, and run **`em-wifi`** to join your home Wi-Fi and obtain a LAN IP.
 
 #### Step 3 — Build, Self-Sign & Generate Bootstrap Seed (First-Time Setup)
+> **Host Toolchain Prerequisites (macOS or Linux)**: Rust (`rustup target add aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf` + `rustup component add llvm-tools` / `rust-lld`), `zig` + `cargo-zigbuild`, Node.js 20+, Python 3 + `pyserial`, and the Sherpa-ONNX aarch64 KWS sidecar bundle at `~/.home-mate/kws-build/bundle` (assembled via `home-mate-gateway-linux/kws/build.sh` + `kws/assemble.sh`).
+
 Clone both repositories side by side (`hm-provision.sh` and `build_bootstrap.py` automatically find `../home-mate-gateway-linux`):
 ```bash
 git clone https://github.com/yes999zc/home-mate.git
@@ -285,8 +287,9 @@ mkdir -p "$REL/components/model"
 cp target/aarch64-unknown-linux-musl/release/hm-core "$REL/components/core-aarch64"
 cp ../home-mate-gateway-linux/target/armv7-unknown-linux-musleabihf/release/home-mate-device-gateway "$REL/components/firmware-armv7"
 cp -a web/dist "$REL/components/web"
-# Download Silero VAD v4 16 kHz ONNX from https://github.com/snakers4/silero-vad first:
-cp /path/to/silero_vad.onnx "$REL/components/model/silero_vad.onnx"
+# Download the audited Silero VAD v4 16 kHz ONNX (643,854 B, SHA-256 verified by hm-release pack):
+curl -fL https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx \
+  -o "$REL/components/model/silero_vad.onnx"
 ./target/debug/hm-release pack --dir "$REL" --out "build/release/home-mate-release-$VER" \
   --serial 1 --version "$VER" --key ~/.home-mate/signing/release-signing-key.hex \
   --model AEOBC --profile dot2d-emos --firmware-min 0.0.44 --firmware-max 0.0.99
@@ -347,21 +350,22 @@ Follow this exact end-to-end checklist safely:
 
 ### Track C: NAS / Docker Full Core (Multi-Gateway Hub for 128 MB LX06 & Android)
 
-Deploy **Full `hm-core`** (including in-process Silero VAD + Vue 3 Console) on Synology, fnOS, UGREEN, Unraid, Raspberry Pi, Linux, or macOS. With `HM_GATEWAY_ALLOW_LAN=1`, it hosts multiple Android terminals and 128 MB LX06 thin gateways concurrently while keeping every device's sessions, audio streams, and KWS thresholds strictly isolated.
+Deploy **Full `hm-core`** (with **pre-bundled Silero VAD v4** + Vue 3 Console) on Synology, fnOS, UGREEN, Unraid, Raspberry Pi, Linux, or macOS. With `HM_GATEWAY_ALLOW_LAN=1`, it hosts multiple Android terminals and 128 MB LX06 thin gateways concurrently while keeping every device's sessions, audio streams, and KWS thresholds strictly isolated.
 
 ```bash
+# On Linux NAS/servers, create ./data writable by container UID 1000:1001
+# and use --network host so UDP :8933 discovery & real LAN IPs work natively:
+mkdir -p ./data && sudo chown -R 1000:1001 ./data
 docker run -d \
   --name home-mate-core \
   --restart unless-stopped \
-  -p 8930:8930 \
-  -p 8932:8932 \
-  -p 8933:8933/udp \
-  -e TZ=Asia/Shanghai \
+  --network host \
+  -e TZ=UTC \
   -e HM_GATEWAY_ALLOW_LAN=1 \
   -v "$(pwd)/data:/data" \
   ghcr.io/yes999zc/home-mate:latest
 ```
-*(Or run `docker compose up -d` using the bundled `docker-compose.yml`; always pair a household admin token immediately on first login at `http://<NAS_IP>:8930`!)*
+*(On macOS Docker Desktop, replace `--network host` with `-p 8930:8930 -p 8932:8932 -p 8933:8933/udp`. Or download `docker-compose.yml` and run `docker compose up -d` — it pulls `ghcr.io/yes999zc/home-mate:latest` directly with zero compiling! Always pair a household admin token immediately on first login at `http://<NAS_IP>:8930`.)*
 
 #### Let an AI Coding Agent Deploy NAS Docker Full Core + Master Brain
 ```text

@@ -58,6 +58,11 @@ pub struct ServiceConfig {
     /// oMLX 12Hz voices); empty = provider default.
     #[serde(default)]
     pub voice: String,
+    /// Optional ASR language hint (ISO 639-1, e.g. "zh", "en").
+    /// Empty (default) omits `language` so OpenAI/Groq Whisper and SenseVoice
+    /// auto-detect the spoken language cleanly for both Chinese and English users.
+    #[serde(default)]
+    pub language: String,
 }
 
 impl ServiceConfig {
@@ -79,4 +84,7 @@ pub struct ServiceStatus {
     /// LLM thinking mode ("" = provider default).
     #[serde(default)]
     pub thinking: String,
+    /// Optional ASR language hint ("" = auto-detect).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub language: String,
 }

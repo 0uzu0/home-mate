@@ -52,6 +52,7 @@ pub(in crate::api) async fn config_history_restore(
                 // Pre-thinking-field snapshots restore as "disabled" (the
                 // voice default), not the old high-effort behavior.
                 thinking: payload["thinking"].as_str().unwrap_or("disabled").into(),
+                language: payload["language"].as_str().unwrap_or_default().into(),
             };
             match state.config.save_service(&scope, cfg, None, "restore") {
                 Ok(st) => Ok(Json(json!({

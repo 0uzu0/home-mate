@@ -29,6 +29,19 @@ class TestDot2ProvisioningResolution(unittest.TestCase):
         self.assertEqual(hlp.returncode, 0, hlp.stderr)
         self.assertIn("hm-provision.sh", hlp.stdout)
 
+    def test_hm_provision_cross_platform_host_ip_and_linux_serial(self):
+        src = HM_PROVISION.read_text()
+        self.assertIn("/dev/ttyACM*", src, "pick_serial_port must support Linux /dev/ttyACM* devices")
+        self.assertIn("--host-ip", src, "hm-provision.sh must accept --host-ip override")
+        start = src.index("detect_host_ip()")
+        end = src.index("pick_serial_port()", start)
+        func_body = src[start:end]
+        # Explicit HOST_IP override works cleanly without macOS ipconfig
+        script = f'HOST_IP="192.168.10.42"\n{func_body}\ndetect_host_ip "192.168.10.73"\n'
+        res = subprocess.run(["sh", "-eu"], input=script, text=True, capture_output=True, timeout=10)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout.strip(), "192.168.10.42")
+
     def test_hm_provision_resolve_serial_tool_precedence(self):
         # Extract the exact resolve_serial_tool function from hm-provision.sh and run it
         # in an isolated directory layout covering HM_GATEWAY_DIR, public, and private siblings.

@@ -18,7 +18,7 @@ const props = defineProps<{
 const emit = defineEmits<{ done: [verified: boolean] }>()
 
 const defaults = {
-  llm: { provider: 'deepseek', base_url: 'https://api.deepseek.com', model: 'deepseek-flash', voice: '' },
+  llm: { provider: 'deepseek', base_url: 'https://api.deepseek.com/v1', model: 'deepseek-chat', voice: '' },
   asr: {
     provider: 'openai-asr',
     base_url: 'https://api.siliconflow.cn/v1',
