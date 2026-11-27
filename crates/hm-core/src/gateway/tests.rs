@@ -88,6 +88,7 @@ mod tests {
                     state_revision: None,
                     capability_fingerprint: None,
                     config_blocks: HashMap::new(),
+                    active_kws_generation: None,
                     reserved_loopback: false,
                     reserved_authenticated: false,
                     last_unauth_lan: false,
@@ -180,6 +181,7 @@ mod tests {
                         state_revision: None,
                         capability_fingerprint: None,
                         config_blocks: HashMap::new(),
+                        active_kws_generation: None,
                         reserved_loopback: false,
                         reserved_authenticated: false,
                         last_unauth_lan: false,
@@ -554,6 +556,7 @@ mod d0_source_tests {
                 state_revision: None,
                 capability_fingerprint: None,
                 config_blocks: HashMap::new(),
+                active_kws_generation: None,
                 reserved_loopback: false,
                 reserved_authenticated: false,
                 last_unauth_lan: false,
@@ -562,17 +565,18 @@ mod d0_source_tests {
                 ConfigBlock::Kws,
                 ConfigBlockState {
                     block: ConfigBlock::Kws,
-                    block_generation: 5,
+                    block_generation: 331,
                     operation_id: "op-5".into(),
                     data_epoch: 1,
                     persisted_hash: Some("h5".into()),
                     active_hash: Some("h5".into()),
-                    active_values: Some(json!({})),
+                    active_values: Some(json!({"kws_generation": 5, "bundle_id": "b5"})),
                     evidence: Some(json!({})),
                     state: ConfigReceiptStatus::Active,
                     reason: None,
                 },
             );
+            slot.active_kws_generation = Some(5);
             st.devices.insert("dot2-d".into(), slot);
         }
 
@@ -608,7 +612,8 @@ mod d0_source_tests {
             "stale_kws_keyword must be recorded"
         );
 
-        // Current KWS generation (5 >= 5) must pass through.
+        // Config transaction 331 and KWS bundle generation 5 are independent.
+        // The current bundle must pass even after many config transactions.
         hub.handle_frame(1, mk_kw("current-word", Some(5)));
         match rx.try_recv().expect("current generation keyword emitted") {
             DeviceEvent::Keyword { keyword, .. } => assert_eq!(keyword, "current-word"),
@@ -621,6 +626,185 @@ mod d0_source_tests {
             DeviceEvent::Keyword { keyword, .. } => assert_eq!(keyword, "legacy-word"),
             other => panic!("expected DeviceEvent::Keyword, got {other:?}"),
         }
+
+        // A newly loaded bundle may report a keyword before its receipt arrives.
+        hub.handle_frame(1, mk_kw("newer-bundle", Some(6)));
+        assert!(
+            matches!(rx.try_recv(), Ok(DeviceEvent::Keyword { keyword, .. }) if keyword == "newer-bundle")
+        );
+
+        // A subsequent Failed KWS redeploy receipt must NOT drop the last-active
+        // KWS bundle generation fence (4 < 5 still dropped, 5 still passes).
+        hub.handle_frame(
+            1,
+            GatewayFrame::ConfigReceipt {
+                device: "dot2-d".into(),
+                core_node_id: "core-1".into(),
+                gateway_boot_id: Some("boot-1".into()),
+                operation_id: "op-6-failed".into(),
+                application_id: "app-6".into(),
+                data_epoch: 1,
+                desired_revision: 34,
+                block_generation: 341,
+                block: ConfigBlock::Kws,
+                schema_version: 1,
+                block_hash: "h6".into(),
+                state_revision: Some(2),
+                state: ConfigReceiptStatus::Failed,
+                reason: Some("kws_reload_timeout".into()),
+                persisted_hash: Some("h6".into()),
+                active_hash: None,
+                active_values: None,
+                evidence: None,
+                retryable: true,
+                ts: 1001,
+            },
+        );
+        // Drain ConfigReceipt control event emitted above.
+        let _ = rx.try_recv();
+        hub.handle_frame(1, mk_kw("stale-after-failed-redeploy", Some(4)));
+        assert!(
+            rx.try_recv().is_err(),
+            "stale keyword must stay fenced even after a failed KWS redeploy"
+        );
+        hub.handle_frame(1, mk_kw("current-after-failed-redeploy", Some(5)));
+        assert!(
+            matches!(rx.try_recv(), Ok(DeviceEvent::Keyword { keyword, .. }) if keyword == "current-after-failed-redeploy")
+        );
+
+        // Active legacy/incomplete receipts have no usable bundle counter: never
+        // substitute the unrelated transaction counter for missing metadata.
+        for values in [
+            None,
+            Some(json!({})),
+            Some(json!({"kws_generation": 0})),
+            Some(json!({"kws_generation": "invalid"})),
+        ] {
+            hub.handle_frame(
+                1,
+                GatewayFrame::ConfigReceipt {
+                    device: "dot2-d".into(),
+                    core_node_id: "core-1".into(),
+                    gateway_boot_id: Some("boot-1".into()),
+                    operation_id: "op-legacy".into(),
+                    application_id: "app-legacy".into(),
+                    data_epoch: 1,
+                    desired_revision: 35,
+                    block_generation: 351,
+                    block: ConfigBlock::Kws,
+                    schema_version: 1,
+                    block_hash: "h-legacy".into(),
+                    state_revision: Some(3),
+                    state: ConfigReceiptStatus::Active,
+                    reason: None,
+                    persisted_hash: Some("h-legacy".into()),
+                    active_hash: Some("h-legacy".into()),
+                    active_values: values,
+                    evidence: None,
+                    retryable: false,
+                    ts: 1002,
+                },
+            );
+            let _ = rx.try_recv();
+            hub.handle_frame(1, mk_kw("missing-bundle-counter", Some(5)));
+            assert!(
+                matches!(rx.try_recv(), Ok(DeviceEvent::Keyword { keyword, .. }) if keyword == "missing-bundle-counter")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn play_chunk_paced_waits_for_voice_queue_drain_without_dropping() {
+        use super::transport_metrics::OUTBOUND_VOICE_CAP;
+        let hub = DeviceHub::new();
+        let (tx, mut rx) =
+            outbound::outbound_channel_with_metrics(hub.transport_tasks.outbound.clone());
+        hub.attach_test_outbound(1, tx);
+        {
+            let mut st = hub.lock_state();
+            st.device_to_conn.insert("dot2-d".into(), 1);
+            st.devices.insert(
+                "dot2-d".into(),
+                DeviceSlot {
+                    descriptor: HelloDevice {
+                        stable_id: "dot2-d".into(),
+                        model: "dot2".into(),
+                        firmware: Some("0.0.55".into()),
+                        capabilities: vec!["audio_out".into(), "play_stream".into()],
+                        audio_profile: "dot2".into(),
+                        wifi_ssid: None,
+                    },
+                    generation: 1,
+                    last_seq: 0,
+                    online: true,
+                    volume: None,
+                    volume_at_ms: None,
+                    volume_seq: 0,
+                    aec_enabled: None,
+                    aec_tail_ms: None,
+                    aec_tail_samples: None,
+                    aec_sample_rate: None,
+                    aec_provenance: None,
+                    profile_version: None,
+                    echo_health: None,
+                    echo_degraded_ms: None,
+                    echo_health_reason: None,
+                    northbound: None,
+                    gateway_boot_id: None,
+                    state_revision: None,
+                    capability_fingerprint: None,
+                    config_blocks: HashMap::new(),
+                    active_kws_generation: None,
+                    reserved_loopback: false,
+                    reserved_authenticated: false,
+                    last_unauth_lan: false,
+                },
+            );
+        }
+
+        // Fill the bounded voice queue completely: 1 PlayBegin + (OUTBOUND_VOICE_CAP - 1) PlayChunks.
+        let ticket = hub
+            .play_begin("dot2-d", "voice", 48_000, Some("burst".into()))
+            .expect("play_begin");
+        for seq in 0..(OUTBOUND_VOICE_CAP - 1) as u64 {
+            hub.play_chunk(&ticket.play_id, seq, &[0x22u8; 64])
+                .expect("fill voice tier");
+        }
+        // Without a drainer, a short paced wait times out cleanly with Full("voice").
+        assert_eq!(
+            hub.play_chunk_paced(
+                &ticket.play_id,
+                (OUTBOUND_VOICE_CAP - 1) as u64,
+                &[0x33u8; 64],
+                std::time::Duration::from_millis(15),
+            )
+            .await,
+            Err(PlayChunkPacedError::Full("voice"))
+        );
+        // Once the writer drains a slot concurrently, `play_chunk_paced` admits smoothly.
+        let drainer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let frame = rx.recv().await;
+            (frame, rx)
+        });
+        hub.play_chunk_paced(
+            &ticket.play_id,
+            (OUTBOUND_VOICE_CAP - 1) as u64,
+            &[0x33u8; 64],
+            std::time::Duration::from_millis(200),
+        )
+        .await
+        .expect("paced send must succeed once a voice slot drains");
+        let (first, _rx) = drainer.await.unwrap();
+        assert!(first.is_some());
+        assert_eq!(
+            hub.transport_tasks
+                .outbound
+                .voice_dropped
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "genuine backpressure must not drop frames while consumer drains"
+        );
     }
 
     /// #233 P1-3: quantitative slow-consumer regression test.
@@ -676,6 +860,7 @@ mod d0_source_tests {
                     state_revision: None,
                     capability_fingerprint: None,
                     config_blocks: HashMap::new(),
+                    active_kws_generation: None,
                     reserved_loopback: false,
                     reserved_authenticated: false,
                     last_unauth_lan: false,
@@ -889,6 +1074,7 @@ mod d0_source_tests {
                     state_revision: None,
                     capability_fingerprint: None,
                     config_blocks: HashMap::new(),
+                    active_kws_generation: None,
                     reserved_loopback: false,
                     reserved_authenticated: false,
                     last_unauth_lan: false,

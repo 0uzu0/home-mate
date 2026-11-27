@@ -652,6 +652,26 @@ impl VoicePipeline {
         // remains as the memory backstop; stop semantics are unchanged
         // (hub.stop flushes the device's pending side).
         let mut queue: VecDeque<crate::speech::TtsPiece> = VecDeque::new();
+        // Enforce one uniform transport frame bound (`STREAM_PCM_CHUNK_BYTES`)
+        // across ALL TTS providers (both streaming providers like VolcanoTts
+        // and fallback whole-WAV providers like OmniTts/MockTts). Align to the
+        // 2-byte mono S16LE sample boundary.
+        let push_framed_piece = |q: &mut VecDeque<crate::speech::TtsPiece>,
+                                 piece: crate::speech::TtsPiece| {
+            const MAX_MONO_CHUNK: usize = (crate::speech::STREAM_PCM_CHUNK_BYTES / 2) * 2;
+            if piece.pcm.len() <= MAX_MONO_CHUNK {
+                if !piece.pcm.is_empty() {
+                    q.push_back(piece);
+                }
+                return;
+            }
+            for chunk in piece.pcm.chunks(MAX_MONO_CHUNK) {
+                q.push_back(crate::speech::TtsPiece {
+                    sample_rate: piece.sample_rate,
+                    pcm: chunk.to_vec(),
+                });
+            }
+        };
         let mut synth_done = false;
         // Pre-open accounting only: as soon as the stream exists, the
         // per-STREAM counters in TurnStream take over (the budget must not
@@ -828,7 +848,7 @@ impl VoicePipeline {
                 if ts.paced_from_ms.is_none() {
                     ts.paced_from_ms = Some(id::now_ms());
                 }
-                let sent = {
+                {
                     let mut states = crate::lock_or_recover(&self.states, "voice.states");
                     let Some(st) = states.get_mut(device) else {
                         return false;
@@ -844,14 +864,49 @@ impl VoicePipeline {
                             rec.answer_text.push_str(segment);
                         }
                     }
-                    self.hub.play_chunk(&ts.play_id, ts.seq, &piece.pcm)
-                };
-                if sent.is_err() {
-                    let dead = stream.take();
-                    if let Some(d) = dead {
-                        self.fail_voice_stream(&d.play_id);
+                }
+                // Genuine bounded backpressure against `OUTBOUND_VOICE_CAP` in
+                // short slices so barge-in/stop cancels immediately while fast
+                // bursts (e.g. 48 kHz TTS) wait for the socket writer to drain.
+                const BACKPRESSURE_SLICE: std::time::Duration =
+                    std::time::Duration::from_millis(50);
+                const BACKPRESSURE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+                let bp_start = tokio::time::Instant::now();
+                loop {
+                    match self
+                        .hub
+                        .play_chunk_paced(&ts.play_id, ts.seq, &piece.pcm, BACKPRESSURE_SLICE)
+                        .await
+                    {
+                        Ok(()) => break,
+                        Err(crate::gateway::PlayChunkPacedError::Full(_)) => {
+                            let cancelled = self.task_cancelled(task_id);
+                            let (epoch_now, live_ok) =
+                                crate::lock_or_recover(&self.states, "voice.states")
+                                    .get(device)
+                                    .map(|st| (st.stop_epoch, st.live_turn == Some(turn_id)))
+                                    .unwrap_or((started_epoch, false));
+                            if cancelled || epoch_now != started_epoch || !live_ok {
+                                if let Some(d) = stream.take() {
+                                    self.fail_voice_stream(&d.play_id);
+                                }
+                                return false;
+                            }
+                            if bp_start.elapsed() >= BACKPRESSURE_BUDGET {
+                                self.hub.record_play_chunk_backpressure(&ts.play_id);
+                                if let Some(d) = stream.take() {
+                                    self.fail_voice_stream(&d.play_id);
+                                }
+                                return false;
+                            }
+                        }
+                        Err(crate::gateway::PlayChunkPacedError::Closed) => {
+                            if let Some(d) = stream.take() {
+                                self.fail_voice_stream(&d.play_id);
+                            }
+                            return false;
+                        }
                     }
-                    return false;
                 }
                 ts.seq += 1;
                 ts.sent_secs += piece_secs;
@@ -867,7 +922,7 @@ impl VoicePipeline {
             tokio::select! {
                 piece = rx.recv(), if !synth_done => {
                     if let Some(piece) = piece {
-                        queue.push_back(piece);
+                        push_framed_piece(&mut queue, piece);
                     }
                 }
                 res = &mut synth, if !synth_done => {
@@ -876,11 +931,10 @@ impl VoicePipeline {
                             // Drain anything the provider queued during the
                             // final poll into the queue (tx is still alive
                             // here, so recv Some/None both end below). The
-                            // default TtsClient impls push their single
-                            // piece just before returning — this must not
-                            // drop it.
+                            // default TtsClient impls push their piece just
+                            // before returning — this must not drop it.
                             while let Ok(piece) = rx.try_recv() {
-                                queue.push_back(piece);
+                                push_framed_piece(&mut queue, piece);
                             }
                             synth_done = true;
                         }

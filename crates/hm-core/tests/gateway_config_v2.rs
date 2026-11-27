@@ -1600,7 +1600,12 @@ async fn deploy_reflex_auto_recovers_after_invalid_kws_rejection_and_fences_stal
                     values,
                     ..
                 } => {
-                    applied_gen_ref.store(block_generation, Ordering::SeqCst);
+                    // The gateway's KWS bundle counter is independent of Core's
+                    // config transaction counter and lives in `active_values`.
+                    let bundle_generation = block_generation + 100;
+                    let mut values = values;
+                    values["kws_generation"] = json!(bundle_generation);
+                    applied_gen_ref.store(bundle_generation, Ordering::SeqCst);
                     rev += 1;
                     send_gw(
                         &mut wr,

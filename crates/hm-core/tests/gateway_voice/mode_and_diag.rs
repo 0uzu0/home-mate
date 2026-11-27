@@ -1332,6 +1332,15 @@ async fn self_echo_gate_covers_direct_plays_and_tail() {
 /// chunks, the stream closes at Answer — and no whole-WAV Play is sent.
 #[tokio::test]
 async fn streamed_answer_rides_one_stream_with_contiguous_seq() {
+    let sentences = ["今天天气不错。", "适合出去走走。", "记得多喝水。"];
+    let mut expected_pcm_bytes = 0usize;
+    for sentence in sentences {
+        let audio =
+            hm_core::speech::TtsClient::synthesize(&hm_core::speech::MockTts::default(), sentence)
+                .await
+                .unwrap();
+        expected_pcm_bytes += hm_core::speech::wav_pcm(&audio.wav).unwrap().2.len();
+    }
     let llm = FakeLlm::new(vec![Scripted::Text {
         chunks: vec![
             "今天天气不错。".into(),
@@ -1383,6 +1392,7 @@ async fn streamed_answer_rides_one_stream_with_contiguous_seq() {
             assert_eq!(text.as_deref(), Some("今天天气不错。"));
             // One stream for the whole answer: collect until its end.
             let mut expect_seq = 0u64;
+            let mut received_pcm_bytes = 0usize;
             loop {
                 match gw
                     .until(|f| match f {
@@ -1406,6 +1416,11 @@ async fn streamed_answer_rides_one_stream_with_contiguous_seq() {
                             .decode(audio_b64)
                             .expect("chunk pcm b64");
                         assert!(!pcm.is_empty(), "chunks carry real audio");
+                        assert!(
+                            pcm.len() <= hm_core::speech::STREAM_PCM_CHUNK_BYTES,
+                            "streamed PCM chunks must stay bounded at STREAM_PCM_CHUNK_BYTES"
+                        );
+                        received_pcm_bytes += pcm.len();
                     }
                     CoreFrame::PlayEnd { task_id: t } => {
                         assert_eq!(t, task_id);
@@ -1414,9 +1429,10 @@ async fn streamed_answer_rides_one_stream_with_contiguous_seq() {
                     f => panic!("unexpected frame {f:?}"),
                 }
             }
-            // MockTts pushes one piece per segment: three sentences →
-            // exactly three chunks.
-            assert_eq!(expect_seq, 3, "three sentence segments, one piece each");
+            // Sentence boundaries need not match transport chunk boundaries:
+            // every PCM sample across all three sentences arrives in one stream.
+            assert_eq!(received_pcm_bytes, expected_pcm_bytes);
+            assert!(expect_seq >= 3, "expected bounded PlayChunk frames");
         }
         f => panic!("expected play_begin, got {f:?}"),
     }
@@ -1431,6 +1447,118 @@ async fn streamed_answer_rides_one_stream_with_contiguous_seq() {
         !log.iter().any(|e| e["kind"] == "tts_played"),
         "the whole-path must not also speak: {log:?}"
     );
+}
+
+/// Custom streaming TTS providers (those overriding `synthesize_streaming`, e.g.
+/// `VolcanoTts`) can yield arbitrarily large raw PCM pieces. The voice stream
+/// forwarder must enforce `STREAM_PCM_CHUNK_BYTES` uniformly for all providers,
+/// preserving exact bytes and contiguous `seq`.
+#[tokio::test]
+async fn custom_streaming_tts_oversized_piece_is_framed_to_stream_bound() {
+    struct OversizedStreamingTts(Vec<u8>);
+
+    #[async_trait::async_trait]
+    impl hm_core::speech::TtsClient for OversizedStreamingTts {
+        async fn synthesize(
+            &self,
+            _text: &str,
+        ) -> Result<hm_core::speech::TtsAudio, hm_core::speech::SpeechError> {
+            let wav = hm_core::speech::pcm_to_wav(&self.0, 24_000, 1);
+            Ok(hm_core::speech::TtsAudio {
+                duration_ms: hm_core::speech::pcm_duration_ms(self.0.len(), 24_000, 1),
+                wav,
+                sample_rate: 24_000,
+                channels: 1,
+                provider: "oversized-stream".into(),
+                voice: "test".into(),
+            })
+        }
+
+        async fn synthesize_streaming(
+            &self,
+            text: &str,
+            on_pcm: &tokio::sync::mpsc::UnboundedSender<hm_core::speech::TtsPiece>,
+        ) -> Result<hm_core::speech::TtsAudio, hm_core::speech::SpeechError> {
+            let _ = on_pcm.send(hm_core::speech::TtsPiece {
+                sample_rate: 24_000,
+                pcm: self.0.clone(),
+            });
+            self.synthesize(text).await
+        }
+
+        fn provider(&self) -> &str {
+            "oversized-stream"
+        }
+    }
+
+    // 40,000 bytes (5 chunks: 4 × 8192 + 7232) emitted as ONE raw TtsPiece.
+    let expected_pcm: Vec<u8> = (0..20_000i16)
+        .flat_map(|i| i.wrapping_mul(3).to_le_bytes())
+        .collect();
+    let llm = FakeLlm::new(vec![Scripted::Text {
+        chunks: vec!["这是一段测试流式分片的回答。".into()],
+    }]);
+    let (_base, _state, gw) = spawn_mic_app_stream_tts(
+        llm,
+        "你好高达，测试一下",
+        Arc::new(OversizedStreamingTts(expected_pcm.clone())),
+    )
+    .await;
+
+    let _ = gw
+        .until(|f| matches!(f, CoreFrame::MicSession { action, .. } if action == "start"))
+        .await;
+    let loud = loud_block();
+    let quiet = quiet_block();
+    for seq in 1..=10 {
+        gw.send(&audio_chunk(seq, &loud)).await;
+    }
+    for seq in 11..=20 {
+        gw.send(&audio_chunk(seq, &quiet)).await;
+    }
+
+    let begin = tokio::time::timeout(
+        Duration::from_secs(5),
+        gw.until(|f| matches!(f, CoreFrame::PlayBegin { .. })),
+    )
+    .await
+    .expect("play_begin timeout");
+    let CoreFrame::PlayBegin { task_id, audio, .. } = begin else {
+        panic!("expected PlayBegin");
+    };
+    assert_eq!(audio.sample_rate, 24_000);
+    assert_eq!(audio.channels, 1);
+
+    let mut expect_seq = 0u64;
+    let mut received = Vec::new();
+    loop {
+        match gw
+            .until(|f| match f {
+                CoreFrame::PlayChunk { task_id: t, .. } => t == &task_id,
+                CoreFrame::PlayEnd { task_id: t } => t == &task_id,
+                _ => false,
+            })
+            .await
+        {
+            CoreFrame::PlayChunk { seq, audio_b64, .. } => {
+                assert_eq!(seq, expect_seq);
+                expect_seq += 1;
+                use base64::Engine;
+                let pcm = base64::engine::general_purpose::STANDARD
+                    .decode(audio_b64)
+                    .expect("chunk b64");
+                assert!(pcm.len() <= hm_core::speech::STREAM_PCM_CHUNK_BYTES);
+                received.extend_from_slice(&pcm);
+            }
+            CoreFrame::PlayEnd { .. } => break,
+            f => panic!("unexpected frame {f:?}"),
+        }
+    }
+    assert_eq!(
+        expect_seq, 5,
+        "40,000 bytes must split into 5 bounded chunks"
+    );
+    assert_eq!(received, expected_pcm);
 }
 
 /// Without `play_stream` the streamed path is not taken at all: the

@@ -116,7 +116,85 @@ pub(super) fn outbound_channel_with_metrics(
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayChunkPacedError {
+    /// Outbound queue remained full for the entire requested wait window.
+    Full(&'static str),
+    /// Play is no longer active or gateway connection closed.
+    Closed,
+}
+
 impl OutboundSender {
+    pub(super) async fn send_tier_paced(
+        &self,
+        tier: OutboundTier,
+        frame: CoreFrame,
+        wait: std::time::Duration,
+    ) -> Result<(), OutboundSendError> {
+        let tx = match tier {
+            OutboundTier::Control => &self.control_tx,
+            OutboundTier::Voice => &self.voice_tx,
+            OutboundTier::Media => &self.media_tx,
+        };
+        let tier_name = match tier {
+            OutboundTier::Control => "control",
+            OutboundTier::Voice => "voice",
+            OutboundTier::Media => "play",
+        };
+        // Fast path: non-blocking admit when queue has capacity.
+        let frame = match tx.try_send(frame) {
+            Ok(()) => {
+                self.observe_admitted_tier(tier);
+                return Ok(());
+            }
+            Err(mpsc::error::TrySendError::Full(frame)) => frame,
+            Err(mpsc::error::TrySendError::Closed(_)) => return Err(OutboundSendError::Closed),
+        };
+        // Genuine bounded backpressure: wait for the socket writer to free a slot.
+        match tokio::time::timeout(wait, tx.reserve()).await {
+            Ok(Ok(permit)) => {
+                permit.send(frame);
+                self.observe_admitted_tier(tier);
+                Ok(())
+            }
+            Ok(Err(_)) => Err(OutboundSendError::Closed),
+            Err(_) => Err(OutboundSendError::Full(tier_name)),
+        }
+    }
+
+    fn observe_admitted_tier(&self, tier: OutboundTier) {
+        match tier {
+            OutboundTier::Control => self.metrics.observe_control_depth(self.queued_control()),
+            OutboundTier::Voice => {
+                self.metrics.observe_voice_depth(self.queued_voice());
+                self.metrics.observe_play_depth(self.queued_play());
+            }
+            OutboundTier::Media => {
+                let media_depth = self.queued_media();
+                if media_depth >= CONGESTED_MEDIA_QUEUE_CHUNKS {
+                    self.link_health.mark_media_congested();
+                }
+                self.metrics
+                    .observe_play_depth(self.queued_voice() + media_depth);
+            }
+        }
+    }
+
+    pub(super) fn record_tier_dropped(&self, tier: OutboundTier) {
+        match tier {
+            OutboundTier::Control => {
+                self.metrics.control_dropped.fetch_add(1, Ordering::SeqCst);
+            }
+            OutboundTier::Voice => {
+                self.metrics.voice_dropped.fetch_add(1, Ordering::SeqCst);
+            }
+            OutboundTier::Media => {
+                self.link_health.mark_media_congested();
+                self.metrics.play_dropped.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
     pub(super) fn link_health(&self) -> Arc<LinkHealth> {
         self.link_health.clone()
     }
@@ -727,7 +805,8 @@ impl DeviceHub {
                 return Err(e);
             }
             let frame_bytes = (channels.max(1) as usize) * 2;
-            let chunk_bytes = (8192 / frame_bytes).max(1) * frame_bytes;
+            let chunk_bytes =
+                (crate::speech::STREAM_PCM_CHUNK_BYTES / frame_bytes).max(1) * frame_bytes;
             for (seq, chunk) in pcm.chunks(chunk_bytes).enumerate() {
                 let frame = CoreFrame::PlayChunk {
                     task_id: play_id.clone(),
@@ -882,6 +961,86 @@ impl DeviceHub {
                 audio_b64: base64::engine::general_purpose::STANDARD.encode(pcm),
             },
         )
+    }
+
+    /// Async backpressure-aware variant of [`Self::play_chunk`]: fast-paths via
+    /// `try_send`, and when the bounded outbound tier is temporarily full waits
+    /// up to `wait` for the socket writer to drain a slot without holding any
+    /// hub lock. Returns `Err(PlayChunkPacedError::Full(..))` if the slice
+    /// times out so callers can check cancellation/barge-in before retrying or
+    /// calling [`Self::record_play_chunk_backpressure`].
+    pub async fn play_chunk_paced(
+        &self,
+        play_id: &str,
+        seq: u64,
+        pcm: &[u8],
+        wait: std::time::Duration,
+    ) -> Result<(), PlayChunkPacedError> {
+        let (tx, tier) = {
+            let st = self.lock_state();
+            let Some(play) = st.active_plays.get(play_id) else {
+                return Err(PlayChunkPacedError::Closed);
+            };
+            let Some(conn) = st.connections.get(&play.generation) else {
+                return Err(PlayChunkPacedError::Closed);
+            };
+            let tier = if play.channel == "media" {
+                OutboundTier::Media
+            } else {
+                OutboundTier::Voice
+            };
+            (conn.outbound.clone(), tier)
+        };
+        use base64::Engine;
+        let frame = CoreFrame::PlayChunk {
+            task_id: play_id.to_string(),
+            seq,
+            audio_b64: base64::engine::general_purpose::STANDARD.encode(pcm),
+        };
+        match tx.send_tier_paced(tier, frame, wait).await {
+            Ok(()) => Ok(()),
+            Err(OutboundSendError::Full(name)) => Err(PlayChunkPacedError::Full(name)),
+            Err(OutboundSendError::Closed) => Err(PlayChunkPacedError::Closed),
+        }
+    }
+
+    /// Record drop/backpressure telemetry when a paced streaming caller gives
+    /// up after exhausting its backpressure budget.
+    pub fn record_play_chunk_backpressure(&self, play_id: &str) {
+        let tx_and_tier = {
+            let st = self.lock_state();
+            st.active_plays.get(play_id).and_then(|play| {
+                let conn = st.connections.get(&play.generation)?;
+                let tier = if play.channel == "media" {
+                    OutboundTier::Media
+                } else {
+                    OutboundTier::Voice
+                };
+                Some((conn.outbound.clone(), tier))
+            })
+        };
+        if let Some((tx, tier)) = tx_and_tier {
+            tx.record_tier_dropped(tier);
+            let tier_name = match tier {
+                OutboundTier::Control => "control",
+                OutboundTier::Voice => "voice",
+                OutboundTier::Media => "play",
+            };
+            let mut st = self.lock_state();
+            st.record(
+                "outbound_backpressure",
+                json!({
+                    "tier": tier_name,
+                    "control_queued": tx.queued_control(),
+                    "voice_queued": tx.queued_voice(),
+                    "media_queued": tx.queued_media(),
+                    "play_queued": tx.queued_play(),
+                    "control_dropped": self.transport_tasks.outbound.control_dropped.load(Ordering::SeqCst),
+                    "voice_dropped": self.transport_tasks.outbound.voice_dropped.load(Ordering::SeqCst),
+                    "play_dropped": self.transport_tasks.outbound.play_dropped.load(Ordering::SeqCst),
+                }),
+            );
+        }
     }
 
     /// v0.3: close a stream (the last chunk was already sent). The device

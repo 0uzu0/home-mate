@@ -338,6 +338,9 @@ impl DeviceHub {
                 slot.capability_fingerprint = capability_fingerprint.clone();
             }
             for b in blocks {
+                if b.block == ConfigBlock::Kws && b.state == ConfigReceiptStatus::Active {
+                    slot.active_kws_generation = super::extract_active_kws_generation(b);
+                }
                 slot.config_blocks.insert(b.block, b.clone());
             }
         }
@@ -483,21 +486,22 @@ impl DeviceHub {
             if state_revision.is_some() {
                 slot.state_revision = state_revision;
             }
-            slot.config_blocks.insert(
+            let block_state = ConfigBlockState {
                 block,
-                ConfigBlockState {
-                    block,
-                    block_generation,
-                    operation_id: operation_id.clone(),
-                    data_epoch,
-                    persisted_hash: persisted_hash.clone(),
-                    active_hash: active_hash.clone(),
-                    active_values: active_values.clone(),
-                    evidence: evidence.clone(),
-                    state,
-                    reason: reason.clone(),
-                },
-            );
+                block_generation,
+                operation_id: operation_id.clone(),
+                data_epoch,
+                persisted_hash: persisted_hash.clone(),
+                active_hash: active_hash.clone(),
+                active_values: active_values.clone(),
+                evidence: evidence.clone(),
+                state,
+                reason: reason.clone(),
+            };
+            if block == ConfigBlock::Kws && state == ConfigReceiptStatus::Active {
+                slot.active_kws_generation = super::extract_active_kws_generation(&block_state);
+            }
+            slot.config_blocks.insert(block, block_state);
         }
         st.record(
             "config_receipt",

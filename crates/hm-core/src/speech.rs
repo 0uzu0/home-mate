@@ -55,7 +55,12 @@ impl TtsAudio {
     }
 }
 
-/// One streaming TTS piece (v0.3/T3): bare S16LE PCM at `sample_rate`.
+/// Maximum raw S16LE PCM payload bytes per `PlayChunk` wire frame.
+/// Shared by both whole-WAV playback (`gateway/outbound.rs`) and streaming
+/// TTS forwarding (`voice/turn.rs`) so all TTS providers obey one framing bound.
+pub const STREAM_PCM_CHUNK_BYTES: usize = 8192;
+
+/// One streaming TTS piece (v0.3/T3): bare mono S16LE PCM at `sample_rate`.
 /// The rate rides every piece so the consumer can open the device stream
 /// lazily on the FIRST piece — before the provider has said anything
 /// about the final audio metadata.
@@ -68,28 +73,30 @@ pub struct TtsPiece {
 #[async_trait::async_trait]
 pub trait TtsClient: Send + Sync {
     async fn synthesize(&self, text: &str) -> Result<TtsAudio, SpeechError>;
-    /// v0.3 (D/T3): streaming synthesis — PCM pieces are pushed to
+    /// v0.3 (D/T3): streaming synthesis — mono S16LE PCM pieces are pushed to
     /// `on_pcm` as the provider yields them, and the FULL audio is still
     /// returned at the end (accounting/trace keep one shape). Providers
-    /// without a streaming API inherit the default: one piece with the
-    /// whole buffer (correct, just not incremental).
+    /// without a streaming API inherit the default: synthesize the whole WAV,
+    /// validate its RIFF `fmt `/`data` chunks as PCM16, downmix multi-channel
+    /// audio to mono, and push the bare PCM to `on_pcm`. Transport chunking
+    /// (`STREAM_PCM_CHUNK_BYTES`) and outbound backpressure are enforced
+    /// uniformly by the voice forwarder for all providers (streaming & fallback).
     async fn synthesize_streaming(
         &self,
         text: &str,
         on_pcm: &tokio::sync::mpsc::UnboundedSender<TtsPiece>,
     ) -> Result<TtsAudio, SpeechError> {
         let audio = self.synthesize(text).await?;
-        // Strip the 44-byte WAV header the whole-path builds: pieces are
-        // bare PCM at the declared rate.
-        let pcm = audio
-            .wav
-            .get(44..)
-            .map(|s| s.to_vec())
-            .unwrap_or_else(|| audio.wav.clone());
-        let _ = on_pcm.send(TtsPiece {
-            sample_rate: audio.sample_rate,
-            pcm,
-        });
+        let (sample_rate, channels, pcm) = wav_pcm(&audio.wav).ok_or_else(|| {
+            SpeechError::Protocol("TTS WAV has no parseable PCM16 data chunk".into())
+        })?;
+        let mono = downmix_pcm16_to_mono(pcm, channels)?;
+        on_pcm
+            .send(TtsPiece {
+                sample_rate,
+                pcm: mono.into_owned(),
+            })
+            .map_err(|_| SpeechError::Protocol("TTS stream consumer closed".into()))?;
         Ok(audio)
     }
     fn provider(&self) -> &str;
@@ -146,6 +153,10 @@ pub fn wav_format(wav: &[u8]) -> Option<(u32, u16)> {
 }
 
 /// Extract `(sample_rate, channels, pcm_s16le_bytes)` from a RIFF/WAVE payload.
+/// Strictly validates linear PCM (`audio_format == 1`), 16-bit sample width
+/// (`bits_per_sample == 16`), non-zero sample rate/channels, and whole-frame
+/// alignment so non-PCM16 payloads (e.g. IEEE float or 24-bit WAV) or RIFF
+/// metadata chunks (`JUNK`/`LIST`) can never leak into raw PCM16 playback.
 pub fn wav_pcm(wav: &[u8]) -> Option<(u32, u16, &[u8])> {
     if wav.len() < 12 || &wav[0..4] != b"RIFF" || &wav[8..12] != b"WAVE" {
         return None;
@@ -158,8 +169,9 @@ pub fn wav_pcm(wav: &[u8]) -> Option<(u32, u16, &[u8])> {
         let size =
             u32::from_le_bytes([wav[pos + 4], wav[pos + 5], wav[pos + 6], wav[pos + 7]]) as usize;
         let start = pos + 8;
-        let end = (start + size).min(wav.len());
-        if id == b"fmt " && start + 8 <= end {
+        let end = start.checked_add(size)?.min(wav.len());
+        if id == b"fmt " && start + 16 <= end {
+            let audio_format = u16::from_le_bytes([wav[start], wav[start + 1]]);
             let channels = u16::from_le_bytes([wav[start + 2], wav[start + 3]]);
             let sample_rate = u32::from_le_bytes([
                 wav[start + 4],
@@ -167,25 +179,63 @@ pub fn wav_pcm(wav: &[u8]) -> Option<(u32, u16, &[u8])> {
                 wav[start + 6],
                 wav[start + 7],
             ]);
+            let bits_per_sample = u16::from_le_bytes([wav[start + 14], wav[start + 15]]);
+            if audio_format != 1 || bits_per_sample != 16 || sample_rate == 0 || channels == 0 {
+                return None;
+            }
             fmt = Some((sample_rate, channels));
         } else if id == b"data" {
             data = Some(&wav[start..end]);
         }
-        pos = start + size + (size & 1);
+        pos = start.checked_add(size)?.checked_add(size & 1)?;
     }
     let (sr, ch) = fmt?;
     let pcm = data?;
+    let frame_bytes = usize::from(ch).checked_mul(2)?;
+    if frame_bytes == 0 || pcm.len() % frame_bytes != 0 {
+        return None;
+    }
     Some((sr, ch, pcm))
 }
 
-pub fn wav_duration_ms(wav_len: usize, sample_rate: u32, channels: u16) -> u64 {
-    let data = wav_len.saturating_sub(44);
+/// Downmix interleaved S16LE PCM to mono (`channels == 1` returns a zero-copy borrow).
+pub fn downmix_pcm16_to_mono(
+    pcm: &[u8],
+    channels: u16,
+) -> Result<std::borrow::Cow<'_, [u8]>, SpeechError> {
+    let frame_bytes = usize::from(channels) * 2;
+    if frame_bytes == 0 || pcm.len() % frame_bytes != 0 {
+        return Err(SpeechError::Protocol(
+            "PCM16 payload has invalid frame geometry".into(),
+        ));
+    }
+    if channels == 1 {
+        return Ok(std::borrow::Cow::Borrowed(pcm));
+    }
+    let ch = i64::from(channels);
+    let mut mono = Vec::with_capacity(pcm.len() / usize::from(channels));
+    for frame in pcm.chunks_exact(frame_bytes) {
+        let sum: i64 = frame
+            .chunks_exact(2)
+            .map(|s| i64::from(i16::from_le_bytes([s[0], s[1]])))
+            .sum();
+        mono.extend_from_slice(&((sum / ch) as i16).to_le_bytes());
+    }
+    Ok(std::borrow::Cow::Owned(mono))
+}
+
+/// Duration in milliseconds of a raw S16LE PCM byte buffer.
+pub fn pcm_duration_ms(pcm_bytes: usize, sample_rate: u32, channels: u16) -> u64 {
     let byte_rate = sample_rate as u64 * channels as u64 * 2;
     if byte_rate == 0 {
         0
     } else {
-        data as u64 * 1000 / byte_rate
+        pcm_bytes as u64 * 1000 / byte_rate
     }
+}
+
+pub fn wav_duration_ms(wav_len: usize, sample_rate: u32, channels: u16) -> u64 {
+    pcm_duration_ms(wav_len.saturating_sub(44), sample_rate, channels)
 }
 
 /// Scale the PCM inside a WAV by `db` (0 = unchanged, negative = quieter).
@@ -387,7 +437,7 @@ impl TtsClient for VolcanoTts {
             return Err(SpeechError::Protocol("no audio frames returned".into()));
         }
         let wav = pcm_to_wav(&pcm, self.sample_rate, 1);
-        let duration_ms = wav_duration_ms(wav.len(), self.sample_rate, 1);
+        let duration_ms = pcm_duration_ms(pcm.len(), self.sample_rate, 1);
         Ok(TtsAudio {
             duration_ms,
             wav,
@@ -458,10 +508,12 @@ impl TtsClient for OmniTts {
         if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
             return Err(SpeechError::Protocol("endpoint did not return WAV".into()));
         }
-        // Walk chunks to fmt — a leading LIST chunk would break fixed offsets.
-        let (sample_rate, channels) = wav_format(&bytes)
-            .ok_or_else(|| SpeechError::Protocol("WAV without a parseable fmt chunk".into()))?;
-        let duration_ms = wav_duration_ms(bytes.len(), sample_rate, channels);
+        // Walk RIFF chunks and validate PCM16 format + exact data chunk length
+        // so leading/trailing JUNK/LIST chunks never distort duration or samples.
+        let (sample_rate, channels, pcm) = wav_pcm(&bytes).ok_or_else(|| {
+            SpeechError::Protocol("WAV without a parseable PCM16 fmt/data chunk".into())
+        })?;
+        let duration_ms = pcm_duration_ms(pcm.len(), sample_rate, channels);
         Ok(TtsAudio {
             wav: bytes.to_vec(),
             sample_rate,
@@ -687,6 +739,124 @@ pub fn asr_from_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FixtureTts(TtsAudio);
+
+    #[async_trait::async_trait]
+    impl TtsClient for FixtureTts {
+        async fn synthesize(&self, _text: &str) -> Result<TtsAudio, SpeechError> {
+            Ok(self.0.clone())
+        }
+        fn provider(&self) -> &str {
+            "fixture"
+        }
+    }
+
+    fn fixture_tts(pcm: &[u8], sample_rate: u32, channels: u16) -> FixtureTts {
+        FixtureTts(TtsAudio {
+            wav: pcm_to_wav(pcm, sample_rate, channels),
+            sample_rate,
+            channels,
+            duration_ms: pcm_duration_ms(pcm.len(), sample_rate, channels),
+            provider: "fixture".into(),
+            voice: "fixture".into(),
+        })
+    }
+
+    #[tokio::test]
+    async fn default_streaming_preserves_pcm_with_extra_and_trailing_riff_chunks() {
+        let pcm: Vec<u8> = (0..24_000i16).flat_map(i16::to_le_bytes).collect();
+        let mut wav = pcm_to_wav(&pcm, 24_000, 1);
+        // Leading JUNK chunk shifts `data` past byte 44; trailing LIST chunk follows `data`.
+        wav.splice(36..36, *b"JUNK\x04\x00\x00\x00meta");
+        wav.extend_from_slice(b"LIST\x04\x00\x00\x00tail");
+        let riff_len = (wav.len() - 8) as u32;
+        wav[4..8].copy_from_slice(&riff_len.to_le_bytes());
+
+        let (sr, ch, parsed) = wav_pcm(&wav).expect("valid PCM16 WAV with extra chunks");
+        assert_eq!((sr, ch), (24_000, 1));
+        assert_eq!(parsed, pcm.as_slice());
+        assert_eq!(pcm_duration_ms(parsed.len(), sr, ch), 1000);
+
+        let tts = FixtureTts(TtsAudio {
+            wav,
+            sample_rate: 24_000,
+            channels: 1,
+            duration_ms: 1000,
+            provider: "fixture".into(),
+            voice: "fixture".into(),
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let audio = tts.synthesize_streaming("fixture", &tx).await.unwrap();
+        let mut received = Vec::new();
+        while let Ok(piece) = rx.try_recv() {
+            assert_eq!(piece.sample_rate, 24_000);
+            received.extend(piece.pcm);
+        }
+        assert_eq!(
+            received, pcm,
+            "RIFF metadata must never become speech samples"
+        );
+        assert_eq!(audio.wav, tts.0.wav);
+    }
+
+    #[tokio::test]
+    async fn default_streaming_downmixes_stereo_without_changing_frame_count() {
+        let pcm: Vec<u8> = [1000i16, -1000, 3000, 1000, i16::MAX, i16::MAX]
+            .into_iter()
+            .flat_map(i16::to_le_bytes)
+            .collect();
+        let tts = fixture_tts(&pcm, 24_000, 2);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tts.synthesize_streaming("fixture", &tx).await.unwrap();
+        let piece = rx.try_recv().unwrap();
+        let expected: Vec<u8> = [0i16, 2000, i16::MAX]
+            .into_iter()
+            .flat_map(i16::to_le_bytes)
+            .collect();
+        assert_eq!(piece.pcm, expected);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn wav_pcm_and_default_streaming_reject_non_pcm16_invalid_geometry_and_closed_consumer() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut tts = fixture_tts(&[0, 1], 24_000, 1);
+        tts.0.wav = b"not a WAV file".to_vec();
+        assert!(tts.synthesize_streaming("fixture", &tx).await.is_err());
+        assert!(rx.try_recv().is_err());
+
+        // Reject IEEE float WAV (audio_format = 3, bits_per_sample = 32) and 24-bit PCM.
+        let mut float_wav = pcm_to_wav(&[0u8; 16], 24_000, 1);
+        float_wav[20..22].copy_from_slice(&3u16.to_le_bytes()); // WAVE_FORMAT_IEEE_FLOAT
+        float_wav[34..36].copy_from_slice(&32u16.to_le_bytes()); // 32-bit
+        assert!(
+            wav_pcm(&float_wav).is_none(),
+            "IEEE float WAV must not pass as PCM16"
+        );
+        let mut pcm24_wav = pcm_to_wav(&[0u8; 12], 24_000, 1);
+        pcm24_wav[34..36].copy_from_slice(&24u16.to_le_bytes());
+        assert!(
+            wav_pcm(&pcm24_wav).is_none(),
+            "24-bit WAV must not pass as PCM16"
+        );
+
+        for (pcm, rate, channels) in [
+            (&[1u8][..], 24_000, 1),
+            (&[0, 0][..], 0, 1),
+            (&[0, 0][..], 24_000, 0),
+        ] {
+            assert!(fixture_tts(pcm, rate, channels)
+                .synthesize_streaming("fixture", &tx)
+                .await
+                .is_err());
+        }
+        drop(rx);
+        assert!(fixture_tts(&[0, 0], 24_000, 1)
+            .synthesize_streaming("fixture", &tx)
+            .await
+            .is_err());
+    }
 
     #[test]
     fn pcm_to_wav_header_is_valid_riff() {

@@ -47,6 +47,7 @@ pub use config::{ConfigApplyRequest, ConfigValidateRequest};
 pub use frames::*;
 pub use negotiation::*;
 pub use northbound::{NorthboundFault, NorthboundFaultCode, NorthboundStatus};
+pub use outbound::PlayChunkPacedError;
 pub use stop::{StopOutcome, StopSubmission};
 
 /// Soft per-syscall coalescing ceiling for queued outbound NDJSON frames.
@@ -270,6 +271,10 @@ struct DeviceSlot {
     state_revision: Option<u64>,
     capability_fingerprint: Option<String>,
     config_blocks: HashMap<ConfigBlock, ConfigBlockState>,
+    /// Last gateway-confirmed active KWS bundle generation (`active_values.kws_generation`).
+    /// Retained across subsequent `Persisted`/`Failed`/`Superseded` KWS redeploys so
+    /// stale-keyword fencing never silently drops while a redeploy is failing or retrying.
+    active_kws_generation: Option<u64>,
     /// Persistent trust-tier reservations (survive `retire_connection`) so an
     /// unauthenticated `lan_gateway_exempt` peer can never hijack a loopback or
     /// authenticated gateway's `stable_id` during a reconnect window.
@@ -281,7 +286,25 @@ struct DeviceSlot {
     last_unauth_lan: bool,
 }
 
+pub(super) fn extract_active_kws_generation(b: &ConfigBlockState) -> Option<u64> {
+    if b.state != ConfigReceiptStatus::Active {
+        return None;
+    }
+    b.active_values
+        .as_ref()
+        .and_then(|v| v.get("kws_generation"))
+        .and_then(serde_json::Value::as_u64)
+        .filter(|generation| *generation > 0)
+}
+
 impl DeviceSlot {
+    fn active_kws_generation(&self) -> Option<u64> {
+        match self.config_blocks.get(&ConfigBlock::Kws) {
+            Some(b) if b.state == ConfigReceiptStatus::Active => extract_active_kws_generation(b),
+            _ => self.active_kws_generation,
+        }
+    }
+
     fn can_be_claimed_by(&self, new_is_loopback: bool, new_authenticated: bool) -> bool {
         if self.reserved_loopback && !new_is_loopback {
             return false;
@@ -1283,6 +1306,7 @@ impl DeviceHub {
                             state_revision: None,
                             capability_fingerprint: None,
                             config_blocks: HashMap::new(),
+                            active_kws_generation: None,
                             reserved_loopback: prev_reserved_loopback || is_loopback,
                             reserved_authenticated: prev_reserved_auth || authenticated,
                             last_unauth_lan: peer_addr.is_some() && !is_loopback && !authenticated,
@@ -2285,6 +2309,7 @@ impl DeviceHub {
                             state_revision: None,
                             capability_fingerprint: None,
                             config_blocks: HashMap::new(),
+                            active_kws_generation: None,
                             reserved_loopback: new_loopback,
                             reserved_authenticated: new_auth,
                             last_unauth_lan: new_unauth_lan,
@@ -2374,14 +2399,15 @@ impl DeviceHub {
                     return;
                 }
                 if let Some(kw_gen) = kws_generation {
+                    // Config transactions (`block_generation`) and KWS bundles
+                    // (`active_values.kws_generation`) have independent counters.
+                    // Compare `Keyword.kws_generation` only against the active
+                    // KWS bundle generation reported by the gateway (preserving
+                    // the last active bundle fence across failed/pending redeploys).
                     let active_kws_gen = st
                         .devices
                         .get(&device)
-                        .and_then(|d| d.config_blocks.get(&ConfigBlock::Kws))
-                        .filter(|b| {
-                            b.state == ConfigReceiptStatus::Active && b.block_generation > 0
-                        })
-                        .map(|b| b.block_generation);
+                        .and_then(DeviceSlot::active_kws_generation);
                     if let Some(active_gen) = active_kws_gen {
                         if kw_gen < active_gen {
                             st.record(
