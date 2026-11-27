@@ -100,7 +100,24 @@ done
 [ -n "$SERIAL" ] || { echo "hm-provision: --serial is required (emOS has no adbd; the USB console is the only channel)" >&2; exit 2; }
 
 HERE=$(cd "$(dirname "$0")/.." && pwd)
-SERIAL_TOOL="$HERE/../home-mate-device-gateway-b/tools/serial_cmd.py"
+resolve_serial_tool() {
+    if [ -n "${HM_GATEWAY_DIR:-}" ] && [ -f "$HM_GATEWAY_DIR/tools/serial_cmd.py" ]; then
+        printf '%s\n' "$HM_GATEWAY_DIR/tools/serial_cmd.py"
+        return 0
+    fi
+    for cand in \
+        "$HERE/tools/serial_cmd.py" \
+        "$HERE/../home-mate-gateway-linux/tools/serial_cmd.py" \
+        "$HERE/../home-mate-device-gateway-b/tools/serial_cmd.py"; do
+        if [ -f "$cand" ]; then
+            printf '%s\n' "$cand"
+            return 0
+        fi
+    done
+    # Fallback default (will be checked cleanly before first device call)
+    printf '%s\n' "$HERE/../home-mate-gateway-linux/tools/serial_cmd.py"
+}
+SERIAL_TOOL=$(resolve_serial_tool)
 if [ -z "$TOKEN_FILE" ] && [ -f "$HOME/.home-mate/$DEVICE_ID.token" ]; then
     TOKEN_FILE="$HOME/.home-mate/$DEVICE_ID.token"
 fi

@@ -33,8 +33,8 @@ cargo build -p hm-release
 
 ```sh
 tools/build_core.sh        # target/aarch64-unknown-linux-musl/release/hm-core
-sh ../home-mate-device-gateway-b/tools/build_firmware.sh
-   # ../home-mate-device-gateway-b/target/armv7-unknown-linux-musleabihf/release/home-mate-device-gateway
+sh ../home-mate-gateway-linux/tools/build_firmware.sh
+   # ../home-mate-gateway-linux/target/armv7-unknown-linux-musleabihf/release/home-mate-device-gateway
 (cd web && npm run build) # web/dist (console)
 ```
 
@@ -46,7 +46,7 @@ VER=2026.11.14-1
 REL=build/release-$VER
 mkdir -p "$REL/components/model"
 cp target/aarch64-unknown-linux-musl/release/hm-core          "$REL/components/core-aarch64"
-cp ../home-mate-device-gateway-b/target/armv7-unknown-linux-musleabihf/release/home-mate-device-gateway \
+cp ../home-mate-gateway-linux/target/armv7-unknown-linux-musleabihf/release/home-mate-device-gateway \
    "$REL/components/firmware-armv7"
 cp -a web/dist "$REL/components/web"
 cp /path/to/silero_vad.onnx "$REL/components/model/silero_vad.onnx"   # the 643,854 B 16 kHz export

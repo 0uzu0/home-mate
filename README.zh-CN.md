@@ -56,15 +56,43 @@
 
 > **旧仓迁移提示**：原独立维护的 `home-mate-gateway-dot2` 与 `home-mate-gateway-lx06` 现已合并至统一的 **[yes999zc/home-mate-gateway-linux](https://github.com/yes999zc/home-mate-gateway-linux)**，后续所有新特性与修复均在统一仓发布。
 
+### 从零到开口对话：设备选型与部署思维导图（新手从这里看！）
+
+设备与模式比较多？顺着下面这张决策导图找到你手里的设备，直接看对应前提、流程与 AI 提示词：
+
+```mermaid
+flowchart TD
+    Root["第 0 步：你手里是什么设备？"]
+
+    Root --> Dot2["① Amazon Echo Dot 2 (RS03QR / AEOBC)<br/>100% 音箱本机独立运行 · 无需 NAS"]
+    Root --> LX06["② 小米小爱音箱 Pro (LX06)<br/>零变砖方案 A · 按内存自动分流"]
+    Root --> Android["③ Android 全系（带屏音箱 / 86 墙面屏 / 平板 / 废旧手机 / 斐讯 R1）<br/>零硬件刷机 · 3 分钟上手"]
+
+    Dot2 --> D0["前提 1：用 yes999zc/firebreak 解锁 Bootrom 并备份原厂 p10"]
+    D0 --> D1["前提 2：从上游 wilbowes/EchoMuse (emos/) 刷入 emOS 底座 + 串口 em-wifi 联网"]
+    D1 --> D2["构建：编译 core/gateway/自签 hm-release → 打出 release.tar 与 bootstrap 种子包"]
+    D2 --> D3["部署：./tools/hm-provision.sh (--dry-run → 正式激活) → :8930 配对<br/>👉 走轨道 B &amp; Dot 2 端到端 AI 提示词"]
+
+    LX06 --> L0["前提：open-xiaoai 开 Root SSH → 查 MemTotal"]
+    L0 -->|"≥ 180,000 kB (256 MB)"| L256["本机满血双唤醒（无需 NAS）<br/>👉 轨道 A1 &amp; LX06 AI 提示词"]
+    L0 -->|"< 180,000 kB (128 MB)"| L128{"家里有常开 NAS / 电脑吗？"}
+    L128 -->|"有（推荐 · 享 Silero VAD）"| LThin["轨道 C 全量 Docker Core + v0.0.54 免编译 --thin<br/>👉 轨道 A2 &amp; LX06 AI 提示词"]
+    L128 -->|"无（单机尝鲜 · 能量 VAD）"| LAsr["v0.0.54 免编译 --standalone-asr（免本地 KWS）<br/>👉 轨道 A3 &amp; LX06 AI 提示词"]
+
+    Android --> A1["前提：轨道 C 在 NAS/电脑跑全量 Docker Core（或连已有音箱 Core 做管理）"]
+    A1 --> A2["安装 v2.3.16 签名 APK（64位手机 full-arm64 / 32位86屏·R1 universal / 遥控 slim）"]
+    A2 --> A3["UDP :8933 一键发现配对 → 立即开口<br/>👉 轨道 C (Docker) + 轨道 D (Android)"]
+```
+
 ### 我该选择哪种部署组合？（速查表）
 
-| 你手头的设备 | 推荐架构组合 | 是否需要常开 NAS / 服务器？ |
-| :--- | :--- | :--- |
-| **小米小爱 Pro (`LX06`, 256 MB 内存版)** | 音箱本体 `hm-core --slim` + `hm-gateway` + `hm-kws`（免刷机双系统） | **不需要**（100% 音箱本体运行） |
-| **小米小爱 Pro (`LX06`, 128 MB · 有 NAS 推荐)** | 音箱自动启用 **瘦网关**（`~4 MiB` RAM） → 连接 **NAS / 服务器全量 Docker `hm-core`**（带 Silero VAD） | **需要**（主脑部署在 NAS 或服务器） |
-| **小米小爱 Pro (`LX06`, 128 MB · 无 NAS 尝鲜)** | 音箱本机 **纯 ASR 模式**（`--standalone-asr`：`hm-core --slim` + `hm-gateway`，跳过本地 KWS，能量 VAD + 云端 ASR 唤醒） | **不需要**（单机独立运行） |
-| **亚马逊 Echo Dot 2 (`RS03QR`)** | 音箱本体全量 `hm-core` + `hm-gateway` + `hm-kws`（7 麦 + 160ms AEC） | **不需要**（100% 音箱本体运行） |
-| **安卓带屏音箱 / 86 墙面屏 / 平板 / 闲置旧安卓手机** | **NAS / 电脑全量 Docker `hm-core`** + 安装 **Android 通用 APK**（零刷机 3 分钟体验！） | **需要**（也可直接以管理模式连接已有音箱 Core） |
+| 你手头的设备 | 前置条件 | 推荐架构组合 | 是否需要常开 NAS / 服务器？ | 直达教程 |
+| :--- | :--- | :--- | :--- | :--- |
+| **亚马逊 Echo Dot 2 (`RS03QR` / `AEOBC`)** | `firebreak` 解锁（备 `p10`）+ 上游 **EchoMuse `emOS`** + `em-wifi` | 音箱本体全量 `hm-core` + `hm-gateway` + `hm-kws`（7 麦 + 160ms AEC + 12 颗灯环） | **不需要**（100% 音箱本体运行） | [轨道 B (Dot 2)](#轨道-b亚马逊-echo-dot-2-rs03qr--aeobc--从原厂到开口对话完整指南) |
+| **小米小爱 Pro (`LX06`, 256 MB 内存版)** | `open-xiaoai` 开 Root SSH，`MemTotal ≥ 180,000 kB` | 音箱本体 `hm-core --slim` + `hm-gateway` + `hm-kws`（免刷机双系统） | **不需要**（100% 音箱本体运行） | [轨道 A (LX06)](#轨道-a小米小爱音箱-pro-lx06--256-mb--128-mb-自适应免刷机部署) |
+| **小米小爱 Pro (`LX06`, 128 MB · 有 NAS 推荐)** | `open-xiaoai` 开 Root SSH + 局域网 NAS 全量 Docker Core | 音箱装免编译 **瘦网关**（`--thin`，`~4 MiB` RAM）→ **NAS 全量 Docker `hm-core`**（Silero VAD） | **需要** | [轨道 A](#轨道-a小米小爱音箱-pro-lx06--256-mb--128-mb-自适应免刷机部署) + [轨道 C](#轨道-cnas--服务器全量-docker-部署128-mb-lx06-与全屋安卓终端中枢) |
+| **小米小爱 Pro (`LX06`, 128 MB · 无 NAS 尝鲜)** | `open-xiaoai` 开 Root SSH，`/data ≥ 5.5 MiB` | 音箱装免编译 **纯 ASR 模式**（`--standalone-asr`：`hm-core --slim` + `hm-gateway`，免 KWS） | **不需要**（单机独立运行） | [轨道 A (LX06)](#轨道-a小米小爱音箱-pro-lx06--256-mb--128-mb-自适应免刷机部署) |
+| **安卓带屏音箱 / 86 屏 / 平板 / 废旧手机 / 斐讯 R1** | Android 5–16（零硬件刷机！） | **NAS / 电脑全量 Docker `hm-core`** + **Android 通用 APK**（`v2.3.16`） | **需要** *(或仅管理模式连音箱 Core)* | [轨道 C](#轨道-cnas--服务器全量-docker-部署128-mb-lx06-与全屋安卓终端中枢) + [轨道 D](#轨道-dandroid-通用终端带屏音箱--86-墙面屏--平板--废旧安卓手机) |
 
 ---
 
@@ -217,37 +245,100 @@ done && chmod +x build/lx06/init.sh build/lx06/unxz
 
 ---
 
-### 轨道 B：亚马逊 Echo Dot 2 (`RS03QR`) — 一键配网脚本 (`tools/hm-provision.sh`)
+### 轨道 B：亚马逊 Echo Dot 2 (`RS03QR` / `AEOBC`) — 从原厂到开口对话完整指南
 
-#### 前置条件
-1. **已通过 `firebreak / amonet` 解锁 Bootrom**（[yes999zc/firebreak](https://github.com/yes999zc/firebreak)）并留存原厂 `p10` 备份。
-2. **已刷入 `emOS` 底座并连上 Wi-Fi**（USB 串口返回 `ID=emos`）。
+#### 前置三步（`emOS` 到底从哪里来？）
+Home Mate 在 Echo Dot 2 上 **100% 本机独立运行**，底层依托的是上游开源项目 **[`wilbowes/EchoMuse`](https://github.com/wilbowes/EchoMuse)** 打造的 **`emOS`** 轻量 Linux 系统层——它完整保留了 Dot 2 原厂的 MediaTek 3.18 内核与 7 麦/3.5mm 音频驱动，同时彻底剥离了臃肿的亚马逊 FireOS/Android 用户态。
 
-#### 手工运行
+1. **步骤 0 — 通过 `firebreak` (`amonet`) 解锁 Bootrom**：
+   - **切记：原厂未解锁的 Echo Dot 2 解锁前切勿在 Alexa App 里联网升级高版本固件！**
+   - 用 Micro-USB 数据线连接电脑，按 **[`yes999zc/firebreak`](https://github.com/yes999zc/firebreak)** 执行 `uvx firebreak@latest` 完成一次性 Bootrom 解锁，并**妥善留存备份下来的原厂 `p10` 分区镜像**。
+2. **步骤 1 — 从上游 `wilbowes/EchoMuse` 刷入 `emOS` 音频底座**：
+   - 克隆上游 **[`wilbowes/EchoMuse`](https://github.com/wilbowes/EchoMuse)**，按照仓库里 **[`emos/`](https://github.com/wilbowes/EchoMuse/tree/main/emos)** 目录及 `SETUP.md` 的向导（`emos-v0.10+`），用你这台音箱自己的原厂内核/DTB 打包并刷入 **`emOS`**。*（`emOS` 并非单行道，在串口执行 `/init recovery` 随时可退回 TWRP。）*
+3. **步骤 2 — USB 串口执行 `em-wifi` 连上家庭 Wi-Fi**：
+   - 用 Micro-USB 线连上电脑，打开串口控制台（macOS 为 `/dev/cu.usbmodem*`，Linux 为 `/dev/ttyACM*`），确认 `cat /etc/os-release` 返回 `ID=emos`，执行 **`em-wifi`** 选好家里 Wi-Fi 并记下分配到的局域网 IP。
+
+#### 步骤 3 — 首次构建、生成自签名 Release 包与 Bootstrap 种子包
+将两个仓库克隆到**平级目录**（`hm-provision.sh` 与 `build_bootstrap.py` 会自动探测同级的 `../home-mate-gateway-linux`）：
+```bash
+git clone https://github.com/yes999zc/home-mate.git
+git clone https://github.com/yes999zc/home-mate-gateway-linux.git
+cd home-mate
+
+# 1. 生成你自己的 Ed25519 签名密钥对（存于 Git 之外），并将你的公钥编入 hm-release：
+cargo build -p hm-release
+./target/debug/hm-release keygen --out ~/.home-mate/signing/release-signing-key.hex
+./target/debug/hm-release pubkey --key ~/.home-mate/signing/release-signing-key.hex > deploy/release/release-pubkey.hex
+./tools/build_release.sh             # 编译内置你公钥的 aarch64 静态 hm-release
+cargo build -p hm-release            # 同步更新宿主机验签工具
+
+# 2. 编译全量 hm-core (aarch64)、Vue 3 控制台与 Dot 2 网关 (armv7，切勿直接手打裸 cargo zigbuild！)：
+./tools/build_core.sh
+(cd web && npm install && npm run build)
+(cd ../home-mate-gateway-linux && ./tools/build_firmware.sh)
+
+# 3. 组装并签名 home-mate-release.tar（完整细则见 deploy/release/README.md）：
+VER=$(date +%Y.%m.%d)-1
+REL="build/release-$VER"
+mkdir -p "$REL/components/model"
+cp target/aarch64-unknown-linux-musl/release/hm-core "$REL/components/core-aarch64"
+cp ../home-mate-gateway-linux/target/armv7-unknown-linux-musleabihf/release/home-mate-device-gateway "$REL/components/firmware-armv7"
+cp -a web/dist "$REL/components/web"
+# 先从 https://github.com/snakers4/silero-vad 下载 Silero VAD v4 16 kHz ONNX：
+cp /path/to/silero_vad.onnx "$REL/components/model/silero_vad.onnx"
+./target/debug/hm-release pack --dir "$REL" --out "build/release/home-mate-release-$VER" \
+  --serial 1 --version "$VER" --key ~/.home-mate/signing/release-signing-key.hex \
+  --model AEOBC --profile dot2d-emos --firmware-min 0.0.44 --firmware-max 0.0.99
+
+# 4. 生成单机 bootstrap 种子包（需准备好 ~/.home-mate/kws-build/bundle 下的 Sherpa-ONNX KWS 侧车；
+#    家里第一台全新 Dot 2 尚未配 TTS 时，附加 --allow-empty-wake-acks）：
+python3 tools/build_bootstrap.py \
+  --device-id dot2-living \
+  --release "build/release/home-mate-release-$VER.tar" \
+  --allow-empty-wake-acks
+```
+
+#### 步骤 4 — 一键串口刷入与激活（`tools/hm-provision.sh`）
 ```bash
 # 1. 只读预检（不写入设备任何字节）：
 ./tools/hm-provision.sh --device-id dot2-living \
-  --seed build/bootstrap/home-mate-bootstrap-dot2-living.tar.gz \
-  --release build/release/home-mate-release.tar \
+  --seed "build/bootstrap/home-mate-bootstrap-dot2-living-$VER.tar.gz" \
+  --release "build/release/home-mate-release-$VER.tar" \
   --serial /dev/cu.usbmodem8401 --ip 192.168.1.73 \
   --wake-word 你好小智 --dry-run
 
-# 2. 去掉 --dry-run 正式执行安装、Ed25519 签名激活（8/8 健康自检）与令牌配对：
+# 2. 去掉 --dry-run 正式执行安装、Ed25519 签名激活（健康自检）与令牌配对：
 ./tools/hm-provision.sh --device-id dot2-living \
-  --seed build/bootstrap/home-mate-bootstrap-dot2-living.tar.gz \
-  --release build/release/home-mate-release.tar \
+  --seed "build/bootstrap/home-mate-bootstrap-dot2-living-$VER.tar.gz" \
+  --release "build/release/home-mate-release-$VER.tar" \
   --serial /dev/cu.usbmodem8401 --ip 192.168.1.73 \
   --wake-word 你好小智
 ```
+*（完成后打开 `http://<Dot2_IP>:8930` 填入 LLM / ASR / TTS 与 Home Assistant，`hm-core` 会在保存 TTS 后自动合成唤醒应答音；多台 Dot 2 声学参数请单台独立标定，切勿跨机复制。）*
 
-#### 让 AI 编程助手代你刷入与配网 Echo Dot 2
+#### 让 AI 编程助手端到端代你完成 Echo Dot 2 部署（从原厂解锁 / emOS 到开口对话）
 ```text
-我有一台已通过 firebreak (amonet) 解锁并刷好 emOS 且连上 Wi-Fi 的亚马逊 Echo Dot 2：
-- USB 串口：/dev/cu.usbmodem8401（或自动检测 `ls /dev/cu.usbmodem* /dev/ttyACM*`）
-- 音箱局域网 IP：192.168.1.73
-- （可选）参考节点 IP：192.168.1.50
+请帮我将 Home Mate 部署到我的亚马逊 Echo Dot 2（第二代，型号 RS03QR / AEOBC）：
+【请先替换下方示例信息为你的实际情况】
+- 当前音箱状态：<原厂未解锁 / 已用 firebreak 解锁 / 已刷好 emOS 并联网>
+- USB 串口设备：/dev/cu.usbmodem8401（或让 AI 执行 `ls /dev/cu.usbmodem* /dev/ttyACM*` 自动查找）
+- 音箱局域网 IP：192.168.1.73（emOS 执行 em-wifi 后获得的 IP）
+- 期望节点 ID 与唤醒词：dot2-living / 你好小智（可按需改为任意中/英文唤醒词）
+- （可选）家里已配好的参考节点 IP：无
 
-请在 `yes999zc/home-mate` 下（如需重编网关固件请在 `yes999zc/home-mate-gateway-linux` 使用 `./tools/build_firmware.sh`，切勿直接跑裸 `cargo zigbuild`），先加 `--dry-run` 预检 `./tools/hm-provision.sh`（节点 ID 设为 `dot2-living`，唤醒词 `你好小智`），确认无误后再正式激活、验证 8/8 健康自检，并将令牌保存至 `~/.home-mate/dot2-living.token`（chmod 600）。
+请严格按以下全流程安全执行：
+1. 前置检查（需人工交互确认，严禁未经我允许自动刷写 p10）：
+   - 若尚未解锁：先引导我用 `https://github.com/yes999zc/firebreak`（`uvx firebreak@latest`）通过 Micro-USB 解锁 Bootrom，并妥善保存原厂 `p10` 备份。
+   - 若尚未刷入 emOS：引导我克隆上游 `https://github.com/wilbowes/EchoMuse`，按其 `emos/` 目录向导（`emos-v0.10+`）用本机内核刷入 emOS 底座，并在 USB 串口运行 `em-wifi` 联网，直到 `cat /etc/os-release` 返回 `ID=emos` 且拿到局域网 IP。
+2. 将 `https://github.com/yes999zc/home-mate.git` 与 `https://github.com/yes999zc/home-mate-gateway-linux.git` 克隆到平级目录（`hm-provision.sh` 与 `build_bootstrap.py` 会自动探测同级的 `../home-mate-gateway-linux`）。
+3. 构建与自签名打包（参考 `deploy/release/README.md`）：
+   - 在 Git 之外生成我自己的 Ed25519 密钥 `~/.home-mate/signing/release-signing-key.hex`（chmod 600），将公钥写入 `deploy/release/release-pubkey.hex` 后编译 `hm-release`（`./tools/build_release.sh` + `cargo build -p hm-release`）。
+   - 编译全量 `hm-core`（`./tools/build_core.sh`）、前端 `web/dist`，以及在 `home-mate-gateway-linux` 里用 `./tools/build_firmware.sh` 编译 Dot 2 网关（严禁直接跑裸 `cargo zigbuild`！）。
+   - 用 `hm-release pack` 打出签名 `home-mate-release.tar`，准备好 `~/.home-mate/kws-build/bundle` 侧车包后，运行 `python3 tools/build_bootstrap.py --device-id dot2-living --release <tar> --allow-empty-wake-acks` 生成种子包。
+4. 串口安全部署：
+   - 先加 `--dry-run` 预检 `./tools/hm-provision.sh`，向我展示串口 `ID=emos`、`/data/emos/sockets` 与将要执行的操作。
+   - 经我确认后去掉 `--dry-run` 正式刷入激活，验证健康自检、将令牌保存至 `~/.home-mate/dot2-living.token`（chmod 600），并确认 `http://<音箱IP>:8930` 返回 HTTP 200。
+5. 严禁将任何真实 IP、Token 或签名私钥提交到 Git；切勿跨机复制其他 Dot 2 的声学标定参数。
 ```
 
 ---

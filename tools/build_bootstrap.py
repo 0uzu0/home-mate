@@ -52,7 +52,22 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-DEFAULT_GW = REPO.parent / "home-mate-device-gateway-b"
+
+
+def resolve_gateway_dir(explicit: str | None = None) -> Path:
+    """Resolve the companion Linux gateway repo (public first, then private dev fallback)."""
+    if explicit:
+        return Path(explicit)
+    env_dir = os.environ.get("HM_GATEWAY_DIR", "").strip()
+    if env_dir:
+        return Path(env_dir)
+    for name in ("home-mate-gateway-linux", "home-mate-device-gateway-b"):
+        cand = REPO.parent / name
+        if cand.is_dir():
+            return cand
+    return REPO.parent / "home-mate-gateway-linux"
+
+
 DEFAULT_KWS = Path.home() / ".home-mate" / "kws-build" / "bundle"
 DEFAULT_INSTALLER = REPO / "target/aarch64-unknown-linux-musl/release/hm-release"
 REFERENCE_DEVICE = "dot2-d"  # the node this repo was developed on; ids must differ
@@ -129,13 +144,19 @@ def stage_tree(seed: Path, args, release_components: Path, manifest: dict) -> di
     # tone with the spoken cue, and v0.25 turned it off by default.
     assets = Path(args.assets_dir)
     ack_src = assets / "wake-acks"
-    if not (ack_src / "manifest.json").is_file():
-        die(
-            f"wake-ack assets not found at {ack_src} (set --assets-dir).\n"
-            "  They are pre-synthesized on a configured node and are not in git;\n"
-            "  a seed without them installs a node that stays silent at the wake word."
+    if (ack_src / "manifest.json").is_file():
+        shutil.copytree(ack_src, seed / "hm/data/assets/wake-acks")
+    elif getattr(args, "allow_empty_wake_acks", False):
+        print(
+            f"note: wake-ack assets absent at {ack_src}; continuing (--allow-empty-wake-acks). "
+            "Configure TTS in http://<node-ip>:8930/services after first boot to synthesize wake acks."
         )
-    shutil.copytree(ack_src, seed / "hm/data/assets/wake-acks")
+    else:
+        die(
+            f"wake-ack assets not found at {ack_src} (set --assets-dir, or pass --allow-empty-wake-acks "
+            "for a brand-new household's first Dot 2 before TTS is configured).\n"
+            "  They are pre-synthesized on a configured node and are not in git."
+        )
 
     # KWS bundle minus kw.txt: the word list is this node's config, pushed by
     # the core. Also rewrite the sidecar's --name so logs name the right node.
@@ -217,9 +238,19 @@ def main() -> int:
         help="dir holding wake-acks/ (pre-synthesized acks; not in git)",
     )
     ap.add_argument(
+        "--allow-empty-wake-acks",
+        action="store_true",
+        help="allow building a first-node seed without pre-synthesized wake-acks/ (TTS will generate them after setup)",
+    )
+    ap.add_argument(
+        "--gateway-dir",
+        default=None,
+        help="path to companion home-mate-gateway-linux checkout (overrides HM_GATEWAY_DIR / sibling auto-detect)",
+    )
+    ap.add_argument(
         "--supervisor",
-        default=str(DEFAULT_GW / "deploy/dot2d/emos/start_server.sh"),
-        help="start_server.sh (the script emOS init execs)",
+        default=None,
+        help="start_server.sh (defaults to <gateway-dir>/deploy/dot2d/emos/start_server.sh)",
     )
     ap.add_argument(
         "--core-supervisor",
@@ -229,6 +260,8 @@ def main() -> int:
     ap.add_argument("--out", help="output tar.gz (default build/bootstrap/<id>-<release>.tar.gz)")
     ap.add_argument("--json", action="store_true", help="print SEED.json to stdout too")
     args = ap.parse_args()
+    if not args.supervisor:
+        args.supervisor = str(resolve_gateway_dir(args.gateway_dir) / "deploy/dot2d/emos/start_server.sh")
 
     if not args.device_id or not all(c.islower() or c.isdigit() or c == "-" for c in args.device_id):
         die("device id must be lowercase letters/digits/dash")

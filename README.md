@@ -56,15 +56,43 @@ We have consolidated and opened the complete **3-repository Home Mate ecosystem*
 
 > **Migration Note**: Legacy single-board repositories (`home-mate-gateway-dot2` and `home-mate-gateway-lx06`) have been unified into **[yes999zc/home-mate-gateway-linux](https://github.com/yes999zc/home-mate-gateway-linux)**. All new deployments and AI agent scripts should target `home-mate-gateway-linux`.
 
-### Which Combination Should I Choose?
+### Zero-to-Talking Device Decision Map (Start Here!)
 
-| What Hardware You Have | Recommended Topology | External NAS/Server Needed? |
-| :--- | :--- | :--- |
-| **Xiaomi LX06 (256 MB RAM)** | On-speaker `hm-core --slim` + `hm-gateway` + `hm-kws` (Scheme A dual-wake with stock XiaoAi) | **No** (100% on-speaker) |
-| **Xiaomi LX06 (128 MB · w/ NAS Recommended)** | Auto-detected **Thin Gateway** (`~4 MiB` RAM) on speaker → **Full Docker `hm-core`** on NAS/Server (with Silero VAD) | **Yes** (Full Docker `hm-core` on NAS/server) |
-| **Xiaomi LX06 (128 MB · No-NAS Trial)** | On-speaker **Standalone Pure-ASR** (`--standalone-asr`: `hm-core --slim` + `hm-gateway`, skips local KWS; energy VAD + cloud ASR wake) | **No** (100% on-speaker) |
-| **Amazon Echo Dot 2 (`RS03QR`)** | On-speaker Full `hm-core` + `hm-gateway` + `hm-kws` (7-mic + 160ms AEC + 12-LED ring) | **No** (100% on-speaker) |
-| **Android Smart Display / 86 Wall Panel / Tablet / Old Android Phone** | **Full Docker `hm-core`** on NAS/Mac/PC + **Android Universal APK** (zero hardware flashing!) | **Yes** (or connect to an existing speaker Core in Manage-Only mode) |
+Not sure which track, prerequisite, or AI prompt to use? Follow your device branch from top to bottom:
+
+```mermaid
+flowchart TD
+    Root["Step 0: Which Hardware Do You Have?"]
+
+    Root --> Dot2["1. Amazon Echo Dot 2 (RS03QR / AEOBC)<br/>100% On-Speaker · No NAS Needed"]
+    Root --> LX06["2. Xiaomi AI Speaker Pro (LX06)<br/>Zero-Flash Scheme A · Adaptive by RAM"]
+    Root --> Android["3. Android Series (Display / 86 Panel / Tablet / Phone / Phicomm R1)<br/>Zero Hardware Flashing · 3-Min Setup"]
+
+    Dot2 --> D0["Prereq 1: Unlock Bootrom via yes999zc/firebreak (backup stock p10)"]
+    D0 --> D1["Prereq 2: Flash upstream emOS from wilbowes/EchoMuse (emos/) + run em-wifi"]
+    D1 --> D2["Build: core + dot2 gateway + your Ed25519 key -> hm-release pack + build_bootstrap.py"]
+    D2 --> D3["Provision: ./tools/hm-provision.sh (--dry-run -> live) -> http://&lt;IP&gt;:8930<br/>👉 Use Track B &amp; Dot 2 AI Prompt"]
+
+    LX06 --> L0["Prereq: Root SSH via open-xiaoai -> check MemTotal"]
+    L0 -->|"≥ 180,000 kB (256 MB)"| L256["On-Speaker Dual-Wake (No NAS)<br/>👉 Track A1 &amp; LX06 AI Prompt"]
+    L0 -->|"< 180,000 kB (128 MB)"| L128{"Have a LAN NAS / PC?"}
+    L128 -->|"Yes (Recommended)"| LThin["Track C NAS Full Docker Core + v0.0.54 Prebuilt --thin<br/>👉 Track A2 &amp; LX06 AI Prompt"]
+    L128 -->|"No (Trial)"| LAsr["v0.0.54 Prebuilt --standalone-asr (Energy VAD, No KWS)<br/>👉 Track A3 &amp; LX06 AI Prompt"]
+
+    Android --> A1["Prereq: Track C Full Docker Core on NAS/Mac/PC (or existing speaker Core)"]
+    A1 --> A2["Install v2.3.16 Signed APK (full-arm64 / universal / slim)"]
+    A2 --> A3["UDP :8933 Auto-Discover -> Pair Token -> Start Talking<br/>👉 Track C (Docker) + Track D (Android)"]
+```
+
+### Which Combination Should I Choose? (Quick Matrix)
+
+| What Hardware You Have | Prerequisites | Recommended Topology | External NAS/Server Needed? | Jump To |
+| :--- | :--- | :--- | :--- | :--- |
+| **Amazon Echo Dot 2 (`RS03QR` / `AEOBC`)** | `firebreak` unlock (`p10` backup) + upstream **EchoMuse `emOS`** + `em-wifi` | On-speaker Full `hm-core` + `hm-gateway` + `hm-kws` (7-mic + 160ms AEC + 12-LED ring) | **No** (100% on-speaker) | [Track B (Dot 2)](#track-b-amazon-echo-dot-2-rs03qr--aeobc--from-stock-to-talking) |
+| **Xiaomi LX06 (256 MB RAM)** | `open-xiaoai` Root SSH, `MemTotal ≥ 180,000 kB` | On-speaker `hm-core --slim` + `hm-gateway` + `hm-kws` (Scheme A dual-wake) | **No** (100% on-speaker) | [Track A (LX06)](#track-a-xiaomi-ai-speaker-pro-lx06--adaptive-256-mb--128-mb-deploy) |
+| **Xiaomi LX06 (128 MB · w/ NAS Recommended)** | `open-xiaoai` Root SSH + LAN NAS Full Docker Core | Prebuilt **Thin Gateway** (`--thin`, `~4 MiB` RAM) → **Full Docker `hm-core`** (Silero VAD) | **Yes** | [Track A](#track-a-xiaomi-ai-speaker-pro-lx06--adaptive-256-mb--128-mb-deploy) + [Track C](#track-c-nas--docker-full-core-multi-gateway-hub-for-128-mb-lx06--android) |
+| **Xiaomi LX06 (128 MB · No-NAS Trial)** | `open-xiaoai` Root SSH, `/data ≥ 5.5 MiB` | Prebuilt **Standalone Pure-ASR** (`--standalone-asr`: `hm-core --slim` + `hm-gateway`, no KWS) | **No** (100% on-speaker) | [Track A (LX06)](#track-a-xiaomi-ai-speaker-pro-lx06--adaptive-256-mb--128-mb-deploy) |
+| **Android Display / 86 Panel / Tablet / Phone / R1** | Android 5–16 (Zero hardware flashing!) | **Full Docker `hm-core`** on NAS/PC + **Android Universal APK** (`v2.3.16`) | **Yes** *(or Manage-Only on speaker Core)* | [Track C](#track-c-nas--docker-full-core-multi-gateway-hub-for-128-mb-lx06--android) + [Track D](#track-d-android-universal-terminal-smart-displays-86-panels-tablets--old-phones) |
 
 ---
 
@@ -218,37 +246,101 @@ Follow these strict rules:
 
 ---
 
-### Track B: Amazon Echo Dot 2 (`RS03QR`) — 1-Command Provisioning (`tools/hm-provision.sh`)
+### Track B: Amazon Echo Dot 2 (`RS03QR` / `AEOBC`) — From Stock to Talking
 
-#### Prerequisites
-1. **Bootrom Unlocked via `firebreak` (`amonet`)**: Unlock over Micro-USB using [yes999zc/firebreak](https://github.com/yes999zc/firebreak) (`uvx firebreak@latest`) with your stock `p10` partition backed up.
-2. **`emOS` Audio Base & Wi-Fi**: USB serial console (`/dev/cu.usbmodem*` or `/dev/ttyACM*`) responds with `ID=emos` and is connected to Wi-Fi via `em-wifi`.
+#### Step-by-Step Prerequisites (Where `emOS` Comes From)
+Home Mate runs **100% on-device** on top of **`emOS`** — a minimal Linux userspace originally created by the upstream **[`wilbowes/EchoMuse`](https://github.com/wilbowes/EchoMuse)** project that keeps your Dot 2's stock MediaTek 3.18 kernel and 7-mic/3.5mm audio hardware while removing Amazon's FireOS/Android userspace completely.
 
-#### Manual Commands
+1. **Step 0 — Unlock Bootrom via `firebreak` (`amonet`)**:
+   - **Do NOT update a brand-new/stock Dot 2 via the Alexa App before unlocking.**
+   - Connect your 2nd-Gen Echo Dot (`RS03QR` / `AEOBC`) over Micro-USB and unlock it using **[`yes999zc/firebreak`](https://github.com/yes999zc/firebreak)** (`uvx firebreak@latest`). **Save your stock `p10` partition backup safely.**
+2. **Step 1 — Flash Upstream `emOS` from `wilbowes/EchoMuse`**:
+   - Clone **[`wilbowes/EchoMuse`](https://github.com/wilbowes/EchoMuse)** and follow its **[`emos/`](https://github.com/wilbowes/EchoMuse/tree/main/emos)** + `SETUP.md` wizard (`emos-v0.10+`) to build and flash `emOS` around **your own speaker's kernel/DTB**. *(We intentionally delegate `emOS` flashing to upstream EchoMuse — `emOS` is not a one-way door; `/init recovery` returns to TWRP anytime.)*
+3. **Step 2 — Connect Wi-Fi Over USB Serial**:
+   - Plug the Dot 2 into your Mac/Linux host via Micro-USB, open the USB serial console (`/dev/cu.usbmodem*` on macOS or `/dev/ttyACM*` on Linux), verify `cat /etc/os-release` reports `ID=emos`, and run **`em-wifi`** to join your home Wi-Fi and obtain a LAN IP.
+
+#### Step 3 — Build, Self-Sign & Generate Bootstrap Seed (First-Time Setup)
+Clone both repositories side by side (`hm-provision.sh` and `build_bootstrap.py` automatically find `../home-mate-gateway-linux`):
 ```bash
-# 1. Read-only dry-run preflight:
-./tools/hm-provision.sh --device-id dot2-living \
-  --seed build/bootstrap/home-mate-bootstrap-dot2-living.tar.gz \
-  --release build/release/home-mate-release.tar \
-  --serial /dev/cu.usbmodem8401 --ip 192.168.1.73 \
-  --wake-word 你好小智 --dry-run
+git clone https://github.com/yes999zc/home-mate.git
+git clone https://github.com/yes999zc/home-mate-gateway-linux.git
+cd home-mate
 
-# 2. Remove --dry-run to install, activate (8/8 health checks), pair token & optionally clone config:
-./tools/hm-provision.sh --device-id dot2-living \
-  --seed build/bootstrap/home-mate-bootstrap-dot2-living.tar.gz \
-  --release build/release/home-mate-release.tar \
-  --serial /dev/cu.usbmodem8401 --ip 192.168.1.73 \
-  --wake-word 你好小智
+# 1. Generate YOUR OWN Ed25519 signing keypair (outside Git) and embed your pubkey into hm-release:
+cargo build -p hm-release
+./target/debug/hm-release keygen --out ~/.home-mate/signing/release-signing-key.hex
+./target/debug/hm-release pubkey --key ~/.home-mate/signing/release-signing-key.hex > deploy/release/release-pubkey.hex
+./tools/build_release.sh             # aarch64 static hm-release carrying YOUR pubkey
+cargo build -p hm-release            # refresh host verifier with YOUR pubkey
+
+# 2. Build full hm-core (aarch64), Vue 3 console, and Dot 2 gateway (armv7 — NEVER raw cargo zigbuild!):
+./tools/build_core.sh
+(cd web && npm install && npm run build)
+(cd ../home-mate-gateway-linux && ./tools/build_firmware.sh)
+
+# 3. Assemble & sign home-mate-release.tar (see deploy/release/README.md for exact layout):
+VER=$(date +%Y.%m.%d)-1
+REL="build/release-$VER"
+mkdir -p "$REL/components/model"
+cp target/aarch64-unknown-linux-musl/release/hm-core "$REL/components/core-aarch64"
+cp ../home-mate-gateway-linux/target/armv7-unknown-linux-musleabihf/release/home-mate-device-gateway "$REL/components/firmware-armv7"
+cp -a web/dist "$REL/components/web"
+# Download Silero VAD v4 16 kHz ONNX from https://github.com/snakers4/silero-vad first:
+cp /path/to/silero_vad.onnx "$REL/components/model/silero_vad.onnx"
+./target/debug/hm-release pack --dir "$REL" --out "build/release/home-mate-release-$VER" \
+  --serial 1 --version "$VER" --key ~/.home-mate/signing/release-signing-key.hex \
+  --model AEOBC --profile dot2d-emos --firmware-min 0.0.44 --firmware-max 0.0.99
+
+# 4. Build the per-device bootstrap seed (requires Sherpa-ONNX KWS bundle at ~/.home-mate/kws-build/bundle;
+#    pass --allow-empty-wake-acks for your household's very first Dot 2 before TTS is configured):
+python3 tools/build_bootstrap.py \
+  --device-id dot2-living \
+  --release "build/release/home-mate-release-$VER.tar" \
+  --allow-empty-wake-acks
 ```
 
-#### Let an AI Coding Agent Provision Echo Dot 2
-```text
-I have an Amazon Echo Dot 2 (RS03QR) unlocked via firebreak (amonet) and running emOS on Wi-Fi:
-- USB Serial Port: /dev/cu.usbmodem8401   <-- Replace or auto-detect via `ls /dev/cu.usbmodem* /dev/ttyACM*`
-- Speaker LAN IP:  192.168.1.73           <-- Replace with actual LAN IP
-- (Optional) Reference Speaker IP: 192.168.1.50
+#### Step 4 — Provision Over USB Serial (`tools/hm-provision.sh`)
+```bash
+# 1. Read-only dry-run preflight (touches zero bytes on the speaker):
+./tools/hm-provision.sh --device-id dot2-living \
+  --seed "build/bootstrap/home-mate-bootstrap-dot2-living-$VER.tar.gz" \
+  --release "build/release/home-mate-release-$VER.tar" \
+  --serial /dev/cu.usbmodem8401 --ip 192.168.1.73 \
+  --wake-word "Hey Mate" --dry-run
 
-In `yes999zc/home-mate` (with `yes999zc/home-mate-gateway-linux` if rebuilding firmware via `./tools/build_firmware.sh` — never raw `cargo zigbuild`), run `./tools/hm-provision.sh --dry-run` first for `--device-id dot2-living --wake-word 你好小智`, report preflight results, then execute the real provision, verify 8/8 activation health checks, and save the token to `~/.home-mate/dot2-living.token` (chmod 600).
+# 2. Remove --dry-run to install, activate (health self-checks), pair token & optionally clone config:
+./tools/hm-provision.sh --device-id dot2-living \
+  --seed "build/bootstrap/home-mate-bootstrap-dot2-living-$VER.tar.gz" \
+  --release "build/release/home-mate-release-$VER.tar" \
+  --serial /dev/cu.usbmodem8401 --ip 192.168.1.73 \
+  --wake-word "Hey Mate"
+```
+*(Open `http://<DOT2_IP>:8930` to configure your LLM / ASR / TTS & Home Assistant — `hm-core` will auto-synthesize wake acks once TTS is saved. Never copy per-unit acoustic calibration across different Dot 2 units.)*
+
+#### Let an AI Coding Agent Set Up Echo Dot 2 End-to-End (From Stock or emOS)
+Copy and paste into **Claude Code, Cursor, Codex, or Antigravity** *(replace the example values below with your real serial port, LAN IP, and preferred wake word)*:
+```text
+Help me deploy Home Mate onto my Amazon Echo Dot 2nd Gen (RS03QR / AEOBC):
+[Replace the example values below with your own]
+- Current speaker state: <stock / already unlocked via firebreak / already running emOS on Wi-Fi>
+- USB Serial Port: /dev/cu.usbmodem8401   (or auto-detect via `ls /dev/cu.usbmodem* /dev/ttyACM*`)
+- Speaker LAN IP:  192.168.1.73           (after running `em-wifi` on emOS)
+- Desired Node ID & Wake Word: dot2-living / "Hey Mate" (customize to English or Chinese)
+- (Optional) Existing Reference Speaker IP: none
+
+Follow this exact end-to-end checklist safely:
+1. Prerequisites (guide me interactively; NEVER auto-flash p10 without my explicit confirmation):
+   - If still stock: guide me through unlocking Bootrom with `yes999zc/firebreak` (`uvx firebreak@latest`) and saving my stock `p10` backup.
+   - If not yet on emOS: guide me to clone upstream `https://github.com/wilbowes/EchoMuse` and flash `emOS` (`emos/` directory, `emos-v0.10+`) around my own kernel/DTB, then run `em-wifi` over USB serial until `cat /etc/os-release` shows `ID=emos` and `wlan0` has an IP.
+2. Clone `https://github.com/yes999zc/home-mate.git` and `https://github.com/yes999zc/home-mate-gateway-linux.git` side by side (`hm-provision.sh` and `build_bootstrap.py` auto-detect `../home-mate-gateway-linux`).
+3. Build & Self-Sign (check `deploy/release/README.md`):
+   - Generate my own Ed25519 key at `~/.home-mate/signing/release-signing-key.hex` (chmod 600, outside Git), write its pubkey into `deploy/release/release-pubkey.hex`, and rebuild `hm-release` (`./tools/build_release.sh` + `cargo build -p hm-release`).
+   - Build full `hm-core` (`./tools/build_core.sh`), `web/dist`, and Dot 2 gateway (`./tools/build_firmware.sh` in `home-mate-gateway-linux` — NEVER raw `cargo zigbuild`!).
+   - Pack & sign `home-mate-release.tar` via `hm-release pack`, then build the per-node seed via `python3 tools/build_bootstrap.py --device-id dot2-living --release <tar> --allow-empty-wake-acks` (after preparing the Sherpa-ONNX KWS bundle at `~/.home-mate/kws-build/bundle`).
+4. Provision safely:
+   - Run `./tools/hm-provision.sh ... --dry-run` first and show me the preflight output (`ID=emos`, `/data/emos/sockets`, IP).
+   - After I confirm, run without `--dry-run`, verify health checks, save the token to `~/.home-mate/dot2-living.token` (chmod 600), and verify `http://<SPEAKER_IP>:8930` loads HTTP 200.
+5. Never commit real IPs, tokens, or signing keys to Git, and never copy acoustic calibration parameters from another Dot 2 unit.
 ```
 
 ---
