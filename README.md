@@ -51,7 +51,7 @@ We have consolidated and opened the complete **3-repository Home Mate ecosystem*
 | Repository | Role & Highlights | License |
 | :--- | :--- | :--- |
 | **[yes999zc/home-mate](https://github.com/yes999zc/home-mate)** *(this repo)* | **Core Edge Brain & Console**: `hm-core` (Full Docker with in-process Silero VAD & `--slim` speaker build), Master Brain delegation, Multi-Gateway isolation, `hm-release` Ed25519 signed OTA manager, Vue 3 Web Console (`web/`), `tools/hm-provision.sh`, and Northbound v2 protocol contract. | `AGPL-3.0` (`Apache-2.0` Protocol v2 Spec) |
-| **[yes999zc/home-mate-gateway-linux](https://github.com/yes999zc/home-mate-gateway-linux)** *(Unified Linux Gateway)* | **Replaces legacy separate `dot2` & `lx06` repos**: Feature-gated Rust hardware gateway supporting **Echo Dot 2 (`board-dot2`)**, **Xiaomi LX06 256 MB** (on-speaker Scheme A dual-wake), and **Xiaomi LX06 128 MB** (auto-detected Thin Gateway pairing with NAS Full Docker Core). | `AGPL-3.0` |
+| **[yes999zc/home-mate-gateway-linux](https://github.com/yes999zc/home-mate-gateway-linux)** *(Unified Linux Gateway)* | **Replaces legacy separate `dot2` & `lx06` repos**: Feature-gated Rust hardware gateway supporting **Echo Dot 2 (`board-dot2`)**, **Xiaomi LX06 256 MB** (on-speaker Scheme A dual-wake), and **Xiaomi LX06 128 MB** (Thin Gateway w/ NAS or Standalone Pure-ASR w/o NAS). | `AGPL-3.0` |
 | **[yes999zc/home-mate-gateway-android](https://github.com/yes999zc/home-mate-gateway-android)** *(Universal Android Gateway)* | **One adaptive zero-dependency APK** (Android 5–16) turning **Android smart displays, 4-inch 86 wall panels (1:1), tablets, everyday phones, and repurposed old Android phones** into offline-KWS far-field voice terminals & multi-room controllers with GitHub Releases auto-update. | `AGPL-3.0` |
 
 > **Migration Note**: Legacy single-board repositories (`home-mate-gateway-dot2` and `home-mate-gateway-lx06`) have been unified into **[yes999zc/home-mate-gateway-linux](https://github.com/yes999zc/home-mate-gateway-linux)**. All new deployments and AI agent scripts should target `home-mate-gateway-linux`.
@@ -61,7 +61,8 @@ We have consolidated and opened the complete **3-repository Home Mate ecosystem*
 | What Hardware You Have | Recommended Topology | External NAS/Server Needed? |
 | :--- | :--- | :--- |
 | **Xiaomi LX06 (256 MB RAM)** | On-speaker `hm-core --slim` + `hm-gateway` + `hm-kws` (Scheme A dual-wake with stock XiaoAi) | **No** (100% on-speaker) |
-| **Xiaomi LX06 (128 MB RAM batch)** | Auto-detected **Thin Gateway** (`~1.6 MiB`) on speaker → **Full Docker `hm-core`** on NAS/Server | **Yes** (Full Docker `hm-core` on NAS/server) |
+| **Xiaomi LX06 (128 MB · w/ NAS Recommended)** | Auto-detected **Thin Gateway** (`~4 MiB` RAM) on speaker → **Full Docker `hm-core`** on NAS/Server (with Silero VAD) | **Yes** (Full Docker `hm-core` on NAS/server) |
+| **Xiaomi LX06 (128 MB · No-NAS Trial)** | On-speaker **Standalone Pure-ASR** (`--standalone-asr`: `hm-core --slim` + `hm-gateway`, skips local KWS; energy VAD + cloud ASR wake) | **No** (100% on-speaker) |
 | **Amazon Echo Dot 2 (`RS03QR`)** | On-speaker Full `hm-core` + `hm-gateway` + `hm-kws` (7-mic + 160ms AEC + 12-LED ring) | **No** (100% on-speaker) |
 | **Android Smart Display / 86 Wall Panel / Tablet / Old Android Phone** | **Full Docker `hm-core`** on NAS/Mac/PC + **Android Universal APK** (zero hardware flashing!) | **Yes** (or connect to an existing speaker Core in Manage-Only mode) |
 
@@ -71,9 +72,11 @@ We have consolidated and opened the complete **3-repository Home Mate ecosystem*
 
 Deployed via **[yes999zc/home-mate-gateway-linux](https://github.com/yes999zc/home-mate-gateway-linux)**, Home Mate automatically inspects `MemTotal` in `/proc/meminfo` and adapts to both Xiaomi factory batches:
 
-1. **Adaptive 256 MB On-Speaker vs. 128 MB Thin Mode**:
+1. **Adaptive 256 MB On-Speaker vs. Dual 128 MB Modes**:
    - **256 MB batch (`MemTotal >= 180,000 kB`)**: Unpacks the `<= 6.0 MiB` Scheme A archive (`/data/hm/hm-bundle.tar.xz`) into `120.9 MiB` `/tmp` RAM tmpfs on boot — `hm-core --slim`, Vue 3 Console (`:8930`), `hm-gateway`, and `hm-kws` (with hardware-calibrated `0.20 / 2.50` KWS sensitivity) run **100% on-speaker**.
-   - **128 MB batch (`MemTotal < 180,000 kB`, ~59 MB `/tmp`)**: Automatically enters **Thin Gateway mode** (`hm-lx06-thin.tar.xz`, ~550 KB compressed / ~1.6 MiB unpacked, no local `hm-core` or `hm-kws`), dialing your **NAS / server Full Docker `hm-core`** over private LAN `:8932` (`--allow-lan-core`) or SSH reverse tunnel.
+   - **128 MB batch (`MemTotal < 180,000 kB`, ~59 MB `/tmp`)**:
+     - **With NAS (Recommended — `--thin`)**: Auto-enters **Thin Gateway mode** (`hm-lx06-thin.tar.xz`, ~606 KB compressed / ~4 MiB RAM), dialing your **NAS / server Full Docker `hm-core`** (with in-process Silero neural VAD) over private LAN `:8932` or SSH reverse tunnel.
+     - **Without NAS (Trial — `--standalone-asr`)**: Skips local `hm-kws` (saving ~50–68 MiB RAM) and runs `hm-core --slim` (`HM_VOICE_EVENTS=0` to protect 58 MB `/tmp`) + `hm-gateway` + `:8930` Console directly on the speaker (~26–31 MiB net RAM, ~22–30 MiB free headroom) using energy VAD + cloud ASR wake.
 2. **Zero Damage to Stock Firmware (Dual-System Coexistence)**:
    - **0 bytes modified in stock SquashFS**: Factory read-only `mtd4 (system0)` and `mtd5 (system1)` partitions remain **100% untouched** (zero brick risk).
    - **1-Line Factory Restore**: Run `rm -rf /data/hm /data/init.sh && reboot` over SSH to return to 100% stock state.
@@ -159,11 +162,10 @@ Every Core (on-speaker or NAS Docker) serves the responsive Vue 3 Web Console di
 #### Prerequisites
 1. **Model & Memory Check**: Black cylinder **Xiaomi AI Speaker Pro (`LX06`, A113X `aarch64`)**. Always run `grep ^MemTotal /proc/meminfo` over SSH first to identify **256 MB (`>= 180,000 kB`)** vs. **128 MB (`< 180,000 kB`)**.
 2. **Root SSH Unlocked**: Enable root SSH (port 22) via [idootop/open-xiaoai](https://github.com/idootop/open-xiaoai).
-3. **If 128 MB Batch**: Deploy **Track C (Full Docker `hm-core` on NAS/Server)** first — never use `--slim` on the NAS.
+3. **If 128 MB Batch**: With a NAS/server, deploy **Track C (Full Docker `hm-core`)** first and use `--thin`; without a NAS, use `--standalone-asr` directly (`v0.0.54+` Releases include zero-compile prebuilt archives for both).
 
-#### Manual Commands
+#### Manual Commands (`v0.0.54+` ships zero-compile prebuilt Release assets)
 ```bash
-git clone https://github.com/yes999zc/home-mate.git
 git clone https://github.com/yes999zc/home-mate-gateway-linux.git
 cd home-mate-gateway-linux
 
@@ -172,31 +174,44 @@ cd home-mate-gateway-linux
 python3 -m http.server 18089 --directory build/lx06 &
 ./deploy/lx06/install-lx06.sh --device-ip 192.168.1.50 --kws-url http://192.168.1.10:18089/hm-kws-lx06.tar.xz
 
-# Option A2 — 128 MB LX06 (Thin Gateway -> NAS Full Docker hm-core):
-./tools/pack_lx06_bundle.sh --thin
-./deploy/lx06/install-lx06.sh --thin --device-ip 192.168.1.50 --core-addr 192.168.1.10:8932 --device-id lx06-living
+# Option A2 — 128 MB LX06 + NAS (Recommended; zero-compile prebuilt Thin Gateway -> NAS Full Docker Core):
+mkdir -p build/lx06 && for f in hm-lx06-thin.tar.xz hm-lx06-thin.sha256 init.sh unxz SHA256SUMS.txt; do
+  curl -fL "https://github.com/yes999zc/home-mate-gateway-linux/releases/download/v0.0.54/$f" -o "build/lx06/$f"
+done && chmod +x build/lx06/init.sh build/lx06/unxz
+./deploy/lx06/install-lx06.sh --thin --device-ip 192.168.1.50 --core-addr 192.168.1.10:8932 --device-id lx06-living --core-token "<TOKEN>"
+
+# Option A3 — 128 MB LX06 without NAS (Standalone Pure-ASR trial; zero-compile main bundle, no local KWS):
+mkdir -p build/lx06 && for f in hm-bundle.tar.xz hm-bundle.sha256 init.sh unxz SHA256SUMS.txt; do
+  curl -fL "https://github.com/yes999zc/home-mate-gateway-linux/releases/download/v0.0.54/$f" -o "build/lx06/$f"
+done && chmod +x build/lx06/init.sh build/lx06/unxz
+./deploy/lx06/install-lx06.sh --standalone-asr --device-ip 192.168.1.50 --device-id lx06-standalone
 ```
 
-#### Let an AI Coding Agent Deploy LX06 (Auto-Detects 256 MB vs 128 MB)
-Copy and paste into **Claude Code, Cursor, Codex, or Antigravity** *(replace the example IPs `192.168.1.50` and `192.168.1.10` with your real LAN IPs)*:
+#### Let an AI Coding Agent Deploy LX06 (Auto-Detects 256 MB vs Dual 128 MB Modes)
+Copy and paste into **Claude Code, Cursor, Codex, or Antigravity** *(replace the example IPs `192.168.1.50` and `192.168.1.10` with your real LAN IPs; note "no NAS" if you want 128 MB standalone pure-ASR)*:
 ```text
 Help me deploy Home Mate (XiaoRui) onto my Xiaomi AI Speaker Pro (LX06, root SSH enabled via open-xiaoai):
-[Replace the two example IPs below with your real LAN IPs]
+[Replace the example IPs below with your real LAN IPs]
 - LX06 Speaker SSH: root@192.168.1.50
-- LAN NAS / Host IP: 192.168.1.10
+- LAN NAS / Host IP: 192.168.1.10 (if I don't have a NAS, use 128 MB Standalone Pure-ASR mode)
 
 Follow these strict rules:
 1. NEVER modify stock SquashFS partitions (mtd4 / mtd5). Use only non-invasive Storage Scheme A under /data/hm and /data/init.sh.
-2. Clone https://github.com/yes999zc/home-mate.git and https://github.com/yes999zc/home-mate-gateway-linux.git side by side.
+2. Clone https://github.com/yes999zc/home-mate-gateway-linux.git (and https://github.com/yes999zc/home-mate.git side-by-side if building 256 MB from source or deploying NAS Docker).
 3. SSH into root@<SPEAKER_IP> and inspect `uname -m`, `grep ^MemTotal /proc/meminfo`, and `df -k /data /tmp`:
    - If MemTotal >= 180000 kB (256 MB batch -> On-Speaker Dual-Wake):
      a) Verify /data has >= 6000 KB free, pack with `./tools/pack_lx06_bundle.sh`, and serve `build/lx06/` on <HOST_IP>:18089 (confirm HTTP 200 on `hm-kws-lx06.tar.xz`).
      b) Run `./deploy/lx06/install-lx06.sh --device-ip <SPEAKER_IP> --kws-url http://<HOST_IP>:18089/hm-kws-lx06.tar.xz`.
      c) Verify `hm-core`, `hm-gateway`, and `hm-kws` are running, `http://<SPEAKER_IP>:8930` loads HTTP 200, and `/api/v0/mode` shows LX06 KWS `0.20 / 2.50`.
-   - If MemTotal < 180000 kB (128 MB batch -> Thin Gateway + NAS Full Core):
-     a) First deploy or verify **Full Docker `hm-core`** (NOT `--slim`, with `HM_GATEWAY_ALLOW_LAN=1`) from `yes999zc/home-mate` on <HOST_IP> (`docker compose up -d`).
-     b) In `home-mate-gateway-linux`, run `./tools/pack_lx06_bundle.sh --thin` and install with `./deploy/lx06/install-lx06.sh --thin --device-ip <SPEAKER_IP> --core-addr <HOST_IP>:8932` (pass `--core-token` if `lan_gateway_exempt` is disabled).
-     c) Verify ONLY `hm-gateway` runs on the speaker (no local `hm-core`/`hm-kws`) and the speaker appears online at `http://<HOST_IP>:8930`.
+   - If MemTotal < 180000 kB (128 MB batch — download prebuilt Release `v0.0.54+` assets into `build/lx06/` and verify `SHA256SUMS.txt` without Rust compilation):
+     * [Preferred w/ NAS -> Thin Gateway]:
+       a) Deploy standard **Full Docker `hm-core`** (NOT `--slim`, `HM_GATEWAY_ALLOW_LAN=1`) from `yes999zc/home-mate` on <HOST_IP> (`docker compose up -d`) and pair an admin token.
+       b) Download `hm-lx06-thin.tar.xz`, `hm-lx06-thin.sha256`, `init.sh`, and `unxz`, then run `./deploy/lx06/install-lx06.sh --thin --device-ip <SPEAKER_IP> --core-addr <HOST_IP>:8932 --core-token "<TOKEN>"`.
+       c) Verify ONLY `hm-gateway` runs on the speaker and it appears online at `http://<HOST_IP>:8930`.
+     * [No-NAS Trial -> Standalone Pure-ASR]:
+       a) Confirm `/data` has >= 5500 KB free; download `hm-bundle.tar.xz`, `hm-bundle.sha256`, `init.sh`, and `unxz`.
+       b) Run `./deploy/lx06/install-lx06.sh --standalone-asr --device-ip <SPEAKER_IP>`.
+       c) Verify ONLY `hm-core` (`HM_VOICE_EVENTS=0`) and `hm-gateway` (no `hm-kws`) run, `/tmp` stays < 45%, and `http://<SPEAKER_IP>:8930` returns HTTP 200.
 4. Never commit real IPs or tokens to Git. Pair a household admin token and save it to `~/.home-mate/` (chmod 600).
 ```
 
