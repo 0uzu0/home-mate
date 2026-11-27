@@ -15,6 +15,7 @@ import ToneCard from '../src/components/device/ToneCard.vue'
 import VolumeCard from '../src/components/device/VolumeCard.vue'
 import StoryJokeCard from '../src/components/tools/StoryJokeCard.vue'
 import OpenSocketsCard from '../src/components/tools/OpenSocketsCard.vue'
+import ProviderCard from '../src/components/service/ProviderCard.vue'
 import WizardServiceCard from '../src/components/wizard/WizardServiceCard.vue'
 import { ApiError, postChat } from '../src/api'
 import { authToken, clearAuthToken, markUnauthorized, pairingRequired, setAuthToken } from '../src/auth'
@@ -787,6 +788,89 @@ Object.assign(globalThis, {
       assert.equal(Boolean(button(emptyRoot, 'Pair').props.disabled), true, `Pair must stay disabled for ${JSON.stringify(junk)}`)
     }
     emptyApp.unmount()
+  }
+
+  // Issue #5 UX fix: ProviderCard uses fixed <select> options for ASR/TTS + contextual /v1 hints,
+  // and preserves legacy/custom provider values; WizardServiceCard allows selecting omni TTS.
+  {
+    calls = []
+    handler = (_path, method) => (method === 'PUT' ? { state: 'applied', service: {} } : { ok: true, latency_ms: 20 })
+
+    // 1. ASR ProviderCard: select only exposes '', 'openai-asr', 'mock' and hints /v1
+    const asrRoot = node('root')
+    const asrApp = renderer.createApp(ProviderCard, {
+      service: 'asr',
+      title: 'Speech recognition (ASR)',
+      status: { provider: 'unconfigured', base_url: '', model: '', api_key_env: '', api_key_set: false, configured: false },
+      refresh: async () => {},
+    })
+    asrApp.mount(asrRoot)
+    await flush()
+    const asrSelect = all(asrRoot).find((n) => n.tag === 'select')
+    assert.ok(asrSelect, 'ASR ProviderCard must render a <select> for provider')
+    const asrOpts = asrSelect.options.map((o: any) => o.props.value)
+    assert.deepEqual(asrOpts, ['', 'openai-asr', 'mock'])
+    assert.ok(text(asrRoot).includes('/v1'), 'ASR ProviderCard must show /v1 base_url hint')
+    asrSelect.props.onChange?.({ target: { value: 'openai-asr' } })
+    await nextTick()
+    await button(asrRoot, 'Save').props.onClick()
+    await flush()
+    const asrPut = calls.find((c) => c.path === '/api/v0/config/services/asr' && c.method === 'PUT')
+    assert.equal(asrPut?.body?.provider, 'openai-asr')
+    asrApp.unmount()
+
+    // 2. TTS ProviderCard: exposes '', 'volc', 'omni', 'mock' AND preserves legacy 'openai_compat'
+    const ttsRoot = node('root')
+    const ttsApp = renderer.createApp(ProviderCard, {
+      service: 'tts',
+      title: 'Speech synthesis (TTS)',
+      status: { provider: 'openai_compat', base_url: 'https://api.example.com/v1', model: 'tts-1', voice: 'alloy', api_key_env: '', api_key_set: true, configured: true },
+      refresh: async () => {},
+    })
+    ttsApp.mount(ttsRoot)
+    await flush()
+    const ttsSelect = all(ttsRoot).find((n) => n.tag === 'select')
+    assert.ok(ttsSelect, 'TTS ProviderCard must render a <select> for provider')
+    assert.deepEqual(
+      ttsSelect.options.map((o: any) => o.props.value),
+      ['', 'volc', 'omni', 'mock', 'openai_compat'],
+      'TTS ProviderCard must preserve existing openai_compat value alongside volc/omni/mock',
+    )
+    ttsApp.unmount()
+
+    // 3. LLM ProviderCard keeps free-text <input> for provider (only select is thinkingMode)
+    const llmRoot = node('root')
+    const llmApp = renderer.createApp(ProviderCard, {
+      service: 'llm',
+      title: 'Conversation model (LLM)',
+      status: { provider: 'deepseek', base_url: 'https://api.deepseek.com/v1', model: 'deepseek-chat', api_key_env: '', api_key_set: true, configured: true },
+      refresh: async () => {},
+    })
+    llmApp.mount(llmRoot)
+    await flush()
+    const llmProviderInput = all(llmRoot).find((n) => n.tag === 'input' && n.props.placeholder === 'deepseek / openai / siliconflow')
+    assert.ok(llmProviderInput, 'LLM ProviderCard must keep free-text input for OpenAI-compatible provider labels')
+    llmApp.unmount()
+
+    // 4. WizardServiceCard for TTS lets user switch volc -> omni and saves provider='omni'
+    calls = []
+    const wizTtsRoot = node('root')
+    const wizTtsApp = renderer.createApp(WizardServiceCard, {
+      service: 'tts',
+      status: { provider: 'unconfigured', base_url: '', model: '', voice: '', api_key_env: '', api_key_set: false, configured: false },
+    })
+    wizTtsApp.mount(wizTtsRoot)
+    await flush()
+    const wizTtsSelect = all(wizTtsRoot).find((n) => n.tag === 'select')
+    assert.ok(wizTtsSelect, 'WizardServiceCard (tts) must render a provider <select>')
+    assert.deepEqual(wizTtsSelect.options.map((o: any) => o.props.value), ['volc', 'omni'])
+    wizTtsSelect.props.onChange?.({ target: { value: 'omni' } })
+    await nextTick()
+    await button(wizTtsRoot, 'Save & test').props.onClick()
+    await flush()
+    const wizTtsPut = calls.find((c) => c.path === '/api/v0/config/services/tts' && c.method === 'PUT')
+    assert.equal(wizTtsPut?.body?.provider, 'omni')
+    wizTtsApp.unmount()
   }
 }
 

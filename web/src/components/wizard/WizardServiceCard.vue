@@ -4,10 +4,11 @@
  * does — PUT then probe — because a wizard that configures things differently
  * is a second, unverified configuration path.
  */
-import { ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { putService, testService, type ServiceName, type ServiceStatus } from '../../api'
 import { t } from '../../i18n'
 import { errorDetail } from '../../format'
+import Select from '../Select.vue'
 import TextInput from '../TextInput.vue'
 
 const props = defineProps<{
@@ -66,6 +67,53 @@ watch(
   { deep: true },
 )
 
+const ttsProviderOptions = computed(() => {
+  const opts = [
+    { value: 'volc', label: t('providerTtsVolc') },
+    { value: 'omni', label: t('providerTtsOmni') },
+  ]
+  const cur = form.value.provider
+  if (cur && !opts.some((o) => o.value === cur)) opts.push({ value: cur, label: cur })
+  return opts
+})
+
+const baseUrlPlaceholder = computed(() => {
+  if (props.service === 'tts') {
+    return form.value.provider === 'volc' ? t('baseUrlPlaceholderVolc') : 'https://api.siliconflow.cn/v1'
+  }
+  return defaults[props.service].base_url
+})
+
+const baseUrlHint = computed(() => {
+  if (props.service === 'asr') return t('baseUrlHintAsr')
+  if (props.service === 'tts') {
+    return form.value.provider === 'volc' ? t('baseUrlHintTtsVolc') : t('baseUrlHintTtsOmni')
+  }
+  return t('baseUrlHintLlm')
+})
+
+const modelPlaceholder = computed(() => {
+  if (props.service === 'tts') {
+    return form.value.provider === 'volc' ? 'seed-tts-2.0' : 'FunAudioLLM/CosyVoice2-0.5B / tts-1'
+  }
+  return defaults[props.service].model
+})
+
+const voicePlaceholder = computed(() =>
+  form.value.provider === 'volc' ? t('voicePlaceholderVolc') : t('voicePlaceholderOmni'),
+)
+
+function onTtsProviderChange(next: string): void {
+  form.value.provider = next
+  dirty.value = true
+  if (next === 'omni' && form.value.model === 'seed-tts-2.0') {
+    form.value.model = ''
+  }
+  if (next === 'omni' && form.value.voice === defaults.tts.voice) {
+    form.value.voice = ''
+  }
+}
+
 async function saveAndTest(): Promise<void> {
   busy.value = true
   result.value = ''
@@ -109,14 +157,28 @@ async function saveAndTest(): Promise<void> {
 <template>
   <div class="wizsvc">
     <div class="wizsvc__row">
-      <TextInput v-model="form.base_url" :label="t('baseUrl')" wide :placeholder="defaults[service].base_url" @update:model-value="dirty = true" />
-      <TextInput v-model="form.model" :label="t('model')" :placeholder="defaults[service].model" @update:model-value="dirty = true" />
+      <Select
+        v-if="service === 'tts'"
+        :model-value="form.provider"
+        :label="t('provider')"
+        :options="ttsProviderOptions"
+        @update:model-value="onTtsProviderChange"
+      />
+      <TextInput
+        v-model="form.base_url"
+        :label="t('baseUrl')"
+        :hint="baseUrlHint"
+        wide
+        :placeholder="baseUrlPlaceholder"
+        @update:model-value="dirty = true"
+      />
+      <TextInput v-model="form.model" :label="t('model')" :placeholder="modelPlaceholder" @update:model-value="dirty = true" />
       <TextInput
         v-if="service === 'tts'"
         v-model="form.voice"
         :label="t('ttsVoice')"
         wide
-        :placeholder="defaults.tts.voice"
+        :placeholder="voicePlaceholder"
         @update:model-value="dirty = true"
       />
       <TextInput v-model="apiKey" :label="t('apiKey')" type="password" :placeholder="status?.api_key_set ? t('apiKeySet') : t('apiKeyUnset')" @update:model-value="dirty = true" />

@@ -394,6 +394,23 @@ Help me connect (or build from source) the Home Mate Android Universal Gateway (
 
 ---
 
+## First-Time Console Setup: LLM, ASR, TTS & Wake Word
+
+After your speaker or NAS Core is online at `http://<CORE_IP>:8930`, open **Services** (`http://<CORE_IP>:8930/services`) and configure all three services so voice wake-up and replies work (especially on **128 MB LX06 `--thin` / `--standalone-asr`**, which rely on **VAD → ASR → wake word matching** because local `hm-kws` is skipped):
+
+| Service Card | Accepted `provider` Values | `base_url` Rule (Avoiding HTTP 404) | Copy-Paste Example |
+| :--- | :--- | :--- | :--- |
+| **Speech Recognition (`ASR`)** | **`openai-asr`** (any OpenAI-compatible `/v1/audio/transcriptions` endpoint) or `mock` | **Must end with `/v1`** — `/audio/transcriptions` is appended automatically (do NOT omit `/v1` or append `/audio/transcriptions`) | `provider`: `openai-asr`<br/>`base_url`: `https://api.siliconflow.cn/v1` *(or `https://api.openai.com/v1` / `https://api.groq.com/openai/v1` / local `http://<IP>:<PORT>/v1`)*<br/>`model`: `FunAudioLLM/SenseVoiceSmall` *(or `whisper-1` / `whisper-large-v3-turbo`)* |
+| **Speech Synthesis (`TTS`)** | **`volc`** (Volcano Engine / Doubao `seed-tts-2.0`)<br/>**`omni`** (any OpenAI-compatible `/v1/audio/speech` returning WAV; alias `openai_compat`)<br/>or `mock` | - `volc`: leave `base_url` & `model` **blank** for official defaults (`seed-tts-2.0`)<br/>- `omni`: **must end with `/v1`** (`/audio/speech` is appended automatically) | **Volcano**: `provider`: `volc`, `voice`: `zh_female_xiaohe_uranus_bigtts`, `api_key`: Volcano `X-Api-Key`<br/>**OpenAI-compat**: `provider`: `omni`, `base_url`: `https://api.openai.com/v1` *(or `https://api.siliconflow.cn/v1`)*, `model`: `tts-1` *(or `FunAudioLLM/CosyVoice2-0.5B`)*, `voice`: `alloy` |
+| **Conversation Model (`LLM`)** | Any OpenAI-compatible label (e.g. `deepseek`, `openai`, `siliconflow`, `ollama`) | Root API URL (usually ending with `/v1`); do NOT append `/chat/completions` | `provider`: `deepseek`, `base_url`: `https://api.deepseek.com/v1`, `model`: `deepseek-chat` |
+
+> **Default Wake Word & Verification**:
+> 1. Click **Save** → **Test connection** on each card until all three return green `✓`.
+> 2. Open **Interaction** (`http://<CORE_IP>:8930/interaction`) to view or customize your wake word (default is **`你好高达`**; e.g. change to `Hey Mate` or `你好小智`).
+> 3. Confirm your speaker gateway shows **Online** on **Status / Devices**, then speak your wake word!
+
+---
+
 ## Acknowledgments
 
 Home Mate stands on the shoulders of many open-source projects and hardware communities. Full license details live in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

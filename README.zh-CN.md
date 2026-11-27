@@ -392,6 +392,23 @@ docker run -d \
 
 ---
 
+## 首次控制台配置：LLM / ASR / TTS 与唤醒词速查
+
+音箱或 NAS Core 启动后，访问 `http://<Core_IP>:8930` 进入 **「服务 / Services」** 页面配齐三项服务（尤其是 **128 MB LX06 `--thin` / `--standalone-asr`** 模式不跑本地 `hm-kws`，唤醒完全依赖 **VAD → ASR 识别文字 → 匹配唤醒词**，必须先配通 ASR 才能唤醒）：
+
+| 服务卡片 | 允许填写的 `provider` 值 | `base_url` 填写规则（避免 `http 404`） | 可直接照抄示例 |
+| :--- | :--- | :--- | :--- |
+| **语音识别（ASR）** | **`openai-asr`**（支持任意 OpenAI 兼容 `/v1/audio/transcriptions` 接口）或 `mock` | **必须以 `/v1` 结尾**——后端自动拼接 `/audio/transcriptions`（切勿漏 `/v1`，也不要重复粘 `/audio/transcriptions`） | `provider`：`openai-asr`<br/>`base_url`：`https://api.siliconflow.cn/v1`（硅基流动国内直连；或 OpenAI `https://api.openai.com/v1` / Groq / 本地 oMLX `http://<IP>:<端口>/v1`）<br/>`model`：`FunAudioLLM/SenseVoiceSmall`（或 `whisper-1`） |
+| **语音合成（TTS）** | **`volc`**（火山引擎 / 豆包 `seed-tts-2.0`，中文推荐）<br/>**`omni`**（任意 OpenAI 兼容 `/v1/audio/speech` 且支持返回 WAV 的接口，兼容别名 `openai_compat`）<br/>或 `mock` | - 选 `volc`：`base_url` 与 `model` **可留空**（自动用官方 `seed-tts-2.0` 地址）<br/>- 选 `omni`：**必须以 `/v1` 结尾**（后端自动拼 `/audio/speech`） | **火山豆包**：`provider`：`volc`，`base_url`/`model` 留空，`voice`：`zh_female_xiaohe_uranus_bigtts`，`API 密钥` 填火山 `X-Api-Key`<br/>**OpenAI 兼容**：`provider`：`omni`，`base_url`：`https://api.siliconflow.cn/v1`（或 `https://api.openai.com/v1`），`model`：`FunAudioLLM/CosyVoice2-0.5B`（或 `tts-1`），`voice`：`FunAudioLLM/CosyVoice2-0.5B:alex`（或 `alloy`） |
+| **对话模型（LLM）** | 任意 OpenAI 兼容标识（如 `deepseek` / `openai` / `siliconflow` / `ollama`） | 填写接口根地址（通常以 `/v1` 结尾），不要重复填写 `/chat/completions` | `provider`：`deepseek`，`base_url`：`https://api.deepseek.com/v1`，`model`：`deepseek-chat` |
+
+> **默认唤醒词与验证步骤**：
+> 1. 在每张卡片填写完毕后依次点 **「保存」→「测试连接」**，确认三项全部出现绿色 `✓`。
+> 2. 进入左侧 **「交互 / Interaction」** 页面查看或自定义唤醒词（全新默认唤醒词为 **`你好高达`**，可改为 `你好小智` 等）。
+> 3. 在 **「状态 / Status」** 或 **「设备 / Devices」** 页确认音箱网关在线，对着音箱说出唤醒词即可开始对话！
+
+---
+
 ## 致谢
 
 感谢所有让 Home Mate 成为可能的开源项目与硬件社区（完整许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)）：

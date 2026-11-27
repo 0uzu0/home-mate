@@ -117,6 +117,65 @@ const thinkingOptions = computed(() => [
   { value: '', label: t('thinkingDefault') },
   { value: 'disabled', label: t('thinkingDisabled') },
 ])
+
+/** Fixed provider options for ASR and TTS so users cannot hit unknown-provider errors. */
+const providerSelectOptions = computed(() => {
+  const cur = draft.value?.provider ?? ''
+  if (props.service === 'asr') {
+    const opts = [
+      { value: '', label: t('providerUnconfigured') },
+      { value: 'openai-asr', label: t('providerAsrOpenai') },
+      { value: 'mock', label: t('providerAsrMock') },
+    ]
+    if (cur && !opts.some((o) => o.value === cur)) opts.push({ value: cur, label: cur })
+    return opts
+  }
+  if (props.service === 'tts') {
+    const opts = [
+      { value: '', label: t('providerUnconfigured') },
+      { value: 'volc', label: t('providerTtsVolc') },
+      { value: 'omni', label: t('providerTtsOmni') },
+      { value: 'mock', label: t('providerTtsMock') },
+    ]
+    if (cur && !opts.some((o) => o.value === cur)) opts.push({ value: cur, label: cur })
+    return opts
+  }
+  return null
+})
+
+const baseUrlPlaceholder = computed(() => {
+  if (props.service === 'asr') return 'https://api.siliconflow.cn/v1'
+  if (props.service === 'tts') {
+    return draft.value?.provider === 'volc' ? t('baseUrlPlaceholderVolc') : 'https://api.siliconflow.cn/v1'
+  }
+  return 'https://api.deepseek.com/v1'
+})
+
+const baseUrlHint = computed(() => {
+  if (props.service === 'asr') return t('baseUrlHintAsr')
+  if (props.service === 'tts') {
+    return draft.value?.provider === 'volc' ? t('baseUrlHintTtsVolc') : t('baseUrlHintTtsOmni')
+  }
+  return t('baseUrlHintLlm')
+})
+
+const modelPlaceholder = computed(() => {
+  if (props.service === 'asr') return 'FunAudioLLM/SenseVoiceSmall / whisper-1'
+  if (props.service === 'tts') {
+    return draft.value?.provider === 'volc' ? 'seed-tts-2.0' : 'FunAudioLLM/CosyVoice2-0.5B / tts-1'
+  }
+  return 'deepseek-chat'
+})
+
+const voicePlaceholderText = computed(() =>
+  draft.value?.provider === 'volc' ? t('voicePlaceholderVolc') : t('voicePlaceholderOmni'),
+)
+
+const apiKeyEnvPlaceholder = computed(() => {
+  if (props.service === 'asr') return 'ASR_API_KEY'
+  if (props.service === 'tts') return draft.value?.provider === 'volc' ? 'VOLC_API_KEY' : 'TTS_API_KEY'
+  return 'DEEPSEEK_API_KEY'
+})
 </script>
 
 <template>
@@ -137,16 +196,34 @@ const thinkingOptions = computed(() => [
     </p>
 
     <div v-if="draft" class="provider__grid">
-      <TextInput v-model="draft.provider" :label="t('provider')" placeholder="deepseek / volc / openai-asr" />
-      <TextInput v-model="draft.base_url" :label="t('baseUrl')" wide placeholder="https://api.deepseek.com" />
-      <TextInput v-model="draft.model" :label="t('model')" placeholder="deepseek-flash" />
-      <TextInput v-model="draft.api_key_env" :label="t('apiKeyEnv')" placeholder="DEEPSEEK_API_KEY" />
+      <Select
+        v-if="providerSelectOptions"
+        v-model="draft.provider"
+        :label="t('provider')"
+        :options="providerSelectOptions"
+      />
+      <TextInput
+        v-else
+        v-model="draft.provider"
+        :label="t('provider')"
+        :hint="t('providerLlmHint')"
+        placeholder="deepseek / openai / siliconflow"
+      />
+      <TextInput
+        v-model="draft.base_url"
+        :label="t('baseUrl')"
+        :hint="baseUrlHint"
+        wide
+        :placeholder="baseUrlPlaceholder"
+      />
+      <TextInput v-model="draft.model" :label="t('model')" :placeholder="modelPlaceholder" />
+      <TextInput v-model="draft.api_key_env" :label="t('apiKeyEnv')" :placeholder="apiKeyEnvPlaceholder" />
       <TextInput
         v-if="service === 'tts'"
         v-model="draft.voice"
         :label="t('voice')"
         wide
-        :placeholder="t('voicePlaceholder')"
+        :placeholder="voicePlaceholderText"
       />
       <Select
         v-if="service === 'llm' || service === 'llm_fallback'"
